@@ -1,0 +1,130 @@
+---
+title: 'Realtime: Broadcast and Presence'
+description: 'How Broadcast and Presence give you low-latency pub/sub and online-user tracking over a Realtime channel, with no database publication or replication setup required.'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+**Broadcast** and **Presence** are a general pub/sub and online-tracking layer on top of a Realtime channel, and unlike Postgres Changes they are **enabled by default** with no table or replication setup at all.
+
+## Broadcast: send arbitrary messages to a channel
+
+Postgres Changes (covered in the previous lesson) only fires when a row actually changes in the database. Plenty of real-time features do not need — and should not pay the cost of — a database write at all: a live cursor position, a "user is typing" flag, or a chat message that only needs to reach people currently in the room. **Broadcast** covers exactly this: any client subscribed to a channel can send a JSON payload, and every other subscriber on that channel receives it directly, with no `public` table, no publication, and no WAL involved anywhere.
+
+Sending a broadcast message from `supabase-js`:
+
+```typescript
+const channel = supabase.channel('room1');
+
+channel.on('broadcast', { event: 'cursor-pos' }, (payload) => {
+  console.log('Cursor moved:', payload.payload);
+});
+
+channel.subscribe();
+
+channel.send({
+  type: 'broadcast',
+  event: 'cursor-pos',
+  payload: { x: 120, y: 340 },
+});
+```
+
+Every subscriber that registered a `.on('broadcast', { event: 'cursor-pos' }, ...)` handler on `room1` gets the payload, typically within tens of milliseconds — there is no database round trip on the hot path.
+
+## Presence: who is here right now
+
+**Presence** builds on the same channel mechanism to solve a different problem: knowing which clients are currently connected to a channel, and what state each one wants to share (a username, a cursor position, an "online" or "typing" flag). Instead of you manually broadcasting "I joined" and "I left" messages and reconciling them yourself, a channel with Presence enabled keeps a **synchronized set of present clients** and pushes updates to everyone subscribed whenever someone joins, leaves, or updates their tracked state.
+
+A client announces its own presence with `track`, and reads the full set of currently present clients with `presenceState`:
+
+```typescript
+const channel = supabase.channel('room1');
+
+channel.on('presence', { event: 'sync' }, () => {
+  const state = channel.presenceState();
+  console.log('Currently online:', state);
+});
+
+channel.subscribe(async (status) => {
+  if (status === 'SUBSCRIBED') {
+    await channel.track({ user_id: 'user-42', online_at: new Date().toISOString() });
+  }
+});
+```
+
+The `sync` event fires whenever the presence set changes for anyone on the channel, and `presenceState()` always returns the current full picture — keyed by presence key, with each entry holding whatever state that client tracked.
+
+## Neither one touches the database
+
+This is the contrast worth holding onto after the previous lesson: Postgres Changes only works once you run `alter publication supabase_realtime add table ...` for a specific table, because it is fundamentally about streaming out of Postgres's own replication log. **Broadcast and Presence are unrelated to any of that** — they are a messaging and state-sync layer that lives entirely inside the Realtime server, enabled the moment you connect a channel, with nothing to toggle in the database at all.
+
+<Mermaid title="Broadcast is direct client-to-client; Presence syncs shared state — neither touches Postgres" code={broadcastPresenceDiagram} />
+
+export const broadcastPresenceDiagram = `flowchart LR
+  subgraph channel["Realtime channel room1"]
+    c1["Client A"]
+    c2["Client B"]
+  end
+  c1 -->|"channel.send broadcast cursor-pos"| c2
+  c1 -->|"channel.track presence state"| sync["Synced presence state"]
+  c2 -->|"channel.track presence state"| sync
+  sync -->|"presence sync event"| c1
+  sync -->|"presence sync event"| c2`;
+
+<Callout title="The one-line takeaway">
+**Broadcast** lets any client send a JSON payload directly to every other subscriber on a channel (`channel.send({ type: 'broadcast', ... })` and `channel.on('broadcast', { event }, callback)`), and **Presence** layers a synchronized "who is here" state on top of the same channel (`channel.track(state)` and `channel.presenceState()`), and critically, both are **enabled by default** with no `supabase_realtime` publication and no replica identity setup — unlike Postgres Changes, neither is tied to a database table at all.
+</Callout>
+
+export const quizBroadcastPresence = [
+  {
+    q: 'Do Broadcast and Presence require adding a table to the supabase_realtime publication like Postgres Changes does',
+    options: [
+      'Yes, exactly the same publication setup is required',
+      'No, Broadcast and Presence are enabled by default and are not tied to any database table or publication',
+      'Only Presence requires it, Broadcast does not',
+      'Only Broadcast requires it, Presence does not',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What is Broadcast best suited for, compared to Postgres Changes',
+    options: [
+      'Persisting every message permanently into a Postgres table',
+      'Low-latency, ephemeral messages like a cursor position that do not need to be stored in the database at all',
+      'Running scheduled batch jobs against the database',
+      'Enforcing row level security policies',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does Presence actually track',
+    options: [
+      'A full history of every row ever changed in a table',
+      'Which clients are currently connected to a channel and the state each one has shared',
+      'The SQL query plan of the last executed statement',
+      'A list of every publication in the database',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which method call announces a client\'s own state to other Presence subscribers on a channel',
+    options: [
+      'channel.subscribe()',
+      'channel.track(state)',
+      'channel.presenceState()',
+      'channel.send({ type: \'broadcast\' })',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="realtime-and-storage/realtime-broadcast-and-presence" questions={quizBroadcastPresence} />
+
+<ProgressTracker client:visible id="realtime-and-storage/realtime-broadcast-and-presence" />

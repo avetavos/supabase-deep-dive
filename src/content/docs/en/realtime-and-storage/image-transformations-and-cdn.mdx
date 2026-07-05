@@ -1,0 +1,116 @@
+---
+title: 'Image Transformations and the CDN'
+description: 'How Supabase Storage resizes and reprocesses images on the fly from URL parameters, and why letting the CDN cache each transformed variant beats pre-generating every size yourself.'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+Supabase Storage can resize and reprocess an image **on the fly** at request time using plain query parameters, so you never have to pre-generate and store a thumbnail, medium, and large copy of every image yourself.
+
+## Requesting a transformed image
+
+Instead of uploading one `photo.png` and separately uploading `photo-thumb.png`, `photo-medium.png`, and so on, you upload the image once and ask for whatever size you need when you serve it. Both `getPublicUrl` and `createSignedUrl` accept a `transform` option:
+
+```typescript
+const { data } = supabase.storage
+  .from('avatars')
+  .getPublicUrl('user123/photo.png', {
+    transform: {
+      width: 200,
+      height: 200,
+      resize: 'cover',
+    },
+  });
+```
+
+`width` and `height` set the target dimensions in pixels. `resize` controls how the image fits those dimensions: `cover` (the default) fills the target size and crops any excess, `contain` fits the whole image inside the target size while preserving aspect ratio, and `fill` stretches the image to the exact dimensions without preserving aspect ratio. A `quality` option is also available to control compression. Requesting three different sizes of the same source file is just three different query strings against the same underlying object:
+
+```typescript
+const thumb = supabase.storage.from('avatars').getPublicUrl('user123/photo.png', {
+  transform: { width: 64, height: 64, resize: 'cover' },
+});
+const medium = supabase.storage.from('avatars').getPublicUrl('user123/photo.png', {
+  transform: { width: 400, height: 400, resize: 'contain' },
+});
+```
+
+No new upload happened for either of those — the same stored original serves both.
+
+## Why the CDN cache matters here
+
+The first request for a given file plus a given set of transform parameters does real work: Storage decodes the original, resizes it, and returns the result. That would be slow if it happened on every single request. It does not, because the transformed output is cached at the **CDN edge**, keyed by the file and the exact transform parameters used. The next request for the same `width`/`height`/`resize` combination on the same object is served straight from the edge cache, without reprocessing the image again. Change any parameter, though, and it is a new cache key — a fresh variant gets generated and cached on its first request.
+
+Worth noting factually: on hosted Supabase, image transformations are a feature gated to paid plans rather than something available on every project tier, so it is worth checking your plan before relying on it in production.
+
+## The tradeoff against pre-generating sizes yourself
+
+The alternative — resizing images yourself at upload time and storing a `photo-thumb.png`, `photo-medium.png`, and `photo-large.png` — avoids any transform cost at read time, but it comes with real costs of its own: you store N copies of every image forever, you have to pick your fixed sizes up front, and if you ever need a size you did not anticipate you have to reprocess and re-upload everything retroactively. On-the-fly transformation flips that trade: you pay a small amount of latency on the *first* request for a given size, in exchange for storing exactly **one** original per image and being able to request any size, at any time, without touching the upload path again.
+
+<Mermaid title="One original image serves any number of transform variants, cached at the CDN edge after first request" code={imageTransformDiagram} />
+
+export const imageTransformDiagram = `flowchart LR
+  original[("Original image: photo.png")]
+  original --> thumb["?width=64&height=64&resize=cover"]
+  original --> medium["?width=400&height=400&resize=contain"]
+  original --> large["?width=1200&height=800&resize=cover"]
+  thumb --> cdnThumb["Cached at CDN edge after first request"]
+  medium --> cdnMedium["Cached at CDN edge after first request"]
+  large --> cdnLarge["Cached at CDN edge after first request"]`;
+
+<Callout title="The one-line takeaway">
+Supabase Storage transforms images **on the fly** via a `transform` option (`width`, `height`, a `resize` mode of `cover`/`contain`/`fill`, and `quality`) passed to `getPublicUrl` or `createSignedUrl`, so one stored original can serve any number of sizes without you ever pre-generating variants; each distinct file-plus-parameters combination is **cached at the CDN edge** after its first request, trading a small amount of first-request latency for not having to store or manage N copies of every image yourself.
+</Callout>
+
+export const quizImageTransform = [
+  {
+    q: 'Which query/transform parameters control an on-the-fly Storage image transformation',
+    options: [
+      'Only a single "size" parameter with preset values like small/medium/large',
+      'width, height, resize mode (cover/contain/fill), and quality',
+      'A completely separate image-editing API with no relation to getPublicUrl or createSignedUrl',
+      'The bucket name must be changed to switch sizes',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why does CDN caching of transformed images matter',
+    options: [
+      'It does not matter, every request always reprocesses the image regardless',
+      'Repeated requests for the same file and same transform parameters are served from the edge cache instead of being reprocessed each time',
+      'It only affects video files, not images',
+      'It removes the need to ever specify width or height',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What is the tradeoff of on-the-fly transformation versus pre-generating multiple image sizes yourself',
+    options: [
+      'On-the-fly transformation is strictly worse in every way',
+      'A small amount of first-request latency per new size in exchange for storing one original instead of N pre-generated copies',
+      'Pre-generating sizes yourself requires no storage at all',
+      'There is no meaningful tradeoff between the two approaches',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does the resize mode "contain" do',
+    options: [
+      'It stretches the image to the exact target dimensions, ignoring aspect ratio',
+      'It fits the whole image inside the target dimensions while preserving aspect ratio',
+      'It deletes the original image after transforming it',
+      'It always crops the image to a perfect square',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="realtime-and-storage/image-transformations-and-cdn" questions={quizImageTransform} />
+
+<ProgressTracker client:visible id="realtime-and-storage/image-transformations-and-cdn" />

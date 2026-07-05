@@ -1,0 +1,149 @@
+---
+title: 'Querying with the Client SDK'
+description: 'The supabase-js query builder as a typed wrapper over PostgREST, the data/error result shape you must check explicitly, and embedding related tables through the query builder.'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+`supabase-js`'s query builder is a fluent TypeScript wrapper that builds the exact same PostgREST request you could write by hand, and every call resolves to a `{ data, error }` object instead of throwing.
+
+## The query builder mirrors the REST API
+
+Everything you saw as a raw query string in the previous lesson has a matching method on the query builder. Pick a table with `.from()`, choose columns with `.select()`, filter with `.eq()` (and its siblings), and sort with `.order()`:
+
+```typescript
+const { data, error } = await supabase
+  .from('movies')
+  .select('id, title, year')
+  .eq('year', 2020)
+  .order('year', { ascending: false });
+```
+
+Writes work the same way — `.insert()`, `.update()`, and `.delete()` map to the corresponding HTTP verbs PostgREST exposes:
+
+```typescript
+await supabase.from('movies').insert({ title: 'Arrival', year: 2016, director_id: 3 });
+
+await supabase.from('movies').update({ year: 2021 }).eq('id', 1);
+
+await supabase.from('movies').delete().eq('id', 1);
+```
+
+## Checking data and error explicitly
+
+A `supabase-js` query never throws on a failed request — it always resolves with an object shaped `{ data, error }`. If the request succeeds, `error` is `null` and `data` holds the rows. If it fails, `data` is `null` and `error` is populated. Because there is no exception to catch, you must check `error` yourself on every call, or a failed request will silently look like an empty result.
+
+`error` is a `PostgrestError` with four fields worth knowing:
+
+- **message** — a human-readable description of what went wrong.
+- **code** — either a Postgres error code (e.g. a unique-constraint violation) or a PostgREST-specific code.
+- **details** — additional context from Postgres, when available.
+- **hint** — a suggestion for fixing the problem, when Postgres or PostgREST can offer one.
+
+```typescript
+const { data, error } = await supabase.from('movies').select('id, title').eq('year', 2020);
+
+if (error) {
+  console.error(`query failed [${error.code}]: ${error.message}`);
+} else {
+  console.log(data);
+}
+```
+
+## Embedding related tables through the builder
+
+Just like the raw REST API, the query builder can embed a related table by naming it inside `select()` — PostgREST still does the work by following the foreign key, the builder just gives you a typed, chainable way to ask for it:
+
+```typescript
+const { data, error } = await supabase.from('movies').select('title, directors(name)');
+```
+
+## A complete example
+
+```typescript
+import { createClient } from '@supabase/supabase-js';
+
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!);
+
+async function recentMovies() {
+  const { data, error } = await supabase
+    .from('movies')
+    .select('id, title, year, directors(name)')
+    .eq('year', 2020)
+    .order('title', { ascending: true });
+
+  if (error) {
+    console.error('failed to load movies:', error.message);
+    return [];
+  }
+
+  return data;
+}
+```
+
+<Mermaid title="Building one PostgREST request from chained calls" code={sdkQueryDiagram} />
+
+export const sdkQueryDiagram = `flowchart LR
+  from[".from('movies')"] --> select[".select('id, title, year')"]
+  select --> eq[".eq('year', 2020)"]
+  eq --> order[".order('year')"]
+  order --> http["One HTTP request to PostgREST"]
+  http --> result["Result: data and error"]`;
+
+<Callout title="The one-line takeaway">
+The `supabase-js` query builder — `.from()`, `.select()`, `.eq()`, `.order()`, `.insert()`, `.update()`, `.delete()` — is a typed wrapper that builds the same request PostgREST would otherwise accept as a raw query string, and it always resolves to **`{ data, error }`** rather than throwing, so you must explicitly check `error` (a `PostgrestError` with **message**, **code**, **details**, and **hint**) on every call; related tables can be embedded the same way as the REST API, by naming them inside `select()`.
+</Callout>
+
+export const quizSdkQuery = [
+  {
+    q: 'What shape does a supabase-js query result always have?',
+    options: [
+      'It throws an exception on any error, like a typical async function',
+      'It resolves to an object shaped { data, error } that you must check explicitly',
+      'It returns only the raw rows, with errors logged to the console automatically',
+      'It returns a boolean indicating success or failure only',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why must you check the error field explicitly instead of relying on a try/catch?',
+    options: [
+      'Because supabase-js does not support try/catch at all',
+      'Because a failed request resolves normally with data set to null and error populated, rather than throwing',
+      'Because error is only set for network failures, never for database errors',
+      'Because checking error is optional and has no effect on behavior',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which combination filters movies to year 2020 and sorts by year descending?',
+    options: [
+      '.select("year").filter(2020).sortDesc()',
+      '.eq("year", 2020).order("year", { ascending: false })',
+      '.where("year = 2020").orderByDesc("year")',
+      '.match({ year: "desc" })',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'How does the query builder embed a related directors table into a movies query?',
+    options: [
+      'By calling a separate .join("directors") method',
+      'By naming the related table inside select(), e.g. select("title, directors(name)")',
+      'Embedding is not possible through the query builder, only through raw REST calls',
+      'By passing a second argument to .from()',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="auto-generated-api/querying-with-the-client-sdk" questions={quizSdkQuery} />
+
+<ProgressTracker client:visible id="auto-generated-api/querying-with-the-client-sdk" />

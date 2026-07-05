@@ -1,0 +1,131 @@
+---
+title: 'Supabase คืออะไร'
+description: 'Supabase ในฐานะ open-source Backend as a Service ที่สร้างบน Postgres จริง service หลักที่มันรวมมาให้ และมันต่างจาก Firebase กับการสร้าง backend เองยังไง'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+Supabase คือ **Backend as a Service** แบบ open-source ที่สร้างรอบ database **Postgres** จริงที่ไม่ได้ถูกดัดแปลง — คุณได้ auto-generated API, auth, storage และ realtime มาให้ฟรี แต่แกนกลางยังคงเป็น Postgres ธรรมดาที่ query ด้วย SQL ตรง ๆ ได้ตลอดเวลา
+
+## Postgres มาก่อน service มาทีหลัง
+
+ถ้าคุณสร้าง backend เองตั้งแต่ศูนย์ สุดท้ายคุณจะต้องเขียน authentication service, query API แบบใดแบบหนึ่ง, realtime layer สำหรับ push update สด ๆ และ file storage service เอง — ทั้งหมดนี้วางอยู่บน database ที่คุณเลือก แนวคิดของ Supabase คือให้ทุกอย่างนี้มาสร้างเสร็จแล้ว เชื่อมต่อกันแล้ว และรันอยู่บน **database ที่คุณเป็นเจ้าของเต็มตัวและ query ตรงได้เสมอ**
+
+จุดหลังนี้แหละคือความต่างสำคัญจาก Firebase Firestore ของ Firebase เป็น NoSQL document store แบบ proprietary ไม่มี schema ตายตัว data model และ query ของคุณถูกล็อกไว้กับ shape API เฉพาะของ Firebase ไม่มีทาง escape ไปใช้ SQL ได้เลย Supabase เดิมพันตรงกันข้าม database เป็น Postgres มาตรฐาน ดังนั้น
+
+- คุณต่อด้วย `psql`, Postgres driver ตัวไหนก็ได้ หรือ ORM ที่คุยกับ Postgres ได้
+- schema ของคุณคือ table แบบ relational, foreign key และ constraint — ไม่ใช่ document shape ที่ซ่อนอยู่
+- ถ้าวันหนึ่งอยากเลิกใช้ Supabase คุณ `pg_dump` database ออกมารันที่ไหนก็ได้ที่รัน Postgres
+
+```sql
+-- This is just Postgres. No proprietary query language, no vendor-specific data model.
+select id, username, created_at
+from public.profiles
+where created_at > now() - interval '7 days'
+order by created_at desc;
+```
+
+## service หลักโดยภาพรวม
+
+หนึ่ง Supabase project คือ Postgres database หนึ่งตัว บวก service ที่ห่อรอบมันอีกชั้น แต่ละตัวจะมี module ของตัวเองในคอร์สนี้ ตอนนี้เก็บไว้แค่เป็นแผนที่ orientation ยังไม่ต้องลงลึก
+
+- **Postgres database** — ที่เก็บข้อมูลจริง SQL ธรรมดา feature relational เต็มรูปแบบ
+- **Auto-generated API** — REST/RPC API ผ่าน **PostgREST** และ GraphQL API ผ่าน **pg_graphql** สร้างขึ้นตรงจาก schema ของคุณ
+- **Auth (GoTrue)** — สมัครสมาชิก, sign-in, จัดการ session และ social/SSO provider
+- **Storage** — object store แบบ S3-compatible สำหรับไฟล์ มี access policy ของตัวเอง
+- **Realtime** — subscribe การเปลี่ยนแปลงใน database หรือใช้ broadcast/presence channel แบบ ephemeral ผ่าน WebSocket
+- **Edge Functions** — logic ฝั่ง server ที่เขียนเองด้วย TypeScript รันบน Deno ที่ edge
+
+ทั้งหมดนี้ตั้งค่าได้จาก dashboard **Supabase Studio** (GUI บนเว็บ) หรือจาก **Supabase CLI** ซึ่งคุณจะได้ setup ในบทถัดไป
+
+```typescript
+import { createClient } from '@supabase/supabase-js';
+
+const supabase = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_ANON_KEY!
+);
+
+// Under the hood this is a PostgREST request against the profiles table.
+const { data, error } = await supabase
+  .from('profiles')
+  .select('id, username, created_at')
+  .order('created_at', { ascending: false });
+```
+
+<Mermaid title="Postgres database หนึ่งตัว พร้อม service ห่อรอบ" code={whatIsSupabaseDiagram} />
+
+export const whatIsSupabaseDiagram = `flowchart TB
+  pg[("Postgres database")]
+  api["REST/RPC API (PostgREST) + GraphQL (pg_graphql)"]
+  auth["Auth (GoTrue)"]
+  storage["Storage"]
+  realtime["Realtime"]
+  functions["Edge Functions (Deno)"]
+  api --> pg
+  auth --> pg
+  storage --> pg
+  realtime --> pg
+  functions --> pg`;
+
+## ทำไมไม่สร้างเองไปเลย
+
+ไม่มีอะไรตรงนี้ที่เป็นเวทมนตร์ที่คุณสร้างเองไม่ได้ — PostgREST, GoTrue และตัวอื่น ๆ ล้วนเป็น open-source project ที่ self-host แยกเองได้ สิ่งที่ Supabase ประหยัดให้จริง ๆ คืองาน integration หนึ่ง project, credential ชุดเดียว, dashboard เดียว และ service ที่รู้วิธีคุยกันเองและคุยกับ Postgres instance เดียวกันอยู่แล้ว คุณยังคงต้องเขียน schema, SQL และ access rule เอง — Supabase แค่เอา plumbing รอบ ๆ ออกไปให้
+
+<Callout title="สรุปหนึ่งบรรทัด">
+Supabase คือ **Postgres บวก service ที่ห่อรอบมันอีกชั้น** — REST/RPC API (PostgREST) กับ GraphQL API (pg_graphql), **Auth**, **Storage**, **Realtime** และ **Edge Functions** — จัดการทั้งหมดผ่าน **Studio** หรือ **CLI** และต่างจาก Firebase ตรงที่ data model ข้างล่างยังเป็น Postgres ธรรมดาที่ portable และ query ได้เสมอ
+</Callout>
+
+export const quizWhatIsSupabase = [
+  {
+    q: 'Supabase สร้างขึ้นบนอะไรเป็นแกนหลัก',
+    options: [
+      'proprietary NoSQL document database',
+      'Postgres database จริงที่ไม่ได้ถูกดัดแปลง พร้อม service ห่อรอบมัน',
+      'query language ที่สร้างเองแบบไม่มี relational model',
+      'ระบบ queue ที่จัดการให้ ไม่มี persistent storage',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Supabase ต่างจาก Firebase ในแง่ data model ยังไง',
+    options: [
+      'เหมือนกันทุกอย่าง ทั้งคู่ใช้ proprietary document store',
+      'Supabase ใช้ Postgres มาตรฐานที่ query ด้วย SQL ได้และ portable ส่วน Firebase ใช้ proprietary NoSQL model',
+      'Supabase ไม่มี database เลย',
+      'Firebase สร้างบน Postgres ส่วน Supabase ไม่ได้สร้างบน Postgres',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ข้อไหน NOT ใช่ service หลักที่มากับ Supabase project',
+    options: [
+      'auto-generated REST/RPC API และ GraphQL API',
+      'Auth สำหรับ authentication',
+      'app store แบบ proprietary สำหรับแจกจ่าย client app',
+      'Realtime กับ Storage',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'ตั้งค่าและจัดการ service ต่าง ๆ ใน Supabase project ได้จากที่ไหน',
+    options: [
+      'แก้ raw Postgres configuration file ด้วยมือเท่านั้น',
+      'ผ่าน dashboard Supabase Studio หรือ Supabase CLI',
+      'ตั้งค่าไม่ได้ ทุกอย่างตายตัว',
+      'ผ่าน add-on เสียเงินจากบุคคลที่สามเท่านั้น',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="foundations/what-is-supabase" questions={quizWhatIsSupabase} />
+
+<ProgressTracker client:visible id="foundations/what-is-supabase" />

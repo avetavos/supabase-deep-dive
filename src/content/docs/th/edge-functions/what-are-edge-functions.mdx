@@ -1,0 +1,118 @@
+---
+title: 'Edge Functions คืออะไร'
+description: 'ฟังก์ชัน TypeScript ฝั่งเซิร์ฟเวอร์ที่รันบน Deno แบบ edge และเวลาที่ควรเลือกใช้แทน Postgres RPC function'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## แนวคิดในหนึ่งประโยค
+
+**Edge Functions** คือฟังก์ชัน TypeScript ฝั่งเซิร์ฟเวอร์ที่รันบน **Deno** ถูก deploy กระจายไปทั่วโลกใกล้ผู้ใช้ ใช้ตอนที่ logic ของคุณไม่ใช่แค่ database query
+
+## ไม่ใช่ Node.js และไม่ใช่ database query
+
+ทุก layer ที่คอร์สนี้พูดถึงมาก่อนหน้านี้อยู่ใกล้ Postgres มาก ๆ PostgREST แปลง table ให้กลายเป็น REST API, RPC function รัน logic ที่ใกล้เคียง SQL อยู่ในตัวฐานข้อมูล ส่วน RLS บังคับสิทธิ์ระดับ row ส่วน Edge Functions คือ layer สำหรับทุกอย่างที่ไม่เข้ากับรูปแบบนั้น เช่น เรียก third-party API, เก็บ secret ที่ไม่ควรอยู่ในฐานข้อมูล, ทำงานที่กิน CPU หนักนอกเหนือ SQL หรือทำ HTTP endpoint แบบ stateless ที่ควบคุม request/response เองทั้งหมด
+
+รายละเอียด runtime ที่สำคัญคือ Edge Functions รันบน **Deno** ไม่ใช่ Node.js Deno มี `Deno.serve` เป็น global function สำหรับจัดการ HTTP request มาให้ในตัว รองรับ TypeScript แบบ first-class โดยไม่ต้องมี build step และปลอดภัยแบบ secure-by-default ด้วย sandboxing ถ้าคุณเคยเขียน server code บน Node.js มาก่อน รูปแบบ request/response จะคุ้นเคย แต่ API และ permission model เป็นของ Deno เอง
+
+```typescript
+// supabase/functions/hello-world/index.ts
+Deno.serve((req) => {
+  return new Response('Hello from the edge')
+})
+```
+
+## เลือก Edge Function แทน Postgres RPC function เมื่อไหร่
+
+โมดูล Auto-Generated API ให้วิธีรัน logic เองใกล้ข้อมูลไปแล้วคือ Postgres RPC function นั่นยังคงเป็นตัวเลือกที่ถูกต้องเมื่อ logic นั้นเป็น database operation โดยพื้นฐาน เขียนด้วย SQL ได้ดีที่สุด หรือต้องรันอยู่ใน transaction เดียวกับการเขียนข้อมูลอื่น ๆ ให้เลือก Edge Function แทนเมื่อข้อใดข้อหนึ่งต่อไปนี้เป็นจริง
+
+- ต้องเรียก third-party API ภายนอก (payment provider, email service, AI model)
+- logic ต้องใช้ secret (API key, signing key) ที่ห้ามให้ฐานข้อมูลหรือ client อ่านได้
+- งานนั้นกิน CPU หนักในแบบที่ SQL แสดงออกได้ไม่สะอาด (image processing, parse string ซับซ้อน, เรียก library อื่น)
+- ต้องการ HTTP endpoint แบบ stateless ที่ควบคุม header, status code และ request/response cycle เองเต็มรูปแบบ
+
+ถ้าไม่เข้าเงื่อนไขข้างต้นเลยและ operation นั้นแค่ "อ่านหรือเขียนบาง row พร้อม logic บางอย่าง" RPC function มักจะง่ายกว่าและเร็วกว่าเพราะไม่ต้องออกจากฐานข้อมูลเลย
+
+## workflow ผ่าน CLI
+
+Supabase CLI มองว่า Edge Functions เป็นแค่ไฟล์ธรรมดาในโปรเจกต์ deploy ได้ด้วยคำสั่งเดียว
+
+```bash
+# Scaffold a new function at supabase/functions/hello-world/index.ts
+supabase functions new hello-world
+
+# Run all functions locally for development
+supabase functions serve
+
+# Ship a function to your live project
+supabase functions deploy hello-world
+```
+
+`supabase functions new` สร้างไฟล์และโฟลเดอร์ boilerplate ให้ `supabase functions serve` เปิด Deno runtime ในเครื่องเพื่อให้ทดสอบได้โดยไม่ต้อง deploy `supabase functions deploy` อัปโหลด function ให้ infrastructure ฝั่ง edge ของ Supabase รันใกล้จุดที่ request มาที่สุด
+
+<Mermaid title="Edge Function เป็นอีกเส้นทางหนึ่งควบคู่กับ REST/RPC API และการเข้าถึงฐานข้อมูลโดยตรง" code={edgeFunctionsOverviewDiagram} />
+
+export const edgeFunctionsOverviewDiagram = `flowchart LR
+  client["Client app"] -->|"GET/POST via PostgREST"| rest["Auto-generated REST API"]
+  client -->|"rpc()"| rpcfn["Postgres RPC function"]
+  client -->|"functions.invoke()"| edge["Edge Function (Deno, deployed at the edge)"]
+  rest --> db[("Postgres")]
+  rpcfn --> db
+  edge -->|"optional"| db
+  edge -->|"optional"| ext["Third-party API"]`;
+
+<Callout title="สรุปในบรรทัดเดียว">
+**Edge Functions** คือฟังก์ชัน TypeScript ฝั่งเซิร์ฟเวอร์ที่รันบน **Deno** (ไม่ใช่ Node.js) deploy กระจายอยู่ที่ edge ทั่วโลก สร้าง scaffold ด้วย `supabase functions new` รันในเครื่องด้วย `supabase functions serve` และ deploy ด้วย `supabase functions deploy` เลือกใช้แทน Postgres RPC function เมื่อคุณต้องการเรียก **third-party API** ใช้ **secret** ที่ฐานข้อมูลไม่ควรถือ ทำงานที่กิน **CPU หนัก** หรือทำ **custom HTTP endpoint**
+</Callout>
+
+export const quizWhatAreEdgeFunctions = [
+  {
+    q: 'Supabase Edge Functions รันบน runtime อะไร',
+    options: [
+      'Node.js',
+      'Deno',
+      'Bun',
+      'Python interpreter ที่กำหนดเอง',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ควรเลือก Edge Function แทน Postgres RPC function เมื่อไหร่',
+    options: [
+      'เมื่อแค่ต้องการอ่าน row เดียวจาก table',
+      'เมื่อ logic ต้องเรียก third-party API ใช้ secret หรือทำงานกิน CPU หนักนอก SQL',
+      'ไม่ควรเลือกเลย เพราะ RPC function แทนที่ Edge Function ได้เสมอ',
+      'เฉพาะตอนที่โปรเจกต์ไม่มีฐานข้อมูลเท่านั้น',
+    ],
+    answer: 1,
+  },
+  {
+    q: '`supabase functions deploy hello-world` ทำอะไร',
+    options: [
+      'รัน function บนเครื่องตัวเองเท่านั้น',
+      'ส่ง function ให้รันบน infrastructure ฝั่ง edge ของ Supabase',
+      'ลบ function ออกจากโปรเจกต์',
+      'สร้าง TypeScript types ให้ function',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'คำสั่งไหนใช้รัน Edge Functions ในเครื่องสำหรับ development',
+    options: [
+      'supabase functions new',
+      'supabase functions deploy',
+      'supabase functions serve',
+      'supabase start functions',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="edge-functions/what-are-edge-functions" questions={quizWhatAreEdgeFunctions} />
+
+<ProgressTracker client:visible id="edge-functions/what-are-edge-functions" />

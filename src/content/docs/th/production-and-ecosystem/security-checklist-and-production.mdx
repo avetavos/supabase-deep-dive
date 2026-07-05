@@ -1,0 +1,105 @@
+---
+title: 'Security Checklist และความพร้อมสู่ Production'
+description: 'checklist ปิดท้ายที่ผูก Row Level Security, Data API, Supavisor, migration, indexing และ backup เข้าด้วยกันเป็น Supabase project ที่พร้อม production'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+Supabase project ที่พร้อม production ไม่ใช่แค่ตั้งค่าอันใดอันหนึ่งให้ถูก — มันคือ Row Level Security, การเปิด Data API แบบตั้งใจ, service role key ที่อยู่ฝั่ง server เท่านั้น, index บน column ของ policy, Supavisor ในโหมดที่ถูกต้อง, migration ที่ไหลผ่าน CI และ backup พร้อม point-in-time recovery ที่ยึดโยงกันทั้งหมดพร้อมกัน รอบ Postgres database เดียวกัน
+
+## Checklist
+
+แต่ละข้อนี้ถูกพูดถึงไปแล้วก่อนหน้านี้ในคอร์ส การข้ามข้อใดข้อหนึ่งไปเฉย ๆ อาจไม่ทำให้อะไรพังแบบเห็นชัดทันที — นั่นแหละคือสิ่งที่ทำให้มันข้ามได้ง่าย และเป็นเหตุผลว่าทำไมมันควรอยู่ใน checklist แทนที่จะฝากไว้กับความจำ
+
+- **Row Level Security เปิดอยู่บนทุก table ที่เก็บข้อมูล user โดยมี policy ครบทุก operation ที่ใช้จริง** การเปิด RLS แล้วมีแค่ policy สำหรับ `select` จะทำให้ insert, update และ delete ของ user ทั่วไป fail แบบเงียบ ๆ เพราะ operation ที่ไม่มี policy จะถูกปฏิเสธโดย default — พูดถึงใน module Auth และ RLS
+- **การเปิด Data API เป็นไปอย่างตั้งใจ ต่อ table และต่อ function ไม่ใช่เปิดทิ้งไว้แบบไม่คิด** table ที่ไม่จำเป็นต้องเข้าถึงผ่าน REST หรือ RPC interface ก็ไม่ควรเปิด เพราะอะไรก็ตามที่เปิดตรงนั้นเข้าถึงได้โดยใครก็ตามที่ส่ง request ที่ valid ได้ — พูดถึงใน module Auto-Generated API
+- **`service_role` key ไม่โผล่อยู่ใน client-side code เด็ดขาด** มันข้าม RLS ไปทั้งหมด จึงควรอยู่แค่ใน context ฝั่ง server ที่เชื่อถือได้อย่าง Edge Function เท่านั้น ไม่ควรถูก ship ไปกับ browser หรือ mobile app bundle เลย — พูดถึงใน module Foundations และ Edge Functions
+- **มี index บน column ที่ RLS policy อ้างอิงถึง และบน column อื่น ๆ ที่ filter หรือ join บ่อย** column ของ policy ที่ไม่มี index จะรัน evaluation เต็มรูปแบบกับทุก row ในทุก query ซึ่งไม่มีปัญหาบน table เล็ก ๆ แต่กลายเป็น production incident บน table ใหญ่ — พูดถึงในบทก่อนหน้า
+- **Supavisor รันในโหมด transaction สำหรับการเข้าถึง database จาก serverless และ edge โดยเก็บ connection แบบ direct หรือ session mode ไว้เฉพาะกรณีที่จำเป็นจริง ๆ** traffic ของ serverless กับ Edge Function เปิด concurrent connection มากกว่าที่ Postgres จะรับตรง ๆ ได้ ซึ่งตรงกับปัญหาที่ pooler ถูกสร้างมาแก้พอดี — พูดถึงในบทแรกของ module นี้
+- **Migration ถูกเก็บใน version control และ apply ผ่าน CI ไม่ใช่รันแบบ ad hoc เข้า production** migration file ที่ merge เข้า main branch ควร deploy แบบเดียวกันทุกครั้ง ผ่าน pipeline เดียวกับที่ test มันบน preview branch มาแล้ว — พูดถึงในบทก่อนหน้า
+- **เปิด backup กับ point-in-time recovery ไว้สำหรับทุกอย่างที่สำคัญใน production** point-in-time recovery หรือ PITR ให้คุณ restore project กลับไปยังจุดเวลาไหนก็ได้ภายใน retention window ไม่ใช่แค่ daily backup ล่าสุด ซึ่งสำคัญมากตอนที่ incident ที่ต้องแก้เกิดขึ้นหลายชั่วโมงหลัง snapshot ล่าสุดถูกถ่ายไป
+
+```sql
+-- A quick self-check: any table with RLS enabled but zero policies for a given command
+-- denies that command entirely rather than allowing it, so gaps here fail closed, not open
+select relname as table_name, relrowsecurity as rls_enabled
+from pg_class
+where relnamespace = 'public'::regnamespace
+  and relkind = 'r';
+```
+
+## Project เดียว ทุกอย่างพร้อมกัน
+
+ลองนึกภาพแอปจริงตัวหนึ่ง เป็น task manager ที่มี table `todos`, เปิด RLS พร้อม policy ที่ scope ด้วย `auth.uid() = user_id` และมี index บน column `user_id` เดียวกันนั้น เพื่อให้ policy check ยังเร็วอยู่แม้ table จะโตขึ้น มีแค่ table `todos` กับ RPC function `create_todo` เท่านั้นที่เปิดผ่าน Data API — ส่วนอื่นใน schema เข้าถึงผ่าน REST ไม่ได้เลย backend ของแอปที่เป็น serverless ต่อผ่าน Supavisor ในโหมด transaction ดังนั้น request จำนวนมากพร้อมกันจะไม่มีทางไปใกล้เพดาน connection ของ Postgres เลย Edge Function จัดการกับ operation เดียวที่ต้องการสิทธิ์สูงจริง ๆ — เช่น admin cleanup job — โดยใช้ `service_role` key ซึ่งอยู่แค่ใน environment ของ function นั้น ไม่มีอยู่ใน client bundle เลย ทุก schema change ตั้งแต่ `create table` แรกสุดไปจนถึง index ที่ตามมาทีหลัง ล้วนเป็น migration file ที่ผ่าน preview branch มาแล้วและถูก apply เข้า production โดย CI ไม่ใช่โดยใครสักคนที่วาง SQL เข้า dashboard และ point-in-time recovery ถูกเปิดไว้ ดังนั้น migration ที่พังหรือการลบข้อมูลจำนวนมากโดยไม่ตั้งใจก็แค่ restore กลับมาได้ ไม่ใช่การสูญเสียถาวร
+
+ไม่มีชิ้นไหนในนี้ที่แปลกใหม่ในตัวมันเอง สิ่งที่ทำให้ project พร้อม production คือทุกชิ้นนี้ยึดโยงกันในเวลาเดียวกัน รอบ database เดียวกัน แทนที่จะจริงแค่ทีละชิ้นในขณะที่ข้ออื่นใน checklist เงียบ ๆ ไม่ถูกทำตาม
+
+<Mermaid title="Every piece of a production-ready Supabase project ties back to one Postgres database" code={securityChecklistDiagram} />
+
+export const securityChecklistDiagram = `flowchart TD
+  db[("Postgres database")]
+  rls["RLS policies scoped to auth.uid()"] --> db
+  idx["Index on RLS policy columns"] --> db
+  api["Data API - only todos table and create_todo RPC exposed"] --> db
+  pool["Serverless backend via Supavisor - transaction mode"] --> db
+  fn["Edge Function using service_role key for admin tasks"] --> db
+  ci["Migrations via preview branch and CI"] --> db
+  pitr["Backups with point-in-time recovery"] --> db`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+Supabase project ที่พร้อม production คือผลรวมของทุก module ก่อนหน้านี้ที่จริงพร้อมกันทั้งหมด **Row Level Security** พร้อม policy ครบทุก operation ที่ต้องใช้, การเปิด **Data API** ที่ตั้งใจ, **service_role** key ที่อยู่แค่ใน server-side code ที่เชื่อถือได้, **index** บน column ของ RLS policy, **Supavisor** ในโหมด transaction สำหรับการเข้าถึงแบบ serverless, **migration** ที่ไหลผ่าน CI แทนที่จะเป็น ad hoc SQL และ **backup พร้อม point-in-time recovery** ที่ทำให้ change ที่พังย้อนกลับได้เสมอ — ไม่มีข้อไหนใน list นี้ที่เป็น optional สำหรับระบบที่ต้องรันจริงใน production
+</Callout>
+
+export const quizSecurityChecklist = [
+  {
+    q: 'table หนึ่งเปิด Row Level Security ไว้แต่มีแค่ policy สำหรับ select เท่านั้น จะเกิดอะไรขึ้นเมื่อ user ทั่วไปพยายาม insert row',
+    options: [
+      'insert สำเร็จตามปกติ เพราะ RLS จำกัดแค่การอ่านเท่านั้น',
+      'insert fail เพราะ operation ที่ไม่มี policy จะถูกปฏิเสธโดย default ภายใต้ RLS',
+      'insert สำเร็จแต่ถูก log เป็น security warning',
+      'RLS จะถูกปิดอัตโนมัติจนกว่าจะมี insert policy',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไม service_role key ไม่ควรโผล่อยู่ใน client-side code เลย',
+    options: [
+      'มันถูก rate limit หนักกว่า anon key',
+      'มันข้าม Row Level Security ไปทั้งหมด client ที่ถือมันจะอ่านหรือเขียน row ไหนใน table ไหนก็ได้',
+      'มันทำงานได้แค่ตอนถูกเรียกจาก Edge Function เท่านั้น ดังนั้นมันก็แค่ไม่ทำงานใน browser อยู่แล้ว',
+      'มันหมดอายุภายในไม่กี่วินาที ทำให้ไม่มีประโยชน์ใน client code อยู่ดี',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไมการรัน migration ผ่าน CI แทนที่จะรันเองด้วยมือถึงสำคัญต่อความพร้อม production',
+    options: [
+      'ไม่ค่อยสำคัญเท่าไหร่ ตราบใดที่มีคนจำได้ว่าต้องรัน SQL สักวัน',
+      'CI apply migration file ที่อยู่ใน version control แบบเดียวกันทุกครั้ง ผ่าน pipeline เดียวกับที่ test มันบน preview branch มาแล้ว แทนที่จะพึ่งให้คนวาง SQL เข้า production เอง',
+      'CI จำเป็นแค่กับ project ที่มี developer มากกว่าหนึ่งคนเท่านั้น',
+      'การรัน SQL ด้วยมือเข้า production จริง ๆ แล้วเร็วกว่าและปลอดภัยเท่ากัน',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'point-in-time recovery หรือ PITR ให้คุณทำอะไรได้โดยเฉพาะที่ daily backup อย่างเดียวทำไม่ได้',
+    options: [
+      'restore project กลับไปยังจุดเวลาไหนก็ได้ภายใน retention window ไม่ใช่แค่เวลาของ daily snapshot ล่าสุด',
+      'ป้องกัน migration ที่พังไม่ให้ถูก apply ได้เลยโดยอัตโนมัติ',
+      'กู้ row ที่ถูกลบกลับมาได้โดยไม่ต้องมี backup เลย',
+      'rollback แค่ config ของ Data API เท่านั้น โดยไม่กระทบ schema ของ database',
+    ],
+    answer: 0,
+  },
+];
+
+<Quiz client:visible id="production-and-ecosystem/security-checklist-and-production" questions={quizSecurityChecklist} />
+
+<ProgressTracker client:visible id="production-and-ecosystem/security-checklist-and-production" />

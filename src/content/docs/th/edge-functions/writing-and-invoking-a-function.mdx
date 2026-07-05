@@ -1,0 +1,115 @@
+---
+title: 'การเขียนและ Invoke Function'
+description: 'ฟังก์ชัน Deno.serve แบบพื้นฐาน การเรียกมันจาก supabase-js และการจัดการ secrets สำหรับ local กับ deployed environment'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## แนวคิดในหนึ่งประโยค
+
+Edge Function คือ `Deno.serve` handler ธรรมดาที่รับ HTTP request แล้วคืน response กลับไป เรียกใช้จาก client ด้วย `supabase.functions.invoke()`
+
+## function จริงแบบขั้นต่ำ
+
+`Deno.serve` เป็น global ที่ Deno runtime มีให้ในตัว ไม่ต้อง import อะไรเพิ่ม คุณส่ง callback ที่รับ `Request` ที่เข้ามาแล้วคืน `Response` กลับไป เหมือน Fetch API ที่คุณคุ้นเคยจากฝั่ง browser อยู่แล้ว
+
+```typescript
+Deno.serve(async (req) => {
+  const { name } = await req.json()
+  return new Response(JSON.stringify({ message: `Hello ${name}!` }), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+})
+```
+
+ไฟล์นี้อยู่ที่ `supabase/functions/hello-world/index.ts` เมื่อ deploy แล้วจะเรียกได้ที่ `https://<project-ref>.supabase.co/functions/v1/hello-world` แต่ปกติคุณไม่ต้องประกอบ URL นี้เอง เพราะ client library จัดการให้
+
+## การเรียกใช้จาก client
+
+`supabase-js` มี method `functions.invoke()` แยกออกมาแทนที่จะใช้ `fetch` เปล่า ๆ เพราะมันทำงานที่เป็นประโยชน์ให้อัตโนมัติ
+
+```typescript
+const { data, error } = await supabase.functions.invoke('hello-world', {
+  body: { name: 'World' },
+})
+```
+
+นอกจากจะ serialize `body` เป็น JSON ให้แล้ว `invoke()` ยังแนบ header `Authorization` ให้อัตโนมัติ เป็น access token ของ user ที่ล็อกอินอยู่ตอนนั้น หรือเป็น anon key ของโปรเจกต์ถ้าไม่มีใครล็อกอิน นั่นแปลว่า function ของคุณตรวจสอบได้ว่าใครเป็นคนเรียก (หรือยืนยันว่าไม่มีการยืนยันตัวตนเลย) โดยไม่ต้องต่อ header นี้เองในทุกครั้งที่เรียก
+
+## Secrets และ environment variables
+
+function มักต้องใช้ credential ที่ห้ามให้ client เห็นเด็ดขาด เช่น API key ของ third-party หรือ signing secret ตั้งค่าให้ deployed function ด้วย CLI
+
+```bash
+supabase secrets set MY_API_KEY=sk_live_examplekey123
+```
+
+อ่านค่าในฟังก์ชันด้วย `Deno.env.get`
+
+```typescript
+const apiKey = Deno.env.get('MY_API_KEY')
+```
+
+สำหรับ local development `supabase functions serve` จะอ่านไฟล์ `.env` ที่วางไว้ใต้ `supabase/functions/` ดังนั้นโค้ด `Deno.env.get` เดิมทำงานเหมือนกันไม่ว่าจะรัน local หรือรันบน function ที่ deploy แล้ว ต่างกันแค่ค่านั้นมาจากไหน
+
+<Mermaid title="การ invoke จาก client ไปถึง Deno function ที่ deploy แล้ว" code={invokeFlowDiagram} />
+
+export const invokeFlowDiagram = `flowchart LR
+  client["supabase.functions.invoke('hello-world', { body })"] -->|"HTTP request + Authorization header"| edge["Deployed Deno function (Deno.serve)"]
+  edge -->|"Response"| client`;
+
+<Callout title="สรุปในบรรทัดเดียว">
+Edge Function คือ `Deno.serve((req) => ...)` handler ที่**ไม่ต้อง import** อะไรสำหรับ `Deno.serve` เอง เรียกใช้จาก client ด้วย `supabase.functions.invoke(name, { body })` ซึ่ง**แนบ Authorization header ให้อัตโนมัติ** (user token หรือ anon key) ส่วน secrets ตั้งค่าด้วย `supabase secrets set` แล้วอ่านในฟังก์ชันด้วย `Deno.env.get` โดย local ใช้ไฟล์ `.env` ใต้ `supabase/functions/` แทน
+</Callout>
+
+export const quizWritingInvoking = [
+  {
+    q: 'ต้อง import อะไรก่อนใช้ Deno.serve ใน Edge Function หรือไม่',
+    options: [
+      'ต้อง import จาก Deno standard library module',
+      'ไม่ต้อง Deno.serve เป็น global ที่ runtime มีให้',
+      'ต้องติดตั้งผ่าน npm ก่อน',
+      'ต้อง import เฉพาะตอนรัน local ด้วย supabase functions serve',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'supabase.functions.invoke() แนบอะไรให้ request อัตโนมัติ',
+    options: [
+      'ไม่แนบอะไรเลย ต้องตั้ง header เองทุกครั้ง',
+      'header Authorization ที่เป็น access token ของผู้เรียกหรือ anon key',
+      'service_role key แบบ hard-coded',
+      'request id แบบสุ่มเท่านั้น',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ตั้งค่า secret ให้ Edge Function ที่ deploy แล้วทำอย่างไร',
+    options: [
+      'เขียนค่าลงไฟล์ index.ts โดยตรง',
+      'รัน supabase secrets set MY_API_KEY=value แล้วอ่านด้วย Deno.env.get',
+      'เก็บไว้ใน Postgres table แล้ว query ตอน request',
+      'ใช้ secret ใน Edge Function ไม่ได้',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'local development อ่าน environment variables ของ function มาจากไหน',
+    options: [
+      'เรียก secrets store ที่ deploy แล้วผ่านเครือข่ายเสมอ',
+      'จากไฟล์ .env ที่วางไว้ใต้ supabase/functions/',
+      'ใช้ environment variables ใน local ไม่ได้',
+      'จาก package.json ของโปรเจกต์',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="edge-functions/writing-and-invoking-a-function" questions={quizWritingInvoking} />
+
+<ProgressTracker client:visible id="edge-functions/writing-and-invoking-a-function" />

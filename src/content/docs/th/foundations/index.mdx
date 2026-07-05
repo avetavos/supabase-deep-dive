@@ -1,0 +1,32 @@
+---
+title: 'Supabase — From Zero to Hero'
+description: 'คอร์ส Supabase แบบ zero-to-hero เน้น developer — Postgres และ CLI, auto-generated API, Row Level Security, Realtime, Storage, Edge Functions และการรัน Supabase บน production'
+sidebar:
+  order: 1
+---
+
+import Callout from '../../../../components/Callout.astro';
+
+**Supabase** คือแพลตฟอร์ม Postgres แบบ open-source database Postgres จริงที่ไม่ได้ถูกดัดแปลง พร้อม service ที่ห่อรอบมันอีกชั้น — auto-generated REST/RPC API (PostgREST), authentication (Auth), file storage (Storage), realtime event stream (Realtime) และ serverless function บน Deno (Edge Functions) — บวก Supabase CLI และ Studio สำหรับจัดการทั้งหมดนี้ คอร์สนี้เขียนขึ้น**สำหรับ developer** — คนที่ออกแบบ schema, รักษาความปลอดภัยให้มัน, query มัน และต้องทำให้มันทำงานถูกต้องบน production
+
+ตัวอย่าง client ทุกอันในคอร์สนี้ใช้ **TypeScript** ด้วย **`supabase-js`** (client อย่างเป็นทางการของ JavaScript/TypeScript) ซึ่งเป็นตัวเลือก default ที่ใช้กันแพร่หลายที่สุดใน ecosystem ของ Supabase มีสองเรื่องที่ tutorial เก่าหลายที่มักสอนผิดหรือข้ามไป เพราะ default ของ Supabase เปลี่ยนไป — **Row Level Security** ต้องเปิดเองต่อ table ไม่มีทางเปิดมาให้โดย default และแม้เปิด RLS แล้ว table จะเข้าถึงผ่าน auto-generated API ได้ก็ต่อเมื่อถูก expose ผ่าน **Data API** อย่างชัดเจน (คนละ layer กับ RLS ที่ทำงานระดับ row) คอร์สนี้สอนทั้งสอง layer อย่างถูกต้องและแยกจากกันชัดเจน
+
+## สิ่งที่คอร์สนี้ครอบคลุม
+
+| Module | คุณจะได้เรียน |
+| --- | --- |
+| **Foundations** | Supabase คืออะไร, ตั้งค่า project และ CLI, table/schema/migration, ภาพรวมสถาปัตยกรรม |
+| **Auto-Generated API** | REST API ของ PostgREST, การ query ด้วย client SDK, RPC function, Data API exposure model |
+| **Auth & Row Level Security** | วิธี authenticate, session กับ JWT, RLS พื้นฐาน, pattern กับข้อผิดพลาดของ RLS |
+| **Realtime & Storage** | Postgres Changes, Broadcast กับ Presence, storage bucket กับ policy, การแปลงรูปภาพ |
+| **Edge Functions** | function บน Deno, การเรียกใช้, การเข้าถึง database จาก function, background task กับ webhook |
+| **Client Development** | supabase-js client, auth ฝั่ง client, typed query, การรวม REST/Realtime/Storage |
+| **Production & Ecosystem** | Supavisor connection pooling, branching กับ migration, performance กับ indexing, production checklist |
+
+## วิธีอ่าน
+
+แต่ละบทเริ่มด้วยไอเดียหลักในหนึ่งประโยค แสดง TypeScript/SQL และ CLI command จริง มีไดอะแกรมของกลไกที่เกี่ยวข้อง และปิดท้ายด้วย takeaway หนึ่งบรรทัดพร้อม quiz สั้น ๆ อ่านเรียงจากบนลงล่าง — module หลัง ๆ จะอ้างอิงคำศัพท์เรื่อง schema, RLS และ Data API จากบทแรก ๆ เหล่านี้
+
+<Callout title="The one-line takeaway">
+Supabase คือ **Postgres บวก service ที่ห่อรอบมันอีกชั้น** — REST/RPC API, Auth, Storage, Realtime และ Edge Functions ทั้งหมดอยู่หน้า database จริงตัวเดียวที่คุณ query ตรงได้เช่นกัน คอร์สนี้สอน Supabase จากมุมมอง developer — service ต่าง ๆ, security สองชั้นที่แยกกัน (Data API exposure กับ Row Level Security) และพฤติกรรมบน production — เริ่มจาก database เอง
+</Callout>

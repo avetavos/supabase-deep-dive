@@ -1,0 +1,140 @@
+---
+title: 'Background Tasks และ Webhooks กับ Functions'
+description: 'การเรียก Edge Function อัตโนมัติจากการเปลี่ยนแปลงในฐานข้อมูลด้วย Database Webhooks และการรันงานต่อหลังตอบ response ด้วย EdgeRuntime.waitUntil'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## แนวคิดในหนึ่งประโยค
+
+**Database Webhook** ทำให้ row ที่เปลี่ยนแปลงใน Postgres เรียก Edge Function ได้อัตโนมัติ ส่วน `EdgeRuntime.waitUntil` ทำให้ function นั้นตอบกลับทันทีในขณะที่งานที่ช้ากว่ายังทำต่อในเบื้องหลัง
+
+## Database Webhooks ให้ฐานข้อมูลเป็นฝ่ายเรียกออกไปเอง
+
+Edge Function ทุกตัวที่ผ่านมาถูกเรียกโดย client อย่างชัดเจนด้วย `supabase.functions.invoke()` แต่งานจริงจำนวนมากควรเกิดขึ้นเพราะ**การเปลี่ยนแปลงในฐานข้อมูล** ไม่ใช่เพราะ client จำได้ว่าต้องเรียก เช่น ส่ง welcome email ตอนมี row ใหม่ใน `profiles` หรือแจ้งระบบปลายทางตอนมีการสั่งซื้อ Database Webhooks ตอบโจทย์นี้ตรง ๆ ตั้งค่าบน table สำหรับ event `insert`, `update` หรือ `delete` แล้ว Supabase จะยิง HTTP request ให้ทุกครั้งที่ event นั้นเกิดขึ้น
+
+เบื้องหลัง Database Webhook คือ wrapper สะดวกใช้ที่ครอบ Postgres trigger อยู่ สร้างบน extension **`pg_net`** `pg_net` ยิง HTTP request จากใน Postgres แบบ**asynchronous** ดังนั้น network call ที่ช้าหรือ fail จะไม่บล็อกการเขียนข้อมูลที่ทำให้เกิด trigger นั้นเลย คำสั่ง `insert` commit ได้ไม่ว่า HTTP call ของ webhook จะใช้เวลานานแค่ไหน
+
+```sql
+-- Roughly what a Database Webhook configures under the hood:
+-- a trigger that calls pg_net on insert into public.profiles
+create trigger "profiles_insert_webhook"
+after insert on public.profiles
+for each row
+execute function supabase_functions.http_request(
+  'https://<project-ref>.supabase.co/functions/v1/welcome-email',
+  'POST',
+  '{"Content-Type":"application/json"}',
+  '{}',
+  '5000'
+);
+```
+
+ในทางปฏิบัติคุณตั้งค่านี้ผ่าน Dashboard ในส่วน Database Webhooks แทนที่จะเขียน trigger เอง แต่การรู้ว่ามันคือ "trigger บวก `pg_net`" ช่วยอธิบายว่าทำไมมันถึง asynchronous และทำไมมันชี้ไปที่ URL ของ Edge Function ได้เหมือน HTTP client ทั่วไป
+
+## ตอบกลับเร็วในขณะที่งานยังทำต่อ EdgeRuntime.waitUntil
+
+งานบางอย่างที่ trigger แบบนี้ไม่ควรทำให้ response ช้าลง เช่น ส่ง confirmation email เขียน analytics log หรือเรียก third-party API ที่ใช้เวลาสักไม่กี่วินาที การให้ผู้เรียกเดิม (ซึ่งมักเป็นกลไก webhook ของฐานข้อมูลเอง) รอสิ่งเหล่านั้นทั้งหมดเป็นเรื่องเสียเวลาเปล่า `EdgeRuntime.waitUntil(promise)` แก้ปัญหานี้ มันทำเครื่องหมาย promise ว่าเป็น background task ที่ยังรันต่อได้แม้ function จะส่ง response ไปแล้ว
+
+```typescript
+Deno.serve(async (req) => {
+  const payload = await req.json()
+
+  // Do not await this — let it run after the response is sent
+  EdgeRuntime.waitUntil(sendConfirmationEmail(payload))
+
+  return new Response('ok', { status: 200 })
+})
+
+async function sendConfirmationEmail(payload: unknown) {
+  // Slow third-party API call, logging, etc.
+}
+```
+
+จุดสำคัญคือไม่มี `await` อยู่หน้า `sendConfirmationEmail(payload)` ถ้า await มันไป response จะต้องรอจนกว่า email จะส่งเสร็จ การส่ง promise ที่ยังไม่ resolve เข้า `waitUntil` คือการบอก Deno runtime ให้เก็บ instance ของ function ไว้จนกว่า promise นั้นจะจบ โดยไม่ทำให้ HTTP response ต้องรอ
+
+## รวมสองอย่างเข้าด้วยกัน flow ยืนยันคำสั่งซื้อ
+
+ตัวอย่างจริงแบบครบวงจร Database Webhook ยิงตอน `insert` เข้า `orders` เรียก Edge Function ที่ตอบกลับทันทีเพื่อยืนยันว่าเขียนข้อมูลสำเร็จ ในขณะที่ confirmation email ถูกส่งอยู่เบื้องหลัง
+
+```typescript
+Deno.serve(async (req) => {
+  const { record } = await req.json() // the new orders row, from the webhook payload
+
+  EdgeRuntime.waitUntil(sendOrderConfirmationEmail(record))
+
+  return new Response(JSON.stringify({ received: true }), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+})
+
+async function sendOrderConfirmationEmail(order: { id: string; email: string }) {
+  // Call an email provider here; this runs after the response is already sent
+}
+```
+
+ฐานข้อมูลไม่ต้องรอ email provider เลย ผู้เรียก webhook ได้ `200` เร็ว ๆ และ email ก็ยังถูกส่งอยู่ดี เพียงแต่ส่งหลังจาก HTTP round trip จบไปแล้ว
+
+<Mermaid title="Postgres insert trigger ไปยัง webhook, Edge Function และ background task" code={webhookBackgroundDiagram} />
+
+export const webhookBackgroundDiagram = `flowchart LR
+  insertRow["insert into orders"] --> webhook["Database Webhook (pg_net, async)"]
+  webhook --> edge["Edge Function"]
+  edge --> respond["Immediate response: 200 received"]
+  edge -->|"EdgeRuntime.waitUntil"| bg["Background task: send confirmation email"]`;
+
+<Callout title="สรุปในบรรทัดเดียว">
+**Database Webhook** คือ Postgres trigger ที่สร้างบน extension **`pg_net`** ซึ่งยิง HTTP request แบบ asynchronous ไปยัง Edge Function ทุกครั้งที่ row event ที่เลือกไว้เกิดขึ้น ส่วน **`EdgeRuntime.waitUntil(promise)`** ทำให้ function นั้นคืน response ทันทีในขณะที่ promise ที่ไม่ได้ await ยังทำงานต่อ รวมกันแล้ว `insert` เข้า `orders` เรียก function ที่ยืนยันทันทีในขณะที่ confirmation email ถูกส่งอยู่เบื้องหลัง
+</Callout>
+
+export const quizBackgroundWebhooks = [
+  {
+    q: 'Database Webhooks ใช้ Postgres extension อะไรเป็นพื้นฐาน',
+    options: [
+      'pg_cron',
+      'pg_net',
+      'pg_graphql',
+      'pg_stat_statements',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไม pg_net ถึงทำให้ HTTP call ของ webhook เป็นแบบ asynchronous',
+    options: [
+      'เพื่อให้ client ที่เรียกต้อง poll ผลลัพธ์เอง',
+      'เพื่อไม่ให้ HTTP request ที่ช้าหรือ fail บล็อกการเขียนข้อมูลที่ทำให้เกิด trigger',
+      'เพื่อให้ใช้ได้เฉพาะการอ่านเท่านั้น ใช้กับการเขียนไม่ได้',
+      'พฤติกรรม asynchronous ไม่เกี่ยวกับ pg_net',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'EdgeRuntime.waitUntil ทำให้ Edge Function ทำอะไรได้',
+    options: [
+      'ชะลอการส่ง response จนกว่า promise ทุกตัวจะ resolve',
+      'คืน HTTP response ทันทีในขณะที่ background task ยังทำงานต่อหลังจากนั้น',
+      'retry request ที่ fail ให้อัตโนมัติ',
+      'cache response ไว้ใช้กับ request ที่เหมือนกันในอนาคต',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ในตัวอย่างยืนยันคำสั่งซื้อแบบรวม ถ้า await promise ของการส่ง email แทนที่จะส่งเข้า waitUntil จะเกิดอะไรขึ้น',
+    options: [
+      'ไม่มีอะไรเปลี่ยน พฤติกรรมเหมือนเดิมทุกประการ',
+      'HTTP response จะต้องรอจนกว่า email จะส่งเสร็จ',
+      'การ insert ในฐานข้อมูลจะถูก rollback',
+      'Database Webhook จะหยุดยิง',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="edge-functions/background-tasks-and-webhooks-with-functions" questions={quizBackgroundWebhooks} />
+
+<ProgressTracker client:visible id="edge-functions/background-tasks-and-webhooks-with-functions" />

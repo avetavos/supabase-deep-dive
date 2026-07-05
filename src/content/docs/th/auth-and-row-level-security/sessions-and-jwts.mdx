@@ -1,0 +1,115 @@
+---
+title: 'Sessions and JWTs'
+description: 'Supabase Auth ออกและ refresh JWT access token ยังไง และ token พวกนี้ไหลไปถึง Postgres สำหรับ row level security ยังไง'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## แนวคิดในหนึ่งประโยค
+
+sign-in สำเร็จหนึ่งครั้งจะได้ **JWT access token** อายุสั้นมาพร้อมกับ **refresh token** อายุยาวกว่า `supabase-js` จะเก็บและ refresh ทั้งคู่ให้เองแบบเงียบ ๆ และ claim ที่อยู่ใน JWT — user ID กับ role — นี่แหละที่ Postgres ใช้ตัดสินว่า request หนึ่ง ๆ มีสิทธิ์เห็นอะไรบ้าง
+
+## สิ่งที่ได้กลับมาหลัง sign-in
+
+ทุกครั้งที่ sign-in สำเร็จจะได้ session ที่มี `access_token` (เป็น JWT อายุสั้น ปกติประมาณหนึ่งชั่วโมง) และ `refresh_token` (อายุยาวกว่า ใช้สร้าง access token ใหม่แบบเงียบ ๆ เมื่ออันเก่าหมดอายุ) `supabase-js` จัดการเรื่อง storage และ refresh cycle ให้ทั้งหมด — คุณไม่ต้องมานั่งตาม expiry เองหรือเรียก refresh endpoint เอง
+
+```typescript
+const {
+  data: { session },
+} = await supabase.auth.getSession();
+
+console.log(session?.access_token); // short-lived JWT
+console.log(session?.refresh_token); // used to silently mint a new access token later
+```
+
+ตัว JWT เองพก claim มาด้วย — claim `sub` เก็บ user ID และ claim `role` (ปกติเป็น `authenticated` สำหรับ user ที่ sign-in แล้ว และ `anon` สำหรับ request ที่ยังไม่ได้ sign-in) ทุก request ที่ `supabase-js` ยิงไปยัง API ที่ auto-generate จะแนบ JWT นี้ไปด้วย และ Postgres กับ PostgREST จะอ่าน claim พวกนี้ตอนรับ request เข้ามา นี่คือสิ่งที่ทำให้ `auth.uid()` ทำงานได้ภายใน row level security policy ซึ่งบทถัดไปจะลงลึก — JWT ที่แนบมากับ request คือสิ่งที่ทำให้ policy เช็คได้ว่า row นี้เป็นของ user คนปัจจุบันหรือเปล่า
+
+## อ่าน session ปัจจุบัน: getSession vs getUser
+
+`supabase.auth.getSession()` อ่าน session ตรงจาก local storage เลย (refresh ให้ถ้า access token หมดอายุ) จึงคืนค่าทันทีโดยไม่ต้อง round trip ไปหา Auth server ส่วน `supabase.auth.getUser()` จะส่ง access token ไปให้ Auth server ตรวจสอบใหม่ ดังนั้นช้ากว่าแต่น่าเชื่อถือกว่า — ใช้ `getUser()` ทุกครั้งที่ต้องการความมั่นใจว่า token ไม่ได้ถูกปลอมหรือถูก revoke ไปแล้ว เช่นก่อนทำ action ฝั่ง server ที่มีความสำคัญสูง
+
+```typescript
+// Fast: reads the locally stored session, refreshing it if needed
+const { data: { session } } = await supabase.auth.getSession();
+
+// Authoritative: revalidates the access token against the Auth server
+const { data: { user }, error } = await supabase.auth.getUser();
+```
+
+## ให้ทุกอย่างซิงก์กัน: onAuthStateChange
+
+sign-in, sign-out และ token refresh ทั้งหมดเกิดขึ้นแบบ asynchronous ดังนั้นโค้ดฝั่ง UI ต้องการวิธีตอบสนองต่อมัน ไม่ใช่คอย poll เอง `supabase.auth.onAuthStateChange` ลงทะเบียน listener ที่ยิงทุกครั้งที่ event พวกนี้เกิดขึ้น พร้อมชื่อ event และ session ปัจจุบัน เป็นวิธีมาตรฐานในการทำให้ state ฝั่ง client (nav bar ที่โชว์ว่า sign-in แล้ว, redirect หลัง logout และอื่น ๆ) ตรงกับ auth state จริง
+
+```typescript
+const { data: authListener } = supabase.auth.onAuthStateChange((event, session) => {
+  console.log(event, session?.user?.id);
+  // event is one of: SIGNED_IN, SIGNED_OUT, TOKEN_REFRESHED, USER_UPDATED, ...
+});
+
+// Later, when the listener is no longer needed:
+authListener.subscription.unsubscribe();
+```
+
+<Mermaid title="From sign-in to a JWT Postgres can evaluate" code={sessionFlowDiagram} />
+
+export const sessionFlowDiagram = `flowchart LR
+  signin["User signs in"] --> issue["Auth issues access token (JWT) + refresh token"]
+  issue --> attach["supabase-js attaches JWT to every API request"]
+  attach --> pg[("Postgres / PostgREST reads JWT claims")]
+  pg --> uid["auth.uid() available inside RLS policies"]`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+sign-in คืนค่า **JWT access token** อายุสั้นมาพร้อมกับ **refresh token** อายุยาวกว่า ทั้งคู่ถูกจัดการอัตโนมัติโดย `supabase-js` claim ใน JWT (user ID ใน `sub` และ `role`) คือสิ่งที่ Postgres อ่านทุก request ซึ่งเป็นตัวที่ทำให้ **`auth.uid()`** ทำงานได้ภายใน row level security policy ใช้ **`getSession()`** เมื่อต้องการอ่านจาก local storage เร็ว ๆ และใช้ **`getUser()`** เมื่อต้องการให้ Auth server ตรวจสอบ token ใหม่ ส่วน **`onAuthStateChange`** ใช้ทำให้ UI state ตรงกับ event sign-in, sign-out และ token refresh
+</Callout>
+
+export const quizSessionsAndJwts = [
+  {
+    q: 'JWT ที่ Supabase Auth ออกให้ ทำให้ row level security policy เข้าถึงอะไรได้บ้าง',
+    options: [
+      'ไม่มีอะไรเลย RLS อ่าน claim ของ JWT ไม่ได้',
+      'user ID ปัจจุบัน (ผ่าน auth.uid() ที่มาจาก claim sub) และ role',
+      'password ของ user แบบ plain text',
+      'มีแค่ refresh token เท่านั้น',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'onAuthStateChange ใช้ทำอะไร',
+    options: [
+      'เข้ารหัส JWT',
+      'ลงทะเบียน listener ที่ยิงตอน sign-in, sign-out, token refresh และ event อื่น ๆ ที่คล้ายกัน เพื่อให้ UI ตรงกับ auth state',
+      'สร้าง row level security policy ใหม่ใน Postgres',
+      'หมุน API key ของ Supabase project',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ความต่างหลักระหว่าง getSession() กับ getUser() คืออะไร',
+    options: [
+      'เหมือนกันทุกอย่าง',
+      'getSession() อ่าน session ที่เก็บไว้ใน local storage โดยไม่จำเป็นต้องยิงไปหา Auth server ส่วน getUser() ตรวจสอบ token กับ Auth server ใหม่เสมอ',
+      'getUser() ใช้ได้เฉพาะ OAuth sign-in เท่านั้น',
+      'getSession() จะ fail เสมอถ้า user sign-in อยู่',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'หลัง sign-in supabase-js จัดการ token สองแบบไหนให้เราโดยอัตโนมัติ',
+    options: [
+      'API key กับ database password',
+      'JWT access token อายุสั้น กับ refresh token อายุยาวกว่า',
+      'access token ที่เหมือนกันสองอัน',
+      'session cookie กับ CSRF token เท่านั้น',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="auth-and-row-level-security/sessions-and-jwts" questions={quizSessionsAndJwts} />
+
+<ProgressTracker client:visible id="auth-and-row-level-security/sessions-and-jwts" />

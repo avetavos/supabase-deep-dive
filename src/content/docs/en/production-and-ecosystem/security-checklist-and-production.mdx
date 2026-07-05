@@ -1,0 +1,105 @@
+---
+title: 'Security Checklist and Production Readiness'
+description: 'A closing checklist tying Row Level Security, the Data API, Supavisor, migrations, indexing, and backups into one production-ready Supabase project.'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+A production-ready Supabase project is not any single setting done right — it is Row Level Security, deliberate Data API exposure, a service role key kept server-side, indexed policy columns, Supavisor in the right mode, migrations flowing through CI, and backups with point-in-time recovery, all holding together at once around one Postgres database.
+
+## The checklist
+
+Each of these was covered earlier in the course. On its own, skipping any one of them does not necessarily break anything visibly — that is exactly what makes them easy to skip, and exactly why they belong on a checklist rather than left to memory.
+
+- **Row Level Security is enabled on every table holding user data, with policies for every operation you actually need.** Enabling RLS with only a `select` policy silently makes every insert, update, and delete fail for ordinary users, since a missing policy for an operation denies it by default — covered in the Auth and RLS module.
+- **Data API exposure is deliberate, per table and per function, not left on by default without thought.** A table that does not need to be reachable over the REST or RPC interface should not be, since anything exposed there is reachable by anyone who can craft a valid request — covered in the Auto-Generated API module.
+- **The `service_role` key never appears in client-side code.** It bypasses RLS entirely, so it belongs only in trusted server-side contexts like Edge Functions, never shipped to a browser or mobile app bundle — covered in the Foundations and Edge Functions modules.
+- **Indexes exist on columns referenced by RLS policies, and on other frequently filtered or joined columns.** An unindexed policy column runs a full evaluation pass over every row on every query, which is fine on a small table and a production incident on a large one — covered in the previous lesson.
+- **Supavisor runs in transaction mode for serverless and edge database access, with direct or session-mode connections reserved for cases that genuinely need them.** Serverless and Edge Function traffic opens far more concurrent connections than Postgres can hold directly, which is exactly the problem the pooler exists to solve — covered in the first lesson of this module.
+- **Migrations are tracked in version control and applied through CI, not run ad hoc against production.** A migration file merged to the main branch should deploy the same way every time, through the same pipeline that already tested it on a preview branch — covered in the previous lesson.
+- **Backups and point-in-time recovery are enabled for anything that matters in production.** Point-in-time recovery, or PITR, lets you restore a project to any specific moment within its retention window, not just to the most recent daily backup, which matters when the incident you need to undo happened hours after the last snapshot was taken.
+
+```sql
+-- A quick self-check: any table with RLS enabled but zero policies for a given command
+-- denies that command entirely rather than allowing it, so gaps here fail closed, not open
+select relname as table_name, relrowsecurity as rls_enabled
+from pg_class
+where relnamespace = 'public'::regnamespace
+  and relkind = 'r';
+```
+
+## One project, all of it at once
+
+Picture a real app: a task manager with a `todos` table, RLS enabled with policies scoped to `auth.uid() = user_id`, and an index on that same `user_id` column so the policy check stays fast as the table grows. Only the `todos` table and the `create_todo` RPC function are exposed through the Data API — nothing else in the schema is reachable over REST. The app's serverless backend connects through Supavisor in transaction mode, so a burst of concurrent requests never comes close to exhausting Postgres's connection limit. An Edge Function handles the one operation that genuinely needs elevated access — say, an admin cleanup job — using the `service_role` key, which exists only in that function's environment and nowhere in the client bundle. Every schema change, from the original `create table` to the index that came later, is a migration file that went through a preview branch and was applied to production by CI, not by someone pasting SQL into a dashboard. And point-in-time recovery is enabled, so a bad migration or an accidental bulk delete is a restore away from being undone, not a permanent loss.
+
+None of these pieces is exotic on its own. What makes the project production-ready is that they hold together at the same time, around the same database, instead of being true in isolation while the rest of the checklist quietly does not apply.
+
+<Mermaid title="Every piece of a production-ready Supabase project ties back to one Postgres database" code={securityChecklistDiagram} />
+
+export const securityChecklistDiagram = `flowchart TD
+  db[("Postgres database")]
+  rls["RLS policies scoped to auth.uid()"] --> db
+  idx["Index on RLS policy columns"] --> db
+  api["Data API - only todos table and create_todo RPC exposed"] --> db
+  pool["Serverless backend via Supavisor - transaction mode"] --> db
+  fn["Edge Function using service_role key for admin tasks"] --> db
+  ci["Migrations via preview branch and CI"] --> db
+  pitr["Backups with point-in-time recovery"] --> db`;
+
+<Callout title="The one-line takeaway">
+A production-ready Supabase project is the sum of every earlier module holding true at once: **Row Level Security** with policies for every operation you need, **Data API** exposure kept deliberate, the **service_role** key confined to trusted server-side code, **indexes** on RLS policy columns, **Supavisor** in transaction mode for serverless access, **migrations** flowing through CI instead of ad hoc SQL, and **backups with point-in-time recovery** so a bad change is always reversible — none of these is optional in a system that actually has to run in production.
+</Callout>
+
+export const quizSecurityChecklist = [
+  {
+    q: 'A table has Row Level Security enabled with only a select policy defined. What happens when an ordinary user tries to insert a row?',
+    options: [
+      'The insert succeeds normally, since RLS only restricts reads',
+      'The insert fails, because a missing policy for an operation denies that operation by default under RLS',
+      'The insert succeeds but is logged as a security warning',
+      'RLS is automatically disabled until an insert policy is added',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why should the service_role key never appear in client-side code?',
+    options: [
+      'It is rate-limited more aggressively than the anon key',
+      'It bypasses Row Level Security entirely, so any client holding it could read or write any row in any table',
+      'It only works when called from an Edge Function, so it simply would not function in a browser',
+      'It expires after a few seconds, making it useless in client code anyway',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why does running migrations through CI rather than manually matter for production readiness?',
+    options: [
+      'It does not matter much, as long as someone remembers to run the SQL eventually',
+      'CI applies a version-controlled migration file the same way every time, the same pipeline that already tested it on a preview branch, instead of relying on someone pasting SQL into production by hand',
+      'CI is only needed for projects with more than one developer',
+      'Manual SQL against production is actually faster and equally safe',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does point-in-time recovery, or PITR, specifically let you do that a daily backup alone does not?',
+    options: [
+      'Restore the project to any specific moment within the retention window, not just the time of the most recent daily snapshot',
+      'Automatically prevent bad migrations from ever being applied',
+      'Recover deleted rows without ever needing a backup at all',
+      'Roll back only the Data API configuration, leaving the database schema unaffected',
+    ],
+    answer: 0,
+  },
+];
+
+<Quiz client:visible id="production-and-ecosystem/security-checklist-and-production" questions={quizSecurityChecklist} />
+
+<ProgressTracker client:visible id="production-and-ecosystem/security-checklist-and-production" />

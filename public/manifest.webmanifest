@@ -1,0 +1,31 @@
+{
+  "id": "/supabase/",
+  "name": "Supabase — From Zero to Hero",
+  "short_name": "Supabase",
+  "start_url": "/supabase/en/",
+  "scope": "/supabase/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0d1117",
+  "theme_color": "#3ECF8E",
+  "icons": [
+    {
+      "src": "/supabase/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/supabase/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/supabase/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}

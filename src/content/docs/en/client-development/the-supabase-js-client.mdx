@@ -1,0 +1,134 @@
+---
+title: 'The supabase-js Client'
+description: 'Initializing supabase-js with the anon key, generating typed database schemas with the CLI, and why one client instance is usually enough for an entire app.'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+`createClient` builds the one object your app uses to talk to Postgres, Auth, Storage, and Realtime, and it should always be constructed with the public `anon` key — never the `service_role` key — because the schema's row level security policies, not the secrecy of this key, are what actually protect your data.
+
+## Initializing the client
+
+Every `supabase-js` app starts the same way: import `createClient`, hand it your project URL and a key, and you get back an object with `.from()`, `.auth`, `.storage`, and `.channel()` on it.
+
+```typescript
+import { createClient } from '@supabase/supabase-js';
+
+// Safe to ship in browser bundles: this is the anon key, not the service_role key
+const supabase = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_ANON_KEY!
+);
+```
+
+This is worth repeating clearly, because it is easy to get backwards: the client in browser or mobile code must always be initialized with the **`anon` key**. The `anon` key is designed to be public — it ships inside your JavaScript bundle where anyone can read it, and that is fine. What actually stops a stranger from reading or writing rows they should not touch is **row level security (RLS)** on your tables, not any secrecy around this key. The **`service_role` key** is a completely different thing: it bypasses RLS entirely, which makes it extremely powerful and exactly why it must never appear in client-side code — it belongs only in trusted server environments (an Edge Function, a backend process) where it never reaches a browser.
+
+## Generated types turn `.from()` into a typed API
+
+The Supabase CLI can read your live schema and emit a matching TypeScript `Database` type:
+
+```bash
+supabase gen types typescript --project-id abcdefghijklmnopqrst > database.types.ts
+```
+
+That command inspects every table, column, and constraint in your project and generates a type with a `Row`, `Insert`, and `Update` shape per table — `Database['public']['Tables']['movies']['Row']` is exactly the columns a `select` returns, `Insert` is what a valid new row looks like, and `Update` is what a partial patch looks like. Passing this type as a generic to `createClient` wires the whole query builder up to it:
+
+```typescript
+import { createClient } from '@supabase/supabase-js';
+import type { Database } from './database.types';
+
+const supabase = createClient<Database>(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_ANON_KEY!
+);
+
+// Autocomplete on table names, column names, and the shape of data
+const { data, error } = await supabase
+  .from('movies')
+  .select('id, title, year');
+```
+
+From this point on, misspelling a column name, selecting a table that does not exist, or building an `insert` payload that is missing a required field all become compile-time TypeScript errors instead of runtime surprises. Whenever your schema changes, re-run the same CLI command to regenerate `database.types.ts` and the whole app's types stay in sync with the database.
+
+## One client, created once
+
+A `supabase-js` client is typically created a single time and reused everywhere in the app — a singleton — rather than re-created on every request or every component render.
+
+```typescript
+// lib/supabase.ts — created once, imported wherever it is needed
+import { createClient } from '@supabase/supabase-js';
+import type { Database } from './database.types';
+
+export const supabase = createClient<Database>(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_ANON_KEY!
+);
+```
+
+Two practical reasons drive this. First, the client holds **session state** in memory (and in local storage) — recreating it discards or duplicates that state and can cause auth listeners to fire inconsistently. Second, the client manages its own network resources, including the WebSocket connection Realtime uses — a fresh client per component means redundant connections instead of one shared, reused connection. Importing the same instance everywhere avoids both problems.
+
+<Mermaid title="From your Postgres schema to a typed query builder" code={jsClientDiagram} />
+
+export const jsClientDiagram = `flowchart LR
+  schema[("Your Postgres schema")] --> gen["supabase gen types typescript"]
+  gen --> types["Generated Database type (database.types.ts)"]
+  types --> client["createClient<Database>()"]
+  client --> query["Typed .from() queries with autocomplete"]`;
+
+<Callout title="The one-line takeaway">
+Build the client with **`createClient`**, always using the public **`anon` key** in browser or mobile code — **RLS**, not key secrecy, is what protects your data, while the **`service_role` key** bypasses RLS and must stay server-side only. Run **`supabase gen types typescript --project-id <ref> > database.types.ts`** and pass the resulting `Database` type as a generic to `createClient<Database>()` to get compile-time checking and autocomplete on every `.from()` call. Create the client **once** and reuse that single instance everywhere, since it holds session state and manages shared network connections.
+</Callout>
+
+export const quizJsClient = [
+  {
+    q: 'Which key should initialize supabase-js in browser or mobile client code?',
+    options: [
+      'The service_role key, because it has full access',
+      'The anon key, because row level security is what protects data, not the secrecy of this key',
+      'Either key works identically in client code',
+      'A key is not required for client-side initialization',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why must the service_role key never appear in client-side code?',
+    options: [
+      'It is slower than the anon key',
+      'It bypasses row level security entirely, so exposing it would let anyone read or write any row',
+      'It only works from the Supabase CLI',
+      'It expires after a few minutes and would break the app',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does passing a generated Database type as a generic to createClient give you?',
+    options: [
+      'Faster network requests',
+      'Compile-time checking and autocomplete on .from() queries against your actual schema',
+      'Automatic row level security policies',
+      'A built-in admin dashboard',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why is a supabase-js client typically created once and reused as a singleton?',
+    options: [
+      'Because createClient can only be called one time per process ever',
+      'It holds session state in memory and manages shared network connections, so recreating it per request or component wastes resources and can desync auth state',
+      'Because TypeScript requires exactly one client per file',
+      'Reuse has no real benefit, it is just a stylistic preference',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="client-development/the-supabase-js-client" questions={quizJsClient} />
+
+<ProgressTracker client:visible id="client-development/the-supabase-js-client" />

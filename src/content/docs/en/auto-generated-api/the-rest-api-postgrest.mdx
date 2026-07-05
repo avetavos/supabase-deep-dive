@@ -1,0 +1,135 @@
+---
+title: 'The REST API — PostgREST'
+description: 'How PostgREST introspects your Postgres schema to generate a REST endpoint for every exposed table, and how query parameters drive filtering, column selection, ordering, and relationship embedding.'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+**PostgREST** reads your Postgres schema and turns every exposed table and view into a REST endpoint automatically — you never hand-write API route code.
+
+## From a table to an endpoint
+
+When you create a table `public.movies`, you do not write a controller, a route, or a serializer for it. PostgREST connects to your database, introspects the schema (tables, columns, types, foreign keys), and generates a matching REST endpoint at request time. The table becomes reachable at:
+
+```bash
+GET /rest/v1/movies
+```
+
+This is the mechanism behind the Data API in every Supabase project — PostgREST sits in front of Postgres and translates HTTP requests into SQL queries. Add a column, and the response shape changes on the next request. Add a table, and a new endpoint exists — no deploy step, no code to write.
+
+```sql
+create table public.movies (
+  id bigint generated always as identity primary key,
+  title text not null,
+  year int not null,
+  director_id bigint references public.directors (id)
+);
+```
+
+## Filtering, selecting, and ordering with query parameters
+
+PostgREST reads plain URL query parameters and turns them into a SQL `where`, `select`, and `order by`. Choose which columns come back with `select`:
+
+```bash
+GET /rest/v1/movies?select=id,title,year
+```
+
+Filter rows using PostgREST's `column=operator.value` syntax. Common operators are `eq.` (equals), `gt.`/`gte.` (greater than / or equal), `lt.`/`lte.`, `like.` (pattern match), and `in.` (membership in a list):
+
+```bash
+GET /rest/v1/movies?year=gte.2020
+GET /rest/v1/movies?title=like.*Matrix*
+GET /rest/v1/movies?year=in.(2020,2021,2022)
+```
+
+Sort the result with `order`, and mark descending with `.desc`:
+
+```bash
+GET /rest/v1/movies?order=year.desc
+```
+
+All three combine in a single request:
+
+```bash
+GET /rest/v1/movies?select=id,title,year&year=gte.2020&order=year.desc
+```
+
+## Embedding related resources through foreign keys
+
+PostgREST can follow a foreign-key constraint and return the related row nested inside the response, in one round trip — no separate query, no manual join in your application code. Because `public.movies.director_id` references `public.directors.id`, you can ask for the director alongside each movie:
+
+```bash
+GET /rest/v1/movies?select=title,director:directors(name)
+```
+
+This returns each movie with a nested `director` object containing `name`. PostgREST works this out by reading the actual foreign-key constraint in your schema — there is no separate relationship-mapping file to maintain. If the constraint changes or is dropped, the embedding stops working, because the schema is the single source of truth.
+
+As a related fact worth knowing: the same schema is also exposed automatically as a **GraphQL API** through the `pg_graphql` extension, for callers who prefer GraphQL over REST. This course focuses on the REST/RPC surface, but the GraphQL endpoint exists side by side with no extra schema work.
+
+<Mermaid title="From a Postgres table to a filterable REST endpoint" code={postgrestDiagram} />
+
+export const postgrestDiagram = `flowchart LR
+  tbl[("public.movies (with FK to directors)")] --> introspect["PostgREST introspects the schema"]
+  introspect --> endpoint["GET /rest/v1/movies"]
+  endpoint --> select["?select= chooses columns"]
+  endpoint --> filter["?year=gte.2020 filters rows"]
+  endpoint --> order["?order=year.desc sorts rows"]
+  endpoint --> embed["?select=title,director:directors(name) embeds via FK"]`;
+
+<Callout title="The one-line takeaway">
+**PostgREST** introspects your Postgres schema and generates a REST endpoint for every exposed table with no hand-written API code, where URL query parameters drive **column selection** (`select`), **filtering** (`column=operator.value`, e.g. `gte.`, `like.`, `in.`), and **ordering** (`order`), and where a real **foreign-key constraint** lets you **embed** a related row in the same request — the same schema also gets a GraphQL endpoint for free via `pg_graphql`.
+</Callout>
+
+export const quizPostgrestApi = [
+  {
+    q: 'What actually generates the REST API for a Supabase project table?',
+    options: [
+      'A developer hand-writes a route and controller for each table',
+      'PostgREST introspects the Postgres schema and generates the endpoint automatically',
+      'A separate YAML config file maps tables to routes',
+      'The Supabase CLI compiles routes at deploy time from a fixed template',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does the query parameter `?year=gte.2020` do?',
+    options: [
+      'It creates a new column called year with a default of 2020',
+      'It filters rows where year is greater than or equal to 2020',
+      'It orders results by year starting from 2020',
+      'It selects only the year column and renames it to 2020',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'How does PostgREST know it can embed a related resource like a director inside a movie response?',
+    options: [
+      'You must write a custom resolver function for every relationship',
+      'It reads the actual foreign-key constraint defined in your schema',
+      'It guesses based on matching column names',
+      'Embedding requires a separate GraphQL-only feature and does not work over REST',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Besides REST, what other API style is automatically available from the same schema',
+    options: [
+      'SOAP, via a legacy compatibility layer',
+      'GraphQL, via the pg_graphql extension',
+      'gRPC, via a built-in protocol buffer compiler',
+      'No other API style is available',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="auto-generated-api/the-rest-api-postgrest" questions={quizPostgrestApi} />
+
+<ProgressTracker client:visible id="auto-generated-api/the-rest-api-postgrest" />

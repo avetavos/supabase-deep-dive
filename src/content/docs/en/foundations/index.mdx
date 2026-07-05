@@ -1,0 +1,32 @@
+---
+title: 'Supabase — From Zero to Hero'
+description: 'A developer-focused, zero-to-hero course on Supabase — Postgres and the CLI, the auto-generated API, Row Level Security, Realtime, Storage, Edge Functions, and running Supabase in production.'
+sidebar:
+  order: 1
+---
+
+import Callout from '../../../../components/Callout.astro';
+
+**Supabase** is an open-source Postgres platform: a real, unmodified Postgres database with a set of services layered around it — an auto-generated REST/RPC API (PostgREST), authentication (Auth), file storage (Storage), a realtime event stream (Realtime), and Deno-based serverless functions (Edge Functions) — plus the Supabase CLI and Studio for managing all of it. This course is written **for developers** — people who design a schema, secure it, query it, and have to make it behave correctly in production.
+
+Every client example in this course is **TypeScript** using **`supabase-js`** (the official JavaScript/TypeScript client), the widely-used default across the Supabase ecosystem. Two facts many existing tutorials get wrong or skip entirely, because Supabase's defaults changed: **Row Level Security** must be explicitly enabled per table — it is never on by default — and even with RLS enabled, a table is only reachable through the auto-generated API at all if it has been explicitly exposed through the **Data API** (a separate, table-level layer from RLS's row-level layer). This course teaches both layers accurately and distinctly.
+
+## What this course covers
+
+| Module | You will learn |
+| --- | --- |
+| **Foundations** | What Supabase is, project setup and the CLI, tables/schema/migrations, the overall architecture |
+| **Auto-Generated API** | PostgREST's REST API, querying with the client SDK, RPC functions, the Data API exposure model |
+| **Auth & Row Level Security** | Authentication methods, sessions and JWTs, RLS fundamentals, RLS patterns and pitfalls |
+| **Realtime & Storage** | Postgres Changes, Broadcast and Presence, storage buckets and policies, image transformations |
+| **Edge Functions** | Deno-based functions, invoking them, database access from a function, background tasks and webhooks |
+| **Client Development** | The supabase-js client, auth in the client, typed queries, combining REST/Realtime/Storage |
+| **Production & Ecosystem** | Supavisor connection pooling, branching and migrations, performance and indexing, a production checklist |
+
+## How to read it
+
+Each lesson opens with the idea in one sentence, shows real TypeScript/SQL and CLI commands, has a diagram of the moving parts, and ends with a one-line takeaway plus a short quiz. Work top to bottom — later modules assume the schema, RLS, and Data-API vocabulary from these first lessons.
+
+<Callout title="The one-line takeaway">
+Supabase is **Postgres, plus a set of services layered around it** — a REST/RPC API, Auth, Storage, Realtime, and Edge Functions, all sitting in front of one real database you can also query directly. This course teaches Supabase from a developer's seat — the services, the two distinct security layers (Data API exposure and Row Level Security), and the production behavior — starting from the database itself.
+</Callout>

@@ -1,0 +1,140 @@
+---
+title: 'Combining REST, Realtime, and Storage'
+description: 'สร้าง feature upload รูปที่ compose Storage upload, REST insert ที่ป้องกันด้วย RLS และ Postgres Changes subscription เข้าด้วยกันเป็น client flow เดียว'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+feature จริงแทบไม่เคยแตะแค่ service เดียว — upload รูป บันทึก row ที่ reference รูปนั้น แล้วให้ client อื่นเห็นมันโผล่ขึ้นมาแบบ live คือ flow เดียวที่ compose Storage, REST API ที่ป้องกันด้วย RLS และ Realtime เข้าด้วยกัน และแต่ละส่วนก็คือสิ่งที่เรียนมาแล้วในบทก่อนหน้า
+
+## Step 1: upload file ขึ้น Storage
+
+นี่คือ call `supabase.storage.from(bucket).upload()` ตัวเดียวกับที่เจอในครึ่ง Storage ของ module Realtime and Storage มันส่ง bytes ของ file ไปที่ bucket และถ้าสำเร็จจะคืน path ที่ file ถูกเก็บไว้
+
+```typescript
+const file = fileInput.files[0];
+const filePath = `${userId}/${crypto.randomUUID()}-${file.name}`;
+
+const { data: uploadData, error: uploadError } = await supabase.storage
+  .from('photos')
+  .upload(filePath, file);
+
+if (uploadError) {
+  console.error('upload failed:', uploadError.message);
+  return;
+}
+```
+
+การเช็ก `error` ตรงนี้สำคัญเหมือนในบทก่อน network สะดุดหรือ policy ของ Storage ปฏิเสธ upload ก็โผล่มาผ่าน `uploadError` เหมือนกัน ไม่ใช่ exception ที่ถูก throw และถ้าข้ามการเช็กนี้ไป ก็เท่ากับพยายาม insert row ที่ชี้ไปยัง file ที่ไม่เคยถูกบันทึกจริงแบบเงียบ ๆ
+
+## Step 2: บันทึก row ที่ reference มัน โดยป้องกันด้วย RLS
+
+พอ file ถูกเก็บไว้แล้ว app จะบันทึก row ใน `posts` ที่ชี้ไปยัง file นั้น นี่คือ call `.insert()` ธรรมดา แต่มันสำเร็จได้เพราะ row level security policy จาก module Auth เท่านั้น — policy ที่ให้ user insert row ได้ก็ต่อเมื่อ `user_id` ตรงกับ `auth.uid()` ฝั่ง client ไม่ต้องทำอะไรเพิ่มเพื่อให้ได้การป้องกันนั้น มันถูกบังคับใช้อัตโนมัติโดย Postgres สำหรับทุก request ที่ client ส่งไป
+
+```typescript
+const { data: post, error: insertError } = await supabase
+  .from('posts')
+  .insert({
+    user_id: userId,
+    photo_path: uploadData.path,
+  })
+  .select()
+  .single();
+
+if (insertError) {
+  console.error('insert failed:', insertError.message);
+  return;
+}
+```
+
+ถ้า `userId` ไม่ตรงกับ `auth.uid()` ของ user ที่ signed in อยู่ RLS จะปฏิเสธ insert และ `insertError` จะมีค่า — `{ data, error }` pattern เดียวกันใช้ได้ตรงนี้เหมือนกับ upload และกฎเดียวกันจากบทก่อนก็ใช้ได้เช่นกัน branch ตาม `insertError.code` ถ้าต้องแยกว่าเป็นการถูก policy ปฏิเสธหรือเป็นอย่างอื่น แทนที่จะ parse ข้อความ message
+
+## Step 3: client อีกตัวเห็นมันแบบ live
+
+client ตัวที่สองที่ต่ออยู่แล้ว — คนอื่นที่กำลังดู feed เดียวกัน — subscribe อยู่กับ `postgres_changes` บน table `posts` ตามที่ module Realtime อธิบายไว้ ทันทีที่ insert จาก step 2 commit Postgres จะ replicate การเปลี่ยนแปลงนั้นออกไป และ subscription นี้ก็จะ fire พร้อม row ใหม่เป็น payload
+
+```typescript
+supabase
+  .channel('posts-feed')
+  .on(
+    'postgres_changes',
+    { event: 'INSERT', schema: 'public', table: 'posts' },
+    (payload) => {
+      // payload.new is the row just inserted in step 2
+      addPostToFeed(payload.new);
+    }
+  )
+  .subscribe();
+```
+
+สิ่งนี้ทำงานได้ก็เพราะ `posts` ถูกเพิ่มเข้าไปใน publication `supabase_realtime` แล้ว — ขั้นตอน setup จาก module Realtime ถ้าไม่มีขั้นตอนนี้ การเปลี่ยนแปลงของ table จะไม่ถูก replicate ออกมาเลย ไม่ว่า listener `.on('postgres_changes', ...)` ตัวนี้จะเขียนถูกต้องแค่ไหน insert ใน step 2 ก็จะยังสำเร็จอยู่ดี แต่ callback ตัวนี้จะไม่ fire เลย
+
+## สาม service หนึ่ง feature
+
+ไม่มีอะไรพิเศษที่เป็น integration เฉพาะระหว่าง Storage, REST API และ Realtime — แต่ละ service ทำสิ่งที่มันทำใน module ของตัวเองตามปกติ และ client code คือสิ่งที่ผูกมันเข้าด้วยกันเป็น feature เดียวที่ user เห็น client ที่ upload ไม่เคยคุยกับ client ที่ subscribe อยู่โดยตรง flow นี้ทำงานได้เพราะทั้งคู่คุยกับ Supabase project เดียวกัน และ replication stream ของ Postgres คือสิ่งที่เชื่อม write ฝั่งหนึ่งเข้ากับ notification อีกฝั่ง
+
+<Mermaid title="One feature, three services: upload, insert under RLS, then a live notification" code={combinedFlowDiagram} />
+
+export const combinedFlowDiagram = `flowchart LR
+  upload["storage.from('photos').upload(file)"] --> insert["from('posts').insert({ photo_path, user_id })"]
+  insert -->|"allowed only if RLS policy passes"| commit[("Row committed in Postgres")]
+  commit -->|"replicated because posts is in supabase_realtime"| notify["postgres_changes INSERT event"]
+  notify --> other["Other client's .on('postgres_changes', ...) callback fires"]`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+feature จริงมัก compose service เข้าด้วยกันแทนที่จะอยู่แค่ service เดียว `storage.from('photos').upload()` เก็บ file (Storage), `.from('posts').insert()` บันทึก row ที่ reference มันและสำเร็จได้เพราะ **RLS policy** ที่ผูก `user_id` กับ `auth.uid()` (REST ที่ป้องกันแบบที่ module Auth อธิบายไว้) และ client อีกตัวที่ subscribe ผ่าน `.channel().on('postgres_changes', { event: 'INSERT', table: 'posts' }, ...)` จะ fire ทันทีที่ row นั้น commit (Realtime และทำงานได้ก็เพราะ `posts` ถูกเพิ่มเข้า publication **`supabase_realtime`** แล้วเท่านั้น) ทุก step ยังคืน `{ data, error }` เหมือนเดิม และการเช็ก `error` ในแต่ละ step ก็ยังจำเป็นเท่ากับตอนที่เป็น call เดียวโดด ๆ แม้จะเป็น flow ที่ compose มาสามขั้นตอนก็ตาม
+</Callout>
+
+export const quizCombinedFlow = [
+  {
+    q: 'ใน feature upload รูป storage.from(\'photos\').upload() เป็นของ Supabase service ไหน',
+    options: [
+      'Storage',
+      'REST API',
+      'Realtime',
+      'Auth',
+    ],
+    answer: 0,
+  },
+  {
+    q: 'ทำไม call .from(\'posts\').insert() ใน step 2 ถึงสำเร็จเฉพาะ user ที่ถูกต้องเท่านั้น',
+    options: [
+      'เพราะ anon key บล็อก user อื่นให้อัตโนมัติ',
+      'เพราะ row level security policy จำกัดให้ insert ได้เฉพาะ row ที่ user_id ตรงกับ auth.uid() ซึ่งเป็น mechanism เดียวกับที่ module Auth อธิบายไว้',
+      'เพราะ Storage validate column user_id ก่อน insert จะรัน',
+      'เพราะ insert ถูกห่อด้วย database transaction',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไม postgres_changes subscription ของ client อีกตัวถึงพึ่งพาสิ่งที่มาจาก module Realtime โดยเฉพาะ',
+    options: [
+      'ไม่ได้พึ่งพาอะไรเลย postgres_changes ทำงานได้เสมอแค่เรียก .subscribe()',
+      'table posts ต้องถูกเพิ่มเข้า publication supabase_realtime ก่อน ไม่งั้น change event จะไม่ถูก replicate ไปหา subscriber เลย',
+      'มันพึ่งพา RLS policy จาก step 2 แทน',
+      'มันพึ่งพาการตั้ง storage bucket ให้เป็น public',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไม error handling ยังสำคัญใน flow หลาย step อย่าง upload แล้ว insert แล้ว subscribe',
+    options: [
+      'ไม่สำคัญ มีแค่ step สุดท้ายเท่านั้นที่ต้องเช็ก',
+      'แต่ละ step fail ได้อิสระต่อกัน และถ้าข้ามการเช็ก (เช่นหลัง upload) ก็อาจปล่อยให้ step ถัดไปทำงานต่อบนข้อมูลที่ผิด เช่น insert row ที่ชี้ไปยัง file ที่ไม่เคยถูกบันทึกจริง',
+      'เพราะ postgres_changes retry insert ที่ fail ให้อัตโนมัติ',
+      'เพราะ TypeScript จะไม่ยอม compile ถ้าไม่มี try/catch ครอบทุก call',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="client-development/combining-rest-realtime-and-storage" questions={quizCombinedFlow} />
+
+<ProgressTracker client:visible id="client-development/combining-rest-realtime-and-storage" />

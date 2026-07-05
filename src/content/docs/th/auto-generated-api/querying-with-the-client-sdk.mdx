@@ -1,0 +1,149 @@
+---
+title: 'Querying with the Client SDK'
+description: 'query builder ของ supabase-js เป็น typed wrapper คลุม PostgREST ผล data กับ error ที่ต้องเช็คเองทุกครั้ง และวิธี embed related table ผ่าน query builder'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+query builder ของ `supabase-js` เป็น TypeScript wrapper แบบ fluent ที่สร้าง PostgREST request เดียวกับที่คุณเขียนเองได้ และทุก call จะ resolve ออกมาเป็น object `{ data, error }` แทนที่จะ throw
+
+## Query builder สะท้อน REST API
+
+ทุกอย่างที่เห็นเป็น raw query string ในบทก่อนหน้ามี method ที่ตรงกันบน query builder เลือก table ด้วย `.from()` เลือก column ด้วย `.select()` filter ด้วย `.eq()` (และตัวพี่น้องของมัน) แล้วเรียงลำดับด้วย `.order()`
+
+```typescript
+const { data, error } = await supabase
+  .from('movies')
+  .select('id, title, year')
+  .eq('year', 2020)
+  .order('year', { ascending: false });
+```
+
+การเขียนข้อมูลก็ทำงานแบบเดียวกัน `.insert()`, `.update()` และ `.delete()` map ไปหา HTTP verb ที่ PostgREST expose ไว้ตรง ๆ
+
+```typescript
+await supabase.from('movies').insert({ title: 'Arrival', year: 2016, director_id: 3 });
+
+await supabase.from('movies').update({ year: 2021 }).eq('id', 1);
+
+await supabase.from('movies').delete().eq('id', 1);
+```
+
+## เช็ค data กับ error เองเสมอ
+
+query ของ `supabase-js` ไม่เคย throw เมื่อ request ล้มเหลว — มันจะ resolve เป็น object รูปแบบ `{ data, error }` เสมอ ถ้า request สำเร็จ `error` จะเป็น `null` และ `data` จะมี row อยู่ข้างใน ถ้าล้มเหลว `data` จะเป็น `null` และ `error` จะถูกเติมค่ามาแทน เพราะไม่มี exception ให้ catch คุณต้องเช็ค `error` เองทุกครั้ง ไม่งั้น request ที่ล้มเหลวจะดูเหมือนผลลัพธ์ว่างเปล่าไปเฉย ๆ
+
+`error` เป็น `PostgrestError` ที่มี 4 field ที่ควรรู้จัก
+
+- **message** — คำอธิบายที่มนุษย์อ่านเข้าใจว่าเกิดอะไรผิดพลาด
+- **code** — อาจเป็น Postgres error code (เช่น unique-constraint violation) หรือ code เฉพาะของ PostgREST
+- **details** — context เพิ่มเติมจาก Postgres ถ้ามี
+- **hint** — คำแนะนำสำหรับแก้ปัญหา ถ้า Postgres หรือ PostgREST ให้มาได้
+
+```typescript
+const { data, error } = await supabase.from('movies').select('id, title').eq('year', 2020);
+
+if (error) {
+  console.error(`query failed [${error.code}]: ${error.message}`);
+} else {
+  console.log(data);
+}
+```
+
+## Embed related table ผ่าน builder
+
+เหมือนกับ raw REST API query builder embed related table ได้โดยระบุชื่อ table นั้นไว้ข้างใน `select()` — PostgREST ยังคงทำงานเบื้องหลังด้วยการตาม foreign key เหมือนเดิม builder แค่ให้วิธีเรียกที่ typed และ chain ได้
+
+```typescript
+const { data, error } = await supabase.from('movies').select('title, directors(name)');
+```
+
+## ตัวอย่างแบบสมบูรณ์
+
+```typescript
+import { createClient } from '@supabase/supabase-js';
+
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!);
+
+async function recentMovies() {
+  const { data, error } = await supabase
+    .from('movies')
+    .select('id, title, year, directors(name)')
+    .eq('year', 2020)
+    .order('title', { ascending: true });
+
+  if (error) {
+    console.error('failed to load movies:', error.message);
+    return [];
+  }
+
+  return data;
+}
+```
+
+<Mermaid title="สร้าง PostgREST request เดียวจากการ chain method" code={sdkQueryDiagram} />
+
+export const sdkQueryDiagram = `flowchart LR
+  from[".from('movies')"] --> select[".select('id, title, year')"]
+  select --> eq[".eq('year', 2020)"]
+  eq --> order[".order('year')"]
+  order --> http["One HTTP request to PostgREST"]
+  http --> result["Result: data and error"]`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+query builder ของ `supabase-js` — `.from()`, `.select()`, `.eq()`, `.order()`, `.insert()`, `.update()`, `.delete()` — เป็น typed wrapper ที่สร้าง request เดียวกับที่ PostgREST รับเป็น raw query string อยู่แล้ว และมัน resolve เป็น **`{ data, error }`** เสมอแทนที่จะ throw ดังนั้นต้องเช็ค `error` เอง (เป็น `PostgrestError` ที่มี **message**, **code**, **details** และ **hint**) ทุกครั้ง ส่วน related table ก็ embed ได้แบบเดียวกับ REST API โดยระบุชื่อ table ไว้ข้างใน `select()`
+</Callout>
+
+export const quizSdkQuery = [
+  {
+    q: 'ผลลัพธ์จาก query ของ supabase-js มีรูปแบบอะไรเสมอ',
+    options: [
+      'มัน throw exception เมื่อเกิด error เหมือน async function ทั่วไป',
+      'มัน resolve เป็น object รูปแบบ { data, error } ที่ต้องเช็คเอง',
+      'มันคืนแค่ row ดิบ ส่วน error จะถูก log ลง console ให้เองอัตโนมัติ',
+      'มันคืนแค่ boolean บอกว่าสำเร็จหรือล้มเหลวเท่านั้น',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไมต้องเช็ค field error เอง แทนที่จะพึ่ง try/catch',
+    options: [
+      'เพราะ supabase-js ไม่รองรับ try/catch เลย',
+      'เพราะ request ที่ล้มเหลว resolve แบบปกติ โดย data เป็น null และ error ถูกเติมค่า แทนที่จะ throw',
+      'เพราะ error จะถูกตั้งค่าเฉพาะตอน network ล้มเหลว ไม่ใช่ตอน database error',
+      'เพราะการเช็ค error เป็น optional และไม่มีผลต่อ behavior',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'การรวม method ไหนที่ filter movie ให้เหลือปี 2020 แล้วเรียงตาม year จากมากไปน้อย',
+    options: [
+      '.select("year").filter(2020).sortDesc()',
+      '.eq("year", 2020).order("year", { ascending: false })',
+      '.where("year = 2020").orderByDesc("year")',
+      '.match({ year: "desc" })',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'query builder embed table directors ที่เกี่ยวข้องเข้าไปใน query ของ movies ได้อย่างไร',
+    options: [
+      'เรียก method แยกต่างหากชื่อ .join("directors")',
+      'ระบุชื่อ related table ไว้ข้างใน select() เช่น select("title, directors(name)")',
+      'การ embed ทำผ่าน query builder ไม่ได้ ทำได้แค่ raw REST call เท่านั้น',
+      'ส่ง argument ตัวที่สองเข้าไปใน .from()',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="auto-generated-api/querying-with-the-client-sdk" questions={quizSdkQuery} />
+
+<ProgressTracker client:visible id="auto-generated-api/querying-with-the-client-sdk" />

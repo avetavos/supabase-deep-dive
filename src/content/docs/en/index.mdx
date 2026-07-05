@@ -1,0 +1,60 @@
+---
+title: Supabase — From Zero to Hero
+description: Master Supabase from first principles — Postgres and the CLI, the auto-generated REST/RPC API and the Data API exposure model, authentication and Row Level Security, Realtime and Storage, Edge Functions, the TypeScript client SDK, and running Supabase in production with Supavisor pooling, branching, and a security checklist.
+template: splash
+hero:
+  tagline: A standalone, developer-focused course on Supabase — the open-source Postgres platform. From the database and the CLI to the auto-generated API, Row Level Security, Realtime, Storage, and Edge Functions — taught through real TypeScript, SQL, and diagrams. Every hard-to-get-right detail (RLS defaults, Data API exposure, Supavisor pooling) is verified against current docs.
+  actions:
+    - text: Start here
+      link: /supabase/en/foundations/
+      icon: right-arrow
+      variant: primary
+    - text: Jump to Row Level Security
+      link: /supabase/en/auth-and-row-level-security/row-level-security-fundamentals/
+      icon: open-book
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+## What you'll learn
+
+<CardGrid>
+  <Card title="Foundations" icon="rocket">
+    What Supabase is, project setup and the CLI, tables/schema/migrations, and how the pieces fit together. [Start →](/supabase/en/foundations/)
+  </Card>
+  <Card title="Auto-Generated API" icon="seti:html">
+    PostgREST's REST API, querying with the client SDK, RPC functions, and the Data API exposure model. [Query →](/supabase/en/auto-generated-api/the-rest-api-postgrest/)
+  </Card>
+  <Card title="Auth & Row Level Security" icon="approve-check">
+    Authentication methods, sessions and JWTs, RLS fundamentals, and real-world RLS patterns and pitfalls. [Secure →](/supabase/en/auth-and-row-level-security/authentication-methods/)
+  </Card>
+  <Card title="Realtime & Storage" icon="random">
+    Postgres Changes, Broadcast and Presence, storage buckets and policies, and image transformations. [Go live →](/supabase/en/realtime-and-storage/realtime-postgres-changes/)
+  </Card>
+  <Card title="Edge Functions" icon="seti:config">
+    Deno-based functions, invoking them, database access from a function, and background tasks with webhooks. [Deploy →](/supabase/en/edge-functions/what-are-edge-functions/)
+  </Card>
+  <Card title="Client Development" icon="seti:plan">
+    The supabase-js client, auth in the client, typed queries, and combining REST, Realtime, and Storage. [Build →](/supabase/en/client-development/the-supabase-js-client/)
+  </Card>
+  <Card title="Production & Ecosystem" icon="puzzle">
+    Supavisor connection pooling, branching and migrations, performance and indexing, and a production checklist. [Ship it →](/supabase/en/production-and-ecosystem/connection-pooling-and-supavisor/)
+  </Card>
+</CardGrid>
+
+## How this course works
+
+<CardGrid>
+  <Card title="It's just Postgres, plus" icon="rocket">
+    Every topic starts from the Postgres underneath — the auto-generated API, Realtime, and Storage are all layers on top of one real database, so what you learn transfers to plain Postgres too.
+  </Card>
+  <Card title="Current defaults, verified" icon="random">
+    Written against current Supabase behavior and checked against the official docs via context7 — including the Data API's explicit exposure model and Realtime's per-table opt-in that a lot of older tutorials skip.
+  </Card>
+  <Card title="Two security layers, not one" icon="approve-check">
+    Not just "turn on RLS" but the full picture: what the Data API exposes at the table level, and what Row Level Security restricts at the row level — two different questions with two different answers.
+  </Card>
+  <Card title="Diagrams that explain" icon="puzzle">
+    The Supabase architecture, the RLS decision path, the Realtime publication model, and the Supavisor pooling modes as theme-aware Mermaid diagrams. Bilingual (English / ไทย) with saved quiz progress.
+  </Card>
+</CardGrid>

@@ -1,0 +1,116 @@
+---
+title: 'Realtime: Postgres Changes'
+description: 'Realtime สตรีม event INSERT UPDATE DELETE ออกจาก write-ahead log ของ Postgres ได้ยังไง และทำไมทุก table ถึงเงียบสนิทจนกว่าจะเปิด replication เอง'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+**Postgres Changes** สตรีม write-ahead log ของ database เองไปให้ client ที่ subscribe อยู่ ในรูป event `INSERT`/`UPDATE`/`DELETE` แต่ฟีเจอร์นี้**ปิดอยู่โดย default สำหรับทุก table** จนกว่าคุณจะเพิ่ม table นั้นเข้า publication เอง
+
+## จาก row change ไปถึง callback ฝั่ง client
+
+Postgres เก็บ record ของทุก write ไว้แบบ durable และเรียงลำดับอยู่แล้วใน **write-ahead log (WAL)** — ใช้สำหรับ crash recovery และ replication ภายในตัวมันเอง Supabase Realtime อ่าน WAL ตัวเดียวกันนี้ผ่านฟีเจอร์ **logical replication** ของ Postgres แล้วแปลงทุก change ที่ commit แล้วให้กลายเป็น message ที่ push ผ่าน WebSocket ได้ client subscribe เข้า channel หนึ่ง บอกว่าสนใจ table ไหนและ event type อะไร แล้วจะได้ callback ยิงทุกครั้งที่ row เปลี่ยนตรงกับเงื่อนไข แบบสด ๆ โดยไม่ต้อง poll table เป็นช่วง ๆ เลย
+
+ข้อเท็จจริงสำคัญที่ต้องจำก่อนเขียนโค้ดเลยคือ **pipeline นี้ปิดอยู่โดย default สำหรับทุก table ที่คุณสร้าง** Realtime ไม่ได้ watch ทั้ง schema ให้อัตโนมัติ — write ของ table หนึ่งจะไปถึง WAL stream ที่ Realtime แตะอยู่ก็ต่อเมื่อ table นั้นถูกเพิ่มเข้า `supabase_realtime` publication แล้วเท่านั้น ตราบใดที่ยังไม่ทำ client จะ subscribe ทั้งวันก็ไม่ได้อะไรกลับมาเลย
+
+เปิดใช้งานด้วย SQL ธรรมดา
+
+```sql
+alter publication supabase_realtime add table public.messages;
+```
+
+สวิตช์ตัวเดียวกันนี้มีอยู่ใน Studio ที่ **Database > Replication** เหมือนกัน ถ้าไม่อยากรัน SQL เอง — ข้างในทำงานแบบเดียวกันทุกประการ
+
+## Subscribe จากฝั่ง client
+
+พอ `public.messages` อยู่ใน publication แล้ว client ฝั่ง `supabase-js` ก็ subscribe การเปลี่ยนแปลงบน table นั้นได้
+
+```typescript
+const channel = supabase
+  .channel('room1')
+  .on(
+    'postgres_changes',
+    { event: 'INSERT', schema: 'public', table: 'messages' },
+    (payload) => {
+      console.log('New message:', payload.new);
+    }
+  )
+  .subscribe();
+```
+
+`event` รับค่าได้เป็น `INSERT`, `UPDATE`, `DELETE` หรือ `*` เพื่อรับทั้งสามแบบพร้อมกัน `schema` กับ `table` ใช้จำกัดขอบเขตให้ subscribe แค่ table เดียว และลงทะเบียน `.on('postgres_changes', ...)` หลายตัวบน channel เดียวกันได้ ถ้าอยากฟังหลาย event type หรือหลาย table พร้อมกัน
+
+ยังมีช่องโหว่อีกจุดที่ต้องปิดให้ครบ โดย default Postgres จะใส่มาแค่ column ของ **primary key** ของ row เก่าใน payload ของ `UPDATE` หรือ `DELETE` เท่านั้น ไม่ใช่ row เก่าเต็ม ๆ ถ้า logic ฝั่งแอปต้องเทียบค่าเก่ากับค่าใหม่ (เช่น อยากรู้ว่า field หนึ่งเปลี่ยนมาจากอะไร) ให้ตั้ง replica identity ของ table เป็น `full`
+
+```sql
+alter table public.messages replica identity full;
+```
+
+พอตั้ง `replica identity full` แล้ว `payload.old` ใน event `UPDATE` หรือ `DELETE` จะมีทุก column ของ row ตามสภาพก่อนเปลี่ยน ไม่ใช่แค่ primary key อีกต่อไป
+
+<Mermaid title="row change จะถึง client ได้ก็ต่อเมื่อ table อยู่ใน publication" code={postgresChangesDiagram} />
+
+export const postgresChangesDiagram = `flowchart LR
+  insert["Postgres INSERT/UPDATE/DELETE"] --> wal["Write-ahead log (WAL)"]
+  wal --> gate{"Is the table added to supabase_realtime publication?"}
+  gate -->|no| nothing["No event is ever sent"]
+  gate -->|yes| realtime["Realtime server reads WAL via logical replication"]
+  realtime --> client["Client's postgres_changes callback fires"]`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+**Postgres Changes** อ่าน write-ahead log ของ Postgres เองผ่าน logical replication แล้ว push event `INSERT`/`UPDATE`/`DELETE` ไปให้ client ที่ subscribe อยู่ แต่ฟีเจอร์นี้**ปิดอยู่โดย default สำหรับทุก table** — ต้องรัน `alter publication supabase_realtime add table your_table;` เอง (หรือกดสวิตช์เดียวกันใน Studio ที่ Replication settings) ก่อน subscription แบบ `channel.on('postgres_changes', ...)` จะได้อะไรกลับมา และต้อง `alter table your_table replica identity full;` ด้วยถ้าอยากได้ row เก่าเต็ม ๆ ใน payload ของ `UPDATE`/`DELETE`
+</Callout>
+
+export const quizPostgresChanges = [
+  {
+    q: 'Postgres Changes ทำงานบน table ที่เพิ่งสร้างใหม่โดย default หรือไม่',
+    options: [
+      'ทำงานเลย ทุก table สตรีม change ให้อัตโนมัติทันทีที่สร้าง',
+      'ไม่ทำงาน ต้องเพิ่ม table นั้นเข้า supabase_realtime publication ก่อนอย่างชัดเจน',
+      'สตรีมเฉพาะ SELECT query เท่านั้น ไม่ใช่ write โดย default',
+      'ทำงาน แต่เฉพาะ schema public เท่านั้น schema อื่นไม่ได้',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'คำสั่ง SQL ไหนใช้เปิด Postgres Changes ให้กับ table หนึ่งตัว',
+    options: [
+      'create trigger supabase_realtime on your_table;',
+      'alter publication supabase_realtime add table your_table;',
+      'grant realtime on your_table to authenticated;',
+      'select enable_realtime(\'your_table\');',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไมต้องตั้ง replica identity full ให้ table ที่ใช้กับ Postgres Changes',
+    options: [
+      'เพราะต้องตั้งก่อนถึงจะเพิ่ม table เข้า publication ใด ๆ ได้เลย',
+      'เพื่อให้ event INSERT ยิงสองครั้งเป็นการสำรอง',
+      'เพื่อให้ payload ของ row เก่าใน event UPDATE/DELETE มีทุก column ไม่ใช่แค่ primary key',
+      'เพื่อปิด logical replication ของ table นั้น',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'subscription แบบ channel.on(\'postgres_changes\', ...) ใช้ field ไหนกำหนดขอบเขตว่าจะฟังอะไร',
+    options: [
+      'ใช้แค่ string SQL where clause แบบ free-text',
+      'event, schema และ table',
+      'ใช้แค่ชื่อ channel อย่างเดียว ไม่มีอย่างอื่น',
+      'ใช้ GraphQL query document',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="realtime-and-storage/realtime-postgres-changes" questions={quizPostgresChanges} />
+
+<ProgressTracker client:visible id="realtime-and-storage/realtime-postgres-changes" />

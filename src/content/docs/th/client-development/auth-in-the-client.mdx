@@ -1,0 +1,139 @@
+---
+title: 'Auth in the Client'
+description: 'flow sign-up sign-in และ sign-out แบบสมบูรณ์ใน supabase-js การ sync UI state ด้วย onAuthStateChange และเหตุผลที่ client-side route protection เป็นแค่ UX ไม่ใช่ security'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+`supabase.auth` ให้ `signUp`, `signInWithPassword` และ `signOut` มาขับเคลื่อน session ให้ `onAuthStateChange` มา sync UI ของแอปกับ session นั้นให้อัตโนมัติ และมีกฎที่ต้องจำไว้ตลอด — การเช็ก session ในโค้ดฝั่ง client เป็นแค่ UX convenience ในขณะที่ row level security บน database คือ security boundary จริง
+
+## flow sign-up, sign-in, sign-out แบบสมบูรณ์
+
+ทุก call เหล่านี้ resolve เป็น `{ data, error }` ไม่ throw exception ดังนั้นต้องเช็ก `error` ก่อนเชื่อผลลัพธ์ — pattern เดียวกับที่จะเห็นแบบเป็นทางการในบทถัดไป
+
+```typescript
+// Sign up a new user
+const { data: signUpData, error: signUpError } = await supabase.auth.signUp({
+  email: 'jane@example.com',
+  password: 'correct-horse-battery-staple',
+});
+
+if (signUpError) {
+  console.error('sign up failed:', signUpError.message);
+}
+
+// Sign in an existing user
+const { data: signInData, error: signInError } = await supabase.auth.signInWithPassword({
+  email: 'jane@example.com',
+  password: 'correct-horse-battery-staple',
+});
+
+if (signInError) {
+  console.error('sign in failed:', signInError.message);
+}
+
+// Sign out the current user
+const { error: signOutError } = await supabase.auth.signOut();
+
+if (signOutError) {
+  console.error('sign out failed:', signOutError.message);
+}
+```
+
+`signUp` หรือ `signInWithPassword` ที่สำเร็จจะเก็บ session (access token กับ refresh token) ไว้ใน client และ request ถัดไปทุกอันจาก client นั้นจะถูกส่งในฐานะ user ที่ authenticated แล้ว
+
+## Sync UI state ด้วย `onAuthStateChange`
+
+แทนที่จะไล่เช็กเองว่า user sign in อยู่หรือไม่ — แล้วต้องมาเช็กซ้ำทุกครั้งหลัง sign-in, sign-out หรือ token refresh แบบเงียบ ๆ — subscribe แค่ครั้งเดียวตอนแอป start ก็พอ
+
+```typescript
+supabase.auth.onAuthStateChange((event, session) => {
+  // Fires on SIGNED_IN, SIGNED_OUT, TOKEN_REFRESHED, and more
+  setSession(session);
+});
+```
+
+subscription เดียวนี้ fire ทุก event ที่เกี่ยวกับ auth ตลอดอายุแอป ทั้ง session แรกตอนโหลด, sign-in, sign-out และ token refresh ที่เกิดขึ้นเงียบ ๆ อยู่เบื้องหลัง การผูก local state ของแอปเข้ากับ callback ตัวเดียวนี้แปลว่า UI จะสะท้อน session จริงของ client อยู่เสมอ และไม่ต้องมานั่งจำว่าต้องเรียกอะไรเองหลัง auth action แต่ละครั้ง
+
+## Protect route: UX convenience ไม่ใช่ security จริง
+
+pattern ที่พบบ่อยฝั่ง client คือเช็ก session ก่อน render หน้าที่ต้อง protect หรือก่อนยิง request ที่ต้อง authenticated
+
+```typescript
+const {
+  data: { session },
+} = await supabase.auth.getSession();
+
+if (!session) {
+  // No session: hide the page and send the user to sign in
+  redirectToLogin();
+}
+```
+
+สิ่งนี้มีประโยชน์จริง มันช่วยไม่ให้ protected content แวบขึ้นมาให้คนที่ sign out อยู่เห็น และไม่ต้องยิง request ที่รู้อยู่แล้วว่าจะ fail แต่ห้ามเข้าใจผิดว่านี่คือกลไก security จริง โค้ด JavaScript ฝั่ง client ถูก inspect, แก้ไข หรือข้ามไปเลยได้เสมอโดยคนที่ตั้งใจจะทำ ไม่มีอะไรห้ามใครสักคนยิงตรงไปที่ Supabase project ด้วย token ของตัวเอง ข้าม UI ของคุณไปทั้งหมด สิ่งที่เป็น boundary จริงว่า request หนึ่งจะอ่านหรือเขียน row ไหนได้บ้างคือ **row level security (RLS)** ที่ Postgres บังคับใช้เองฝั่ง server ไม่ว่า client จะเช็กหรือ render อะไรก็ตาม
+
+<Mermaid title="A session drives the UI, but RLS is still the real gate" code={authClientDiagram} />
+
+export const authClientDiagram = `flowchart LR
+  action["signUp() or signInWithPassword()"] --> session["Session created and stored in the client"]
+  session --> event["onAuthStateChange fires"]
+  event --> ui["App UI updates; a protected route becomes reachable"]
+  ui --> rls[("Real enforcement still happens via RLS on the database")]`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+`supabase.auth.signUp()`, `signInWithPassword()` และ `signOut()` แต่ละอัน resolve เป็น `{ data, error }` และขับเคลื่อน session ที่ถูกเก็บไว้ subscribe **`onAuthStateChange`** แค่ครั้งเดียวก็ทำให้ UI ของแอป sync กับ sign-in, sign-out และ token refresh โดยไม่ต้องเช็ก session state เองทุกที่ การเช็ก `session` ก่อน render หน้า protected เป็น **UX convenience** จริง แต่ไม่ใช่ security จริง — client ที่ตั้งใจจะ bypass ก็ทำได้เสมอ ดังนั้น **row level security (RLS)** บน database ยังคงเป็น boundary จริงที่ตัดสินว่า request หนึ่งอ่านหรือเขียนอะไรได้บ้าง
+</Callout>
+
+export const quizAuthClient = [
+  {
+    q: 'การ subscribe onAuthStateChange แค่ครั้งเดียวช่วยให้ไม่ต้องทำอะไรเอง',
+    options: [
+      'ไม่ต้องเขียนโค้ด sign-in เลย',
+      'ไม่ต้องเช็กและ sync auth state เองซ้ำ ๆ หลัง sign-in, sign-out หรือ token refresh แต่ละครั้ง',
+      'ไม่ต้องเรียก signOut ตอน user ออกจากหน้า',
+      'ไม่ต้องเก็บ anon key ไว้ในแอป',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไมการเช็ก session ก่อน render หน้า protected ถึงเป็นแค่ UX convenience',
+    options: [
+      'เพราะ getSession() ถูก deprecate ใน supabase-js แล้ว',
+      'เพราะโค้ดฝั่ง client ถูก inspect หรือ bypass ได้โดยคนที่ตั้งใจ จึงเป็น security boundary จริงไม่ได้',
+      'เพราะ session ไม่มีวันหมดอายุ เลยไม่จำเป็นต้องเช็ก',
+      'เพราะมันใช้ได้แค่กับ OAuth sign-in ไม่ใช่ password',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'อะไรคือตัวที่บังคับจริงว่า request หนึ่งอ่านหรือเขียน row ไหนได้บ้าง ไม่ว่า client จะเช็กอะไรก็ตาม',
+    options: [
+      'callback ของ onAuthStateChange',
+      'row level security (RLS) ที่ Postgres บังคับใช้ฝั่ง server',
+      'ว่า browser tab กำลัง focus อยู่หรือไม่',
+      'ลำดับที่เรียก signUp กับ signInWithPassword',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'call อย่าง supabase.auth.signOut() resolve ออกมาเป็นรูปแบบไหน',
+    options: [
+      'มัน throw exception ตอน fail แทนที่จะ return ค่า',
+      'object รูปแบบ { data, error } (หรือ { error } สำหรับ signOut) ที่ต้องเช็กเอง',
+      'boolean ธรรมดา true หรือ false',
+      'ไม่มีอะไรเลย มัน resolve เป็น undefined เสมอ',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="client-development/auth-in-the-client" questions={quizAuthClient} />
+
+<ProgressTracker client:visible id="client-development/auth-in-the-client" />

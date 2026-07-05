@@ -1,0 +1,119 @@
+---
+title: 'Securing the Data API'
+description: 'The two-layer Supabase API security model — Data API exposure that gates whether a table or function is reachable at all, and Row Level Security that decides which rows a reachable request can see.'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+A table or function must pass **two separate gates** before a request is both safe and successful: **Data API exposure** decides if it is reachable through the API at all, and **Row Level Security** then decides which rows a reachable request can see or change.
+
+## Layer 1 — Data API exposure
+
+Many older Supabase tutorials describe RLS as the whole story. It is not. Before RLS is even evaluated, Postgres must have granted the requesting role — `anon`, `authenticated`, or `service_role` — permission to touch the table or function in the first place. In current Supabase projects this is not automatic: you either expose specific tables and functions in the **Integrations → Data API** section of the dashboard, or turn on **Default privileges for new entities** so that new objects created in the `public` schema are granted access going forward.
+
+Under the hood, this exposure is ordinary Postgres `grant` statements:
+
+```sql
+-- Table grants: what each role is allowed to attempt
+grant select on public.your_table to anon;
+grant select, insert, update, delete on public.your_table to authenticated;
+grant all on public.your_table to service_role;
+
+-- Function grants: who may call this RPC endpoint
+grant execute on function public.your_function to authenticated, service_role;
+```
+
+If a role has no `grant` on a table, that table is invisible to it through the Data API — the request fails before RLS is ever checked, regardless of how permissive your RLS policies are. This is a **table/function-level** gate: it answers "can this role touch this object at all," not "which rows."
+
+## Layer 2 — Row Level Security
+
+Once a table clears the exposure gate, **Row Level Security** (RLS) takes over and answers a narrower question: for a request arriving as `anon`, `authenticated`, or a specific authenticated user, which individual **rows** can it see or modify? RLS policies are the subject of the entire next module, so the detail to hold onto here is just the boundary between the two layers:
+
+- **Data API exposure** — table/function-level. Is this object reachable through the API at all?
+- **Row Level Security** — row-level. Given that it is reachable, which rows does this specific request get?
+
+Both must be configured correctly. Exposure without RLS means a technically reachable table returns every row to anyone who is granted access. RLS without exposure means correctly scoped policies that no request can ever reach, because the table was never exposed in the first place.
+
+```sql
+-- Layer 2 lives on the table once it clears layer 1
+alter table public.your_table enable row level security;
+
+create policy "users read their own rows"
+on public.your_table
+for select
+to authenticated
+using (auth.uid() = user_id);
+```
+
+## `service_role` bypasses RLS entirely
+
+Postgres row level security is skipped for any role with the `BYPASSRLS` attribute, and `service_role` has it. A request authenticated with the `service_role` key still has to clear layer 1 (it needs the underlying grants, though `service_role` is typically granted broad access), but once it does, RLS policies do not apply to it at all — it sees and can modify every row. This is exactly why the `service_role` key must never ship to a browser or mobile client, echoing the warning from the Foundations module: it is meant for trusted server-side code only, where you enforce access rules yourself instead of relying on RLS.
+
+<Mermaid title="A request passing through exposure and then RLS" code={securityLayersDiagram} />
+
+export const securityLayersDiagram = `flowchart TB
+  req["Incoming request as anon, authenticated, or service_role"] --> gate1{"Layer 1: Data API exposure — is the table/function reachable at all?"}
+  gate1 -- "no grant" --> reject1["Rejected: not reachable"]
+  gate1 -- "granted" --> role{"Role has BYPASSRLS?"}
+  role -- "yes (service_role)" --> allrows["All rows visible, RLS skipped entirely"]
+  role -- "no" --> gate2{"Layer 2: Row Level Security — which rows?"}
+  gate2 -- "no matching policy" --> reject2["Rejected: no rows returned/modified"]
+  gate2 -- "policy matches" --> scoped["Only matching rows visible/modifiable"]`;
+
+<Callout title="The one-line takeaway">
+Supabase's Data API security is **two layers**, not one: **Data API exposure** — via the dashboard's **Integrations → Data API** settings, "Default privileges for new entities," or plain Postgres `grant` statements to `anon`/`authenticated`/`service_role` — is a table/function-level gate deciding whether an object is reachable through the API **at all**, and only once a request clears that gate does **Row Level Security** decide which **rows** it can see or modify; `service_role` has the `BYPASSRLS` attribute and skips RLS entirely, which is why that key must stay server-side only.
+</Callout>
+
+export const quizSecuringApi = [
+  {
+    q: 'What does the Data API exposure layer actually control?',
+    options: [
+      'Which individual rows a request can see, the same thing RLS controls',
+      'Whether a table or function is reachable through the API at all, independent of RLS',
+      'The password policy for authenticated users',
+      'The network firewall rules for the Postgres port',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'If a table has permissive RLS policies but no grant to the authenticated role, what happens?',
+    options: [
+      'RLS policies still apply and authenticated users can read matching rows',
+      'The request never reaches the point of evaluating RLS, because the table is not reachable at all',
+      'Supabase automatically grants access based on the RLS policies present',
+      'The table becomes readable only by anon, never by authenticated',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why does a request made with the service_role key skip Row Level Security entirely?',
+    options: [
+      'Because service_role requests are always rejected before reaching RLS',
+      'Because service_role has the BYPASSRLS attribute, which Postgres respects by skipping RLS checks for that role',
+      'Because RLS only applies to the anon role, never to service_role or authenticated',
+      'Because service_role automatically fails the Data API exposure gate',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why is it not enough to configure Row Level Security alone?',
+    options: [
+      'RLS is deprecated and no longer enforced in current Supabase projects',
+      'Because RLS only decides row visibility for a request that already passed the separate Data API exposure gate, so a table that is never exposed stays unreachable regardless of its policies',
+      'RLS and Data API exposure are the same setting under two different names',
+      'Because RLS policies can only be written in plpgsql, never SQL',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="auto-generated-api/securing-the-data-api" questions={quizSecuringApi} />
+
+<ProgressTracker client:visible id="auto-generated-api/securing-the-data-api" />

@@ -1,0 +1,139 @@
+---
+title: 'Auth in the Client'
+description: 'A complete sign-up, sign-in, and sign-out flow in supabase-js, keeping UI state in sync with onAuthStateChange, and why client-side route protection is UX, not security.'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+`supabase.auth` gives you `signUp`, `signInWithPassword`, and `signOut` to drive a session, `onAuthStateChange` to keep your app's UI in sync with that session automatically, and a hard rule to remember throughout: any check you do against that session in client code is a UX convenience, while row level security on the database is the actual security boundary.
+
+## A complete sign-up, sign-in, sign-out flow
+
+Every one of these calls resolves to `{ data, error }` rather than throwing, so check `error` before trusting the result — the same pattern you will see formalized in the next lesson.
+
+```typescript
+// Sign up a new user
+const { data: signUpData, error: signUpError } = await supabase.auth.signUp({
+  email: 'jane@example.com',
+  password: 'correct-horse-battery-staple',
+});
+
+if (signUpError) {
+  console.error('sign up failed:', signUpError.message);
+}
+
+// Sign in an existing user
+const { data: signInData, error: signInError } = await supabase.auth.signInWithPassword({
+  email: 'jane@example.com',
+  password: 'correct-horse-battery-staple',
+});
+
+if (signInError) {
+  console.error('sign in failed:', signInError.message);
+}
+
+// Sign out the current user
+const { error: signOutError } = await supabase.auth.signOut();
+
+if (signOutError) {
+  console.error('sign out failed:', signOutError.message);
+}
+```
+
+A successful `signUp` or `signInWithPassword` call stores a session (an access token and a refresh token) in the client, and every subsequent request from that client is sent as that authenticated user.
+
+## Keeping UI state in sync with `onAuthStateChange`
+
+Rather than manually tracking whether a user is signed in — and re-checking it after every sign-in, sign-out, or silent token refresh — subscribe once, typically at app startup:
+
+```typescript
+supabase.auth.onAuthStateChange((event, session) => {
+  // Fires on SIGNED_IN, SIGNED_OUT, TOKEN_REFRESHED, and more
+  setSession(session);
+});
+```
+
+This one subscription fires for every auth-related event for the lifetime of the app: the initial session on load, a sign-in, a sign-out, and a token refresh happening quietly in the background. Wiring your app's local state to this single callback means the UI is always a reflection of the client's real session, and you never have to remember to call it manually after each auth action.
+
+## Protecting a route: a UX convenience, not real security
+
+A common client-side pattern is checking for a session before rendering a protected page or firing an authenticated request:
+
+```typescript
+const {
+  data: { session },
+} = await supabase.auth.getSession();
+
+if (!session) {
+  // No session: hide the page and send the user to sign in
+  redirectToLogin();
+}
+```
+
+This is genuinely useful — it avoids flashing protected content at a signed-out visitor and avoids firing requests you know will fail. But it must not be mistaken for the actual security mechanism. Client-side JavaScript can always be inspected, modified, or skipped entirely by a determined visitor — nothing stops someone from calling your Supabase project directly with their own token, bypassing your UI altogether. The real boundary that decides whether a request can read or write a given row is **row level security (RLS)** enforced by Postgres itself, on the server side, regardless of what any client chose to check or render.
+
+<Mermaid title="A session drives the UI, but RLS is still the real gate" code={authClientDiagram} />
+
+export const authClientDiagram = `flowchart LR
+  action["signUp() or signInWithPassword()"] --> session["Session created and stored in the client"]
+  session --> event["onAuthStateChange fires"]
+  event --> ui["App UI updates; a protected route becomes reachable"]
+  ui --> rls[("Real enforcement still happens via RLS on the database")]`;
+
+<Callout title="The one-line takeaway">
+`supabase.auth.signUp()`, `signInWithPassword()`, and `signOut()` each resolve to `{ data, error }` and drive a stored session; subscribing once to **`onAuthStateChange`** keeps your app's UI synced with sign-in, sign-out, and token refresh without manually re-checking session state everywhere. Checking `session` before rendering a protected page is a genuine **UX convenience**, but it is not real security — a determined client can always bypass it, so **row level security (RLS)** on the database remains the actual boundary that decides what a request is allowed to read or write.
+</Callout>
+
+export const quizAuthClient = [
+  {
+    q: 'What does subscribing once to onAuthStateChange let you avoid doing manually?',
+    options: [
+      'Writing any sign-in code at all',
+      'Re-checking and re-syncing auth state yourself after every sign-in, sign-out, or token refresh',
+      'Calling signOut when a user leaves the page',
+      'Storing the anon key in your app',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why is checking session before rendering a protected page only a UX convenience?',
+    options: [
+      'Because getSession() is deprecated in supabase-js',
+      'Because client-side code can be inspected or bypassed by a determined visitor, so it cannot be the actual security boundary',
+      'Because sessions never expire so the check is unnecessary',
+      'Because it only works for OAuth sign-ins, not passwords',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What actually enforces which rows a request can read or write, regardless of client-side checks?',
+    options: [
+      'The onAuthStateChange callback',
+      'Row level security (RLS) enforced by Postgres on the server side',
+      'Whether the browser tab is focused',
+      'The order in which signUp and signInWithPassword are called',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What shape does a call like supabase.auth.signOut() resolve to?',
+    options: [
+      'It throws an exception on failure instead of returning a value',
+      'An object shaped { data, error } (or { error } for signOut) that must be checked explicitly',
+      'A plain boolean, true or false',
+      'Nothing; it always resolves to undefined',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="client-development/auth-in-the-client" questions={quizAuthClient} />
+
+<ProgressTracker client:visible id="client-development/auth-in-the-client" />

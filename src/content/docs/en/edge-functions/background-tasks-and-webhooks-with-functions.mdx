@@ -1,0 +1,140 @@
+---
+title: 'Background Tasks and Webhooks with Functions'
+description: 'Triggering an Edge Function from a database change with Database Webhooks, and running work after the response with EdgeRuntime.waitUntil.'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+A **Database Webhook** lets a row change in Postgres call an Edge Function automatically, and `EdgeRuntime.waitUntil` lets that function respond immediately while finishing slower work in the background.
+
+## Database Webhooks: letting the database call out
+
+Every Edge Function so far has been invoked by a client, explicitly, with `supabase.functions.invoke()`. But plenty of real work should happen because of a **database change**, not because a client remembered to ask for it — send a welcome email when a row appears in `profiles`, notify a downstream system when an order is placed. Database Webhooks cover exactly this: configure one on a table for `insert`, `update`, or `delete`, and Supabase fires an HTTP request whenever that event happens.
+
+Under the hood, a Database Webhook is a convenience wrapper around a Postgres trigger, built on the **`pg_net`** extension. `pg_net` makes HTTP requests **asynchronously** from inside Postgres, so a slow or failing network call never blocks the write that triggered it — the `insert` commits regardless of how long the webhook's HTTP call takes.
+
+```sql
+-- Roughly what a Database Webhook configures under the hood:
+-- a trigger that calls pg_net on insert into public.profiles
+create trigger "profiles_insert_webhook"
+after insert on public.profiles
+for each row
+execute function supabase_functions.http_request(
+  'https://<project-ref>.supabase.co/functions/v1/welcome-email',
+  'POST',
+  '{"Content-Type":"application/json"}',
+  '{}',
+  '5000'
+);
+```
+
+In practice you configure this from the Dashboard's Database Webhooks UI rather than writing the trigger by hand, but knowing it is "a trigger plus `pg_net`" explains why it is asynchronous and why it can point at an Edge Function URL just like any other HTTP client.
+
+## Responding fast while work continues: EdgeRuntime.waitUntil
+
+Some work triggered this way should not delay the response — sending a confirmation email, writing an analytics log, calling a third-party API that takes a few seconds. Making the original caller (often the database's webhook mechanism itself) wait for all of that is wasteful. `EdgeRuntime.waitUntil(promise)` solves this: it marks a promise as a background task that keeps running after the function has already sent its response.
+
+```typescript
+Deno.serve(async (req) => {
+  const payload = await req.json()
+
+  // Do not await this — let it run after the response is sent
+  EdgeRuntime.waitUntil(sendConfirmationEmail(payload))
+
+  return new Response('ok', { status: 200 })
+})
+
+async function sendConfirmationEmail(payload: unknown) {
+  // Slow third-party API call, logging, etc.
+}
+```
+
+The key detail is the missing `await` on `sendConfirmationEmail(payload)`. If you awaited it, the response would wait for the email to finish sending. Passing the unresolved promise to `waitUntil` tells the Deno runtime to keep the function instance alive until that promise settles, without holding up the HTTP response.
+
+## Combining both: an order confirmation flow
+
+A realistic end-to-end example: a Database Webhook fires on `insert` into `orders`, calling an Edge Function that responds immediately to acknowledge the write, while a confirmation email sends in the background.
+
+```typescript
+Deno.serve(async (req) => {
+  const { record } = await req.json() // the new orders row, from the webhook payload
+
+  EdgeRuntime.waitUntil(sendOrderConfirmationEmail(record))
+
+  return new Response(JSON.stringify({ received: true }), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+})
+
+async function sendOrderConfirmationEmail(order: { id: string; email: string }) {
+  // Call an email provider here; this runs after the response is already sent
+}
+```
+
+The database never waits on the email provider, the webhook caller gets a fast `200`, and the email still gets sent — just after the HTTP round trip has already completed.
+
+<Mermaid title="A Postgres insert triggering a webhook, an Edge Function, and a background task" code={webhookBackgroundDiagram} />
+
+export const webhookBackgroundDiagram = `flowchart LR
+  insertRow["insert into orders"] --> webhook["Database Webhook (pg_net, async)"]
+  webhook --> edge["Edge Function"]
+  edge --> respond["Immediate response: 200 received"]
+  edge -->|"EdgeRuntime.waitUntil"| bg["Background task: send confirmation email"]`;
+
+<Callout title="The one-line takeaway">
+A **Database Webhook** is a Postgres trigger built on the **`pg_net`** extension that fires an HTTP request asynchronously to an Edge Function whenever a chosen row event happens, and **`EdgeRuntime.waitUntil(promise)`** lets that function return its response immediately while an un-awaited promise keeps running afterward — combined, an `insert` into `orders` can trigger a function that acknowledges instantly while a confirmation email sends in the background.
+</Callout>
+
+export const quizBackgroundWebhooks = [
+  {
+    q: 'What Postgres extension powers Database Webhooks',
+    options: [
+      'pg_cron',
+      'pg_net',
+      'pg_graphql',
+      'pg_stat_statements',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why does pg_net make webhook HTTP calls asynchronous',
+    options: [
+      'So the calling client has to poll for the result',
+      'So a slow or failing HTTP request never blocks the database write that triggered it',
+      'So it can only be used for reads, never writes',
+      'Asynchronous behavior is not related to pg_net',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does EdgeRuntime.waitUntil let an Edge Function do',
+    options: [
+      'Delay sending any response until all promises resolve',
+      'Return its HTTP response immediately while a background task keeps running afterward',
+      'Retry a failed request automatically',
+      'Cache the response for future identical requests',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'In the combined order confirmation example, what happens if you await the email-sending promise instead of passing it to waitUntil',
+    options: [
+      'Nothing changes, behavior is identical',
+      'The HTTP response would wait until the email finished sending',
+      'The database insert would be rolled back',
+      'The Database Webhook would stop firing',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="edge-functions/background-tasks-and-webhooks-with-functions" questions={quizBackgroundWebhooks} />
+
+<ProgressTracker client:visible id="edge-functions/background-tasks-and-webhooks-with-functions" />

@@ -1,0 +1,120 @@
+---
+title: 'Table, Schema และ Migration'
+description: 'สร้าง table ด้วย SQL ธรรมดา pattern profiles กับ auth.users และใช้ CLI แปลง schema change ให้เป็น migration ที่ version-controlled'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+เพราะ Supabase คือ Postgres ธรรมดา table หนึ่งอันจึงถูกสร้างด้วย SQL ธรรมดา — ผ่าน Table Editor GUI ของ Studio หรือคำสั่ง `create table` ตรง ๆ — และ migration คือสิ่งที่แปลง schema change นั้นให้เป็นไฟล์ใน version control ที่ review ได้และทำซ้ำได้
+
+## สร้าง table ด้วย SQL ธรรมดา
+
+ไม่มี abstraction พิเศษของ Supabase สำหรับนิยาม table เลย ไม่ว่าคุณจะคลิกผ่าน Table Editor ของ Studio หรือพิมพ์ SQL ตรง ๆ ใน SQL Editor ผลลัพธ์คือ table Postgres ธรรมดา pattern ที่พบบ่อยมากคือ table `profiles` ที่ `id` ของมันอ้างอิงไปยัง table `auth.users` ที่ Supabase มีให้ในตัว (module Auth จะพูดถึง `auth.users` แบบลงลึก)
+
+```sql
+create table public.profiles (
+  id uuid primary key references auth.users (id),
+  username text,
+  created_at timestamptz default now()
+);
+```
+
+`auth.users` คือ table ที่ service Auth ของ Supabase จัดการให้คุณ การเชื่อม `profiles.id` เข้ากับมันด้วย foreign key คือวิธีมาตรฐานในการผูกข้อมูลของแอปคุณเอง — username, avatar, preference — เข้ากับ user ที่ authenticate แล้ว
+
+## Migration ผ่าน CLI
+
+schema change ที่ทำผ่าน Studio GUI เป็นของจริงและมีผลทันที แต่ตัวมันเอง **ไม่ได้** ถูกเก็บไว้เป็น code ที่ไหนเลย — ไม่มีใคร review มัน และมันจะไม่โผล่ไปที่ environment อื่นเองอัตโนมัติ migration แก้ปัญหานี้
+
+```bash
+# Create a new, timestamped SQL migration file under supabase/migrations/
+supabase migration new create_profiles_table
+
+# Apply all pending local migrations to the linked hosted project
+supabase db push
+
+# Generate a migration from schema changes made through the Studio GUI
+supabase db diff --schema public
+```
+
+`supabase migration new <name>` สร้างไฟล์ `.sql` เปล่า ๆ ที่มี timestamp กำกับ — คุณเขียนคำสั่ง `create table` (หรือ `alter table`) ลงไปเอง หรือ generate มันด้วย `supabase db diff` หลังจากแก้ผ่าน Studio GUI แล้ว `supabase db push` จะ apply ทุก migration ที่ยังไม่เคยรันเข้ากับ hosted project ที่ link ไว้
+
+```sql
+-- supabase/migrations/20250101000000_create_profiles_table.sql
+create table public.profiles (
+  id uuid primary key references auth.users (id),
+  username text,
+  created_at timestamptz default now()
+);
+```
+
+## ทำไมเรื่องนี้ถึงสำคัญ มันคือ IaC ที่ใช้กับ schema ของคุณ
+
+นี่คือไอเดียเดียวกับ "infrastructure as code เทียบกับ ClickOps" จากฝั่ง infrastructure tooling แค่เอามาใช้กับ database ของคุณ การแก้ไขด้วยการคลิกใน Studio GUI ใช้งานได้จริง แต่มันมองไม่เห็นตอน code review, มองไม่เห็นใน `git log` และต้อง reproduce มือเพื่อให้ไปถึง environment ที่สอง migration file ทำให้ change เดียวกันนี้ **review ได้, ทำซ้ำได้ และ deploy ได้** — `supabase db push` apply มันเข้า staging, production หรือ local stack ของเพื่อนร่วมทีมได้เหมือนกันทุกที่
+
+<Mermaid title="GUI edit และ migration file ไหลเข้า Postgres schema เดียวกัน" code={migrationsDiagram} />
+
+export const migrationsDiagram = `flowchart LR
+  gui["Studio GUI schema edit"] --> pg[("Postgres schema")]
+  diff["supabase db diff"] --> file["Migration SQL file (supabase/migrations/)"]
+  gui -.-> diff
+  file --> push["supabase db push"]
+  push --> hosted[("Hosted project Postgres")]
+  local["Local migration written by hand"] --> file`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+table ใน Supabase ถูกสร้างด้วย **SQL ธรรมดาจริง ๆ** — `create table` ไม่มี abstraction พิเศษ — ไม่ว่าจะผ่าน Studio GUI หรือเขียนเอง และ pattern ที่พบบ่อยคือ table `profiles` ที่ `id` อ้างอิงไปยัง `auth.users` `supabase migration new` กับ `supabase db diff` แปลง schema change ให้เป็นไฟล์ `.sql` ใน version control และ `supabase db push` apply มันเข้า hosted project ที่ link ไว้ ทำให้แม้แต่ change ที่ทำผ่าน GUI ก็ยังจบลงที่ **review ได้, ทำซ้ำได้ และ deploy ได้** แทนที่จะเป็น ClickOps ที่มองไม่เห็น
+</Callout>
+
+export const quizTablesMigrations = [
+  {
+    q: 'table ใน Supabase ถูกสร้างขึ้นโดยพื้นฐานยังไง',
+    options: [
+      'ผ่านรูปแบบ schema definition เฉพาะของ Supabase เอง',
+      'ด้วย Postgres SQL ธรรมดา เช่น `create table` ไม่ว่าจะพิมพ์เองหรือ generate จาก Studio GUI',
+      'สร้าง table ตรง ๆ ไม่ได้ ต้อง infer จาก client code เท่านั้น',
+      'ผ่าน schema builder add-on แบบเสียเงินเท่านั้น',
+    ],
+    answer: 1,
+  },
+  {
+    q: '`supabase db push` ทำอะไร',
+    options: [
+      'ลบ table ทั้งหมดใน hosted project',
+      'apply migration บนเครื่องที่ยังไม่รัน เข้ากับ hosted project ที่ link ไว้',
+      'สตาร์ท local Docker stack',
+      'สร้างไฟล์ migration เปล่า ๆ ที่ไม่มี SQL อยู่ข้างใน',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไมการเก็บ schema change เป็น migration file ถึงสำคัญ แม้ว่าคุณจะแก้ผ่าน Studio GUI ก็ตาม',
+    options: [
+      'ไม่สำคัญ เพราะ change ผ่าน GUI ถูก version-control ให้อัตโนมัติอยู่แล้ว',
+      'migration file ทำให้ change นั้น review ได้, ทำซ้ำได้ และ deploy ไป environment อื่นได้ ต่างจากการแก้ผ่าน GUI แบบ ad hoc',
+      'migration file จำเป็นแค่กับ table ที่อ้างอิง auth.users เท่านั้น',
+      'GUI ทำ schema change จริงไม่ได้เลย',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'pattern ที่พบบ่อยสำหรับเชื่อม table profiles เข้ากับ Supabase Auth คืออะไร',
+    options: [
+      'เก็บสำเนา password hash ไว้ใน table profiles',
+      'ให้ profiles.id มี foreign key อ้างอิงไปยัง auth.users',
+      'ไม่มีวิธีที่รองรับสำหรับผูกข้อมูลของแอปเข้ากับ user ที่ authenticate แล้ว',
+      'ใช้ UUID แยกที่ไม่เกี่ยวข้องกัน โดยไม่มี foreign key',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="foundations/tables-schema-and-migrations" questions={quizTablesMigrations} />
+
+<ProgressTracker client:visible id="foundations/tables-schema-and-migrations" />

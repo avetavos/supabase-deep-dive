@@ -1,0 +1,158 @@
+---
+title: 'Error Handling and Typed Queries'
+description: 'The PostgrestError shape every failed query returns, why matching on error.code beats parsing error.message, and how generated Database types catch bad inserts at compile time.'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+Every `supabase-js` call resolves to `{ data, error }` instead of throwing, so the standard pattern is checking `error` first — once you have handled it, TypeScript narrows `data` for you, and if `error` is a `PostgrestError` you should branch on its stable `code` rather than its human-readable `message`.
+
+## Check `error` before trusting `data`
+
+You saw this pattern already in the previous lesson; here it is formalized. No `supabase-js` call throws on a failed request — it always resolves normally, with the result split between `data` and `error`:
+
+```typescript
+const { data, error } = await supabase
+  .from('profiles')
+  .select('id, username')
+  .eq('id', userId)
+  .single();
+
+if (error) {
+  console.error(error.message);
+} else {
+  // TypeScript now knows data is not null here
+  console.log(data.username);
+}
+```
+
+Because nothing is thrown, a failed request that you forget to check simply looks like `data` being `null` — there is no stack trace forcing you to notice. Checking `error` first is not just good practice, it is the only way to reliably tell success from failure, and it is also what lets TypeScript narrow `data`'s type: inside the `else` branch (or after an early `return` on `error`), `data` is known to be non-null.
+
+## The shape of a `PostgrestError`
+
+When `error` is populated, it is a `PostgrestError` with four fields worth knowing:
+
+- **`message`** — a human-readable description of what went wrong.
+- **`code`** — a stable code: either a Postgres error code (such as `23505` for a unique-constraint violation) or a PostgREST-specific code.
+- **`details`** — additional context from Postgres, when available.
+- **`hint`** — a suggestion for fixing the problem, when Postgres or PostgREST can offer one.
+
+The practical rule: match on `error.code` for any programmatic decision, not on `error.message`. Message text is meant for humans and can change wording between versions; the code is a stable contract you can safely branch on.
+
+```typescript
+const { error } = await supabase
+  .from('profiles')
+  .insert({ id: userId, username: 'ada' });
+
+if (error) {
+  if (error.code === '23505') {
+    // Postgres unique_violation — a stable code, unlike the message text
+    showError('That username is taken.');
+  } else {
+    showError('Something went wrong, please try again.');
+  }
+}
+```
+
+## Generated types catch bad queries before you run them
+
+Plugging the `Database` type from the previous lesson into `createClient<Database>()` means every `.select()`, `.insert()`, and `.update()` is checked against your actual schema at compile time:
+
+```typescript
+import { createClient } from '@supabase/supabase-js';
+import type { Database } from './database.types';
+
+const supabase = createClient<Database>(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_ANON_KEY!
+);
+
+type ProfileInsert = Database['public']['Tables']['profiles']['Insert'];
+
+async function createProfile(profile: ProfileInsert) {
+  const { data, error } = await supabase
+    .from('profiles')
+    .insert(profile)
+    .select()
+    .single();
+
+  if (error) {
+    if (error.code === '23505') {
+      throw new Error('That username is taken.');
+    }
+    throw error;
+  }
+
+  return data;
+}
+```
+
+With this in place, selecting a column that does not exist on `profiles`, or calling `createProfile` with an object missing a required field from `Insert`, is a TypeScript error at build time — you find out while writing the code, not from a failed request in production.
+
+<Mermaid title="Branch on error, and specifically on error.code, before trusting data" code={typedQueriesDiagram} />
+
+export const typedQueriesDiagram = `flowchart LR
+  call[".from('profiles').insert(profile)"] --> result["{ data, error }"]
+  result --> check{"error present?"}
+  check -->|"yes"| code{"error.code"}
+  code -->|"23505"| unique["Show: username already taken"]
+  code -->|"other"| generic["Show a generic failure message"]
+  check -->|"no"| typed["Use typed data safely"]`;
+
+<Callout title="The one-line takeaway">
+Every `supabase-js` call resolves to **`{ data, error }`** instead of throwing, so check `error` first — TypeScript then narrows `data` for you. A populated `error` is a `PostgrestError` with **`message`**, **`code`**, **`details`**, and **`hint`**; branch on the stable **`error.code`** (for example `23505` for a unique-constraint violation) rather than parsing `error.message` text, which can change wording. Passing your generated `Database` type into `createClient<Database>()` checks `.select()`, `.insert()`, and `.update()` calls against your real schema at **compile time**, turning bad columns or missing required fields into build errors instead of runtime surprises.
+</Callout>
+
+export const quizTypedQueries = [
+  {
+    q: 'What shape does a supabase-js query result take, and how do you know it failed?',
+    options: [
+      'It throws an exception you must catch with try/catch',
+      'It resolves to { data, error }, and you check error explicitly rather than relying on a thrown exception',
+      'It returns only data, with failures silently producing an empty array',
+      'It returns a numeric HTTP status code you must interpret yourself',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why is matching on error.code more robust than matching on error.message?',
+    options: [
+      'error.message is not available on PostgrestError',
+      'error.code is a stable identifier (such as a Postgres error code), while error.message is human-readable text that can change wording',
+      'error.code is only present for network failures',
+      'There is no practical difference between the two',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What compile-time benefit does passing a generated Database type to createClient give insert and update calls?',
+    options: [
+      'It automatically retries failed inserts',
+      'Calls are checked against your actual schema, so a missing required field or a nonexistent column becomes a TypeScript error before the code ever runs',
+      'It disables row level security for that call',
+      'It converts every error into a thrown exception',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What Postgres error code typically appears when an insert violates a unique constraint?',
+    options: [
+      '23505',
+      '404',
+      '500',
+      'PGRST100',
+    ],
+    answer: 0,
+  },
+];
+
+<Quiz client:visible id="client-development/error-handling-and-typed-queries" questions={quizTypedQueries} />
+
+<ProgressTracker client:visible id="client-development/error-handling-and-typed-queries" />

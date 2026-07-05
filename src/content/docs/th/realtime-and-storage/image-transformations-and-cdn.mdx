@@ -1,0 +1,116 @@
+---
+title: 'Image Transformations and the CDN'
+description: 'Supabase Storage resize และ reprocess รูปแบบ on the fly จาก query parameter ยังไง และทำไมให้ CDN cache แต่ละ variant ที่ transform แล้วถึงดีกว่า pre-generate ทุกขนาดเอง'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+Supabase Storage resize และ reprocess รูปได้ **on the fly** ตอน request จริงด้วย query parameter ธรรมดา ๆ ทำให้คุณไม่ต้อง pre-generate แล้วเก็บ thumbnail, medium และ large ของทุกรูปเองเลย
+
+## ขอรูปแบบ transform แล้ว
+
+แทนที่จะ upload `photo.png` หนึ่งไฟล์ แล้วแยก upload `photo-thumb.png`, `photo-medium.png` ไปเรื่อย ๆ คุณ upload รูปแค่ครั้งเดียว แล้วขอขนาดที่ต้องการตอน serve รูป ทั้ง `getPublicUrl` และ `createSignedUrl` รับ option `transform` ได้
+
+```typescript
+const { data } = supabase.storage
+  .from('avatars')
+  .getPublicUrl('user123/photo.png', {
+    transform: {
+      width: 200,
+      height: 200,
+      resize: 'cover',
+    },
+  });
+```
+
+`width` กับ `height` ตั้งขนาดเป้าหมายเป็น pixel `resize` คุมว่ารูปจะ fit ขนาดนั้นยังไง `cover` (ค่า default) เติมเต็มขนาดเป้าหมายแล้ว crop ส่วนเกินทิ้ง `contain` ใส่รูปทั้งใบให้อยู่ในขนาดเป้าหมายโดยรักษา aspect ratio และ `fill` ยืดรูปให้พอดีขนาดเป๊ะโดยไม่รักษา aspect ratio มี option `quality` ให้คุม compression ได้ด้วย การขอรูปเดียวกันสามขนาดก็แค่ query string สามแบบที่ต่างกันบน object เดิม
+
+```typescript
+const thumb = supabase.storage.from('avatars').getPublicUrl('user123/photo.png', {
+  transform: { width: 64, height: 64, resize: 'cover' },
+});
+const medium = supabase.storage.from('avatars').getPublicUrl('user123/photo.png', {
+  transform: { width: 400, height: 400, resize: 'contain' },
+});
+```
+
+ไม่มีการ upload ใหม่เกิดขึ้นเลยสักครั้ง ต้นฉบับตัวเดียวที่เก็บไว้ serve ทั้งสองขนาดนี้ได้เลย
+
+## ทำไม CDN cache ถึงสำคัญตรงนี้
+
+request แรกของไฟล์หนึ่งบวก transform parameter ชุดหนึ่งต้องทำงานจริง Storage decode ต้นฉบับ, resize แล้วคืนผลลัพธ์กลับมา ถ้าทำแบบนี้ทุก request จะช้ามาก แต่มันไม่ช้าเพราะ output ที่ transform แล้วถูก cache ไว้ที่ **CDN edge** โดย key ด้วยไฟล์บวก transform parameter ที่ใช้เป๊ะ ๆ request ถัดไปที่ขอ `width`/`height`/`resize` ชุดเดิมบน object เดิมจะถูก serve ตรงจาก edge cache โดยไม่ต้อง reprocess รูปซ้ำอีก แต่ถ้าเปลี่ยน parameter ตัวไหนก็ตาม จะกลายเป็น cache key ใหม่ทันที variant ใหม่จะถูกสร้างแล้ว cache ตอน request แรกของมันเอง
+
+มีข้อเท็จจริงที่ควรรู้ไว้ ใน Supabase แบบ hosted image transformation เป็นฟีเจอร์ที่จำกัดไว้กับ plan ที่เสียเงินเท่านั้น ไม่ได้มีให้ใช้ทุก plan ดังนั้นควรเช็ค plan ของตัวเองก่อนพึ่งพามันใน production
+
+## trade-off เทียบกับการ pre-generate ขนาดเอง
+
+ทางเลือกอื่นคือ resize รูปเองตอน upload แล้วเก็บ `photo-thumb.png`, `photo-medium.png` และ `photo-large.png` ไว้ วิธีนี้ไม่มีต้นทุน transform ตอนอ่านเลย แต่ก็มีต้นทุนของตัวเองจริง ๆ คือคุณต้องเก็บ N สำเนาของทุกรูปตลอดไป ต้องเลือกขนาดตายตัวไว้ล่วงหน้า และถ้าวันไหนต้องการขนาดที่ไม่ได้เผื่อไว้ก็ต้อง reprocess แล้ว re-upload ใหม่ทั้งหมดย้อนหลัง การ transform แบบ on-the-fly กลับด้านนี้ คุณจ่าย latency นิดหน่อยตอน request *แรก* ของแต่ละขนาด แลกกับการเก็บต้นฉบับแค่ **หนึ่งชุด** ต่อรูป แล้วขอขนาดไหนก็ได้เมื่อไหร่ก็ได้ โดยไม่ต้องแตะ upload path อีกเลย
+
+<Mermaid title="ต้นฉบับรูปเดียว serve variant ที่ transform แล้วได้ไม่จำกัด cache ไว้ที่ CDN edge หลัง request แรก" code={imageTransformDiagram} />
+
+export const imageTransformDiagram = `flowchart LR
+  original[("Original image: photo.png")]
+  original --> thumb["?width=64&height=64&resize=cover"]
+  original --> medium["?width=400&height=400&resize=contain"]
+  original --> large["?width=1200&height=800&resize=cover"]
+  thumb --> cdnThumb["Cached at CDN edge after first request"]
+  medium --> cdnMedium["Cached at CDN edge after first request"]
+  large --> cdnLarge["Cached at CDN edge after first request"]`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+Supabase Storage transform รูป **on the fly** ผ่าน option `transform` (`width`, `height`, resize mode `cover`/`contain`/`fill` และ `quality`) ที่ส่งเข้า `getPublicUrl` หรือ `createSignedUrl` ทำให้ต้นฉบับที่เก็บไว้ชุดเดียว serve ได้ทุกขนาดโดยไม่ต้อง pre-generate variant เองเลย แต่ละคู่ไฟล์บวก parameter ที่ต่างกันจะถูก **cache ไว้ที่ CDN edge** หลัง request แรก แลก latency นิดหน่อยตอน request แรกกับการไม่ต้องเก็บหรือจัดการ N สำเนาของทุกรูปเอง
+</Callout>
+
+export const quizImageTransform = [
+  {
+    q: 'query/transform parameter ตัวไหนคุม image transformation แบบ on-the-fly ของ Storage',
+    options: [
+      'มีแค่ parameter "size" เดียวที่ตั้งค่าตายตัวได้แค่ small/medium/large',
+      'width, height, resize mode (cover/contain/fill) และ quality',
+      'API แก้รูปแยกต่างหากทั้งหมด ไม่เกี่ยวกับ getPublicUrl หรือ createSignedUrl เลย',
+      'ต้องเปลี่ยนชื่อ bucket ถึงจะสลับขนาดได้',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไมการ cache รูปที่ transform แล้วไว้ที่ CDN ถึงสำคัญ',
+    options: [
+      'ไม่สำคัญเลย ทุก request ต้อง reprocess รูปใหม่เสมออยู่ดี',
+      'request ซ้ำสำหรับไฟล์และ transform parameter ชุดเดิมถูก serve จาก edge cache แทนที่จะ reprocess ใหม่ทุกครั้ง',
+      'มีผลแค่กับไฟล์วิดีโอเท่านั้น ไม่เกี่ยวกับรูป',
+      'ทำให้ไม่ต้องระบุ width หรือ height อีกต่อไป',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'trade-off ของการ transform แบบ on-the-fly เทียบกับการ pre-generate หลายขนาดเองคืออะไร',
+    options: [
+      'on-the-fly แย่กว่าทุกด้านแบบเทียบกันไม่ได้เลย',
+      'จ่าย latency นิดหน่อยตอน request แรกของแต่ละขนาดใหม่ แลกกับการเก็บต้นฉบับชุดเดียวแทน N สำเนาที่ pre-generate ไว้',
+      'การ pre-generate ขนาดเองไม่ต้องใช้ storage เลย',
+      'ไม่มี trade-off ที่มีนัยสำคัญระหว่างสองวิธีนี้',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'resize mode "contain" ทำอะไร',
+    options: [
+      'ยืดรูปให้พอดีขนาดเป้าหมายเป๊ะ โดยไม่สนใจ aspect ratio',
+      'ใส่รูปทั้งใบให้อยู่ในขนาดเป้าหมายโดยรักษา aspect ratio ไว้',
+      'ลบต้นฉบับทิ้งหลัง transform เสร็จ',
+      'crop รูปให้เป็นสี่เหลี่ยมจัตุรัสเสมอ',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="realtime-and-storage/image-transformations-and-cdn" questions={quizImageTransform} />
+
+<ProgressTracker client:visible id="realtime-and-storage/image-transformations-and-cdn" />

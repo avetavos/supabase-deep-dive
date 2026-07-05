@@ -1,0 +1,113 @@
+---
+title: 'The Supabase Architecture'
+description: 'How every request carries a Postgres role (anon, authenticated, or service_role), why PostgREST enforces nothing itself, and how Auth, Storage, and Realtime relate to the same database.'
+sidebar:
+  order: 5
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+Every request to Supabase's auto-generated API arrives at Postgres carrying a **Postgres role** — `anon`, `authenticated`, or `service_role` — and that role is the architectural backbone that everything else (the Data API, Row Level Security) is built on top of.
+
+## Every request carries a role
+
+Supabase's auto-generated API authenticates every request, or treats it as explicitly anonymous. Whichever it is, the request reaches Postgres as one of three roles:
+
+- **`anon`** — an unauthenticated request. No user is logged in.
+- **`authenticated`** — a request from a logged-in user, carrying their JWT claims, including `auth.uid()` for identifying which user it is.
+- **`service_role`** — trusted server-side code. This role **bypasses Row Level Security entirely**, the same key you already met in the previous lesson.
+
+```sql
+-- Inside a Row Level Security policy, this is exactly how you tell roles apart.
+create policy "Users can view their own profile"
+on public.profiles
+for select
+to authenticated
+using (auth.uid() = id);
+```
+
+## PostgREST translates HTTP into SQL — it does not enforce anything itself
+
+**PostgREST** is the service that turns an HTTP request like `GET /rest/v1/profiles?select=*` into an actual SQL query, and executes that query **as the role the request carries**. This detail matters more than it looks: PostgREST does not implement its own separate permission system. It relies entirely on Postgres's own access control — plain `grant`/`revoke` permissions, and **Row Level Security** policies — to decide what that role is actually allowed to read or write. Access control lives in the database, not in the API layer sitting in front of it.
+
+```typescript
+// This client call becomes an HTTP request to PostgREST, executed as
+// whatever role the current session carries (anon or authenticated).
+const { data, error } = await supabase
+  .from('profiles')
+  .select('id, username')
+  .eq('id', userId);
+```
+
+## The other services also just read and write Postgres
+
+Auth, Storage, and Realtime are separate services (separate processes), but none of them invent their own storage layer — they all ultimately read and write the same Postgres database:
+
+- **Auth (GoTrue)** manages the `auth` schema — `auth.users`, sessions, and related tables.
+- **Storage** manages its own metadata tables (buckets, objects, permissions) in the `storage` schema; the files themselves live in an object store, but access rules are Postgres rows.
+- **Realtime** reads Postgres's write-ahead log (WAL) to stream row changes, in addition to offering ephemeral broadcast/presence channels.
+
+<Mermaid title="A request's role travels through PostgREST into Postgres; other services share the same database" code={architectureDiagram} />
+
+export const architectureDiagram = `flowchart LR
+  client["Client request (anon / authenticated / service_role)"] --> postgrest["PostgREST"]
+  postgrest -->|"executes SQL as that role"| pg[("Postgres\n(grants + RLS enforced here)")]
+  auth["Auth (GoTrue)"] --> pg
+  storage["Storage"] --> pg
+  realtime["Realtime (reads WAL)"] --> pg`;
+
+<Callout title="The one-line takeaway">
+Every request carries a **Postgres role** — `anon` for unauthenticated requests, `authenticated` for logged-in users (with `auth.uid()` available), and `service_role` for trusted server code that bypasses **Row Level Security**. **PostgREST** turns HTTP into SQL executed as that role, but enforces nothing itself — access control lives entirely in Postgres's own grants and RLS policies. **Auth**, **Storage**, and **Realtime** are separate services, but all of them ultimately read and write the same underlying Postgres database.
+</Callout>
+
+export const quizArchitecture = [
+  {
+    q: 'Which Postgres role does an unauthenticated request use?',
+    options: [
+      'service_role',
+      'authenticated',
+      'anon',
+      'There is no role, unauthenticated requests are rejected before reaching Postgres',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'Where is access control actually enforced for Supabase\'s auto-generated API?',
+    options: [
+      'Inside PostgREST, which has its own independent authorization engine',
+      'Inside Postgres itself, via grants and Row Level Security policies',
+      'Inside the supabase-js client library',
+      'Access control is not enforced anywhere, it relies on obscurity',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What role does trusted server-side code use to bypass Row Level Security?',
+    options: [
+      'anon',
+      'authenticated',
+      'service_role',
+      'admin',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'How do Auth, Storage, and Realtime relate to the underlying Postgres database?',
+    options: [
+      'They are entirely independent systems with their own separate databases',
+      'They are separate services, but all ultimately read and write the same Postgres database (auth schema, storage schema, and the write-ahead log)',
+      'Only Auth touches Postgres, Storage and Realtime do not',
+      'They replace Postgres entirely for their own data',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="foundations/the-supabase-architecture" questions={quizArchitecture} />
+
+<ProgressTracker client:visible id="foundations/the-supabase-architecture" />

@@ -1,0 +1,135 @@
+---
+title: 'The REST API — PostgREST'
+description: 'PostgREST อ่าน schema ของ Postgres แล้ว generate REST endpoint ให้ทุก table และ view ที่ expose ไว้ พร้อมวิธีที่ query parameter ควบคุม filter, เลือก column, เรียงลำดับ และ embed relationship'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+**PostgREST** อ่าน schema ของ Postgres แล้วเปลี่ยนทุก table และ view ที่ expose ไว้ให้กลายเป็น REST endpoint โดยอัตโนมัติ — คุณไม่ต้องเขียนโค้ด API เอง
+
+## จาก table สู่ endpoint
+
+เมื่อคุณสร้าง table `public.movies` คุณไม่ต้องเขียน controller, route หรือ serializer ให้มันเลย PostgREST เชื่อมต่อกับ database ของคุณ introspect schema (table, column, type, foreign key) แล้ว generate REST endpoint ที่ตรงกันตอน request มาถึง table นี้จะเรียกใช้ได้ที่
+
+```bash
+GET /rest/v1/movies
+```
+
+นี่คือกลไกเบื้องหลัง Data API ของทุกโปรเจกต์ Supabase — PostgREST อยู่หน้าฐาน Postgres และแปลง HTTP request เป็น SQL query เพิ่ม column เข้าไป response shape ก็เปลี่ยนใน request ถัดไปทันที เพิ่ม table ใหม่ ก็มี endpoint ใหม่เกิดขึ้น — ไม่ต้อง deploy ไม่ต้องเขียนโค้ดเพิ่ม
+
+```sql
+create table public.movies (
+  id bigint generated always as identity primary key,
+  title text not null,
+  year int not null,
+  director_id bigint references public.directors (id)
+);
+```
+
+## Filter, select และ order ด้วย query parameter
+
+PostgREST อ่าน URL query parameter ธรรมดาแล้วแปลงเป็น SQL `where`, `select` และ `order by` ให้เอง เลือกว่าจะเอา column ไหนกลับมาด้วย `select`
+
+```bash
+GET /rest/v1/movies?select=id,title,year
+```
+
+filter row ด้วย syntax `column=operator.value` ของ PostgREST operator ที่ใช้บ่อยคือ `eq.` (เท่ากับ), `gt.`/`gte.` (มากกว่า / มากกว่าหรือเท่ากับ), `lt.`/`lte.` และ `like.` (จับ pattern) รวมถึง `in.` (อยู่ใน list)
+
+```bash
+GET /rest/v1/movies?year=gte.2020
+GET /rest/v1/movies?title=like.*Matrix*
+GET /rest/v1/movies?year=in.(2020,2021,2022)
+```
+
+เรียงผลลัพธ์ด้วย `order` และใส่ `.desc` เพื่อเรียงจากมากไปน้อย
+
+```bash
+GET /rest/v1/movies?order=year.desc
+```
+
+ทั้งสามอย่างรวมกันใน request เดียวได้
+
+```bash
+GET /rest/v1/movies?select=id,title,year&year=gte.2020&order=year.desc
+```
+
+## Embed related resource ผ่าน foreign key
+
+PostgREST ตาม foreign-key constraint แล้วส่ง row ที่เกี่ยวข้องกลับมาแบบ nested ใน response เดียว — ไม่ต้อง query แยก ไม่ต้อง join เองใน application code เพราะ `public.movies.director_id` reference ไปที่ `public.directors.id` คุณขอ director มาพร้อมกับแต่ละ movie ได้เลย
+
+```bash
+GET /rest/v1/movies?select=title,director:directors(name)
+```
+
+request นี้คืนแต่ละ movie พร้อม object `director` แบบ nested ที่มี `name` อยู่ข้างใน PostgREST หาความสัมพันธ์นี้ได้จากการอ่าน foreign-key constraint จริงใน schema ของคุณ — ไม่มีไฟล์ mapping ความสัมพันธ์แยกต่างหากให้ดูแล ถ้า constraint เปลี่ยนหรือถูกลบ การ embed ก็จะหยุดทำงานทันที เพราะ schema คือ source of truth เดียว
+
+อีกข้อที่ควรรู้ไว้ schema เดียวกันนี้ยัง expose เป็น **GraphQL API** ให้อัตโนมัติผ่าน extension `pg_graphql` สำหรับคนที่ชอบใช้ GraphQL มากกว่า REST คอร์สนี้เน้นที่ REST/RPC เป็นหลัก แต่ GraphQL endpoint ก็มีอยู่คู่กันโดยไม่ต้องทำ schema เพิ่ม
+
+<Mermaid title="จาก table ใน Postgres สู่ REST endpoint ที่ filter ได้" code={postgrestDiagram} />
+
+export const postgrestDiagram = `flowchart LR
+  tbl[("public.movies (with FK to directors)")] --> introspect["PostgREST introspects the schema"]
+  introspect --> endpoint["GET /rest/v1/movies"]
+  endpoint --> select["?select= chooses columns"]
+  endpoint --> filter["?year=gte.2020 filters rows"]
+  endpoint --> order["?order=year.desc sorts rows"]
+  endpoint --> embed["?select=title,director:directors(name) embeds via FK"]`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+**PostgREST** อ่าน schema ของ Postgres แล้ว generate REST endpoint ให้ทุก table ที่ expose ไว้โดยไม่ต้องเขียนโค้ด API เอง โดย URL query parameter ควบคุม **เลือก column** (`select`), **filter** (`column=operator.value` เช่น `gte.`, `like.`, `in.`) และ **เรียงลำดับ** (`order`) ส่วน **foreign-key constraint** จริงในระบบทำให้ **embed** row ที่เกี่ยวข้องมาใน request เดียวกันได้ และ schema เดียวกันนี้ยังได้ GraphQL endpoint ฟรีผ่าน `pg_graphql`
+</Callout>
+
+export const quizPostgrestApi = [
+  {
+    q: 'อะไรคือตัวที่ generate REST API ให้ table ในโปรเจกต์ Supabase จริง ๆ',
+    options: [
+      'นักพัฒนาเขียน route และ controller เองให้แต่ละ table',
+      'PostgREST introspect schema ของ Postgres แล้ว generate endpoint ให้อัตโนมัติ',
+      'ไฟล์ config YAML แยกที่ map table ไปหา route',
+      'Supabase CLI compile route ตอน deploy จาก template ตายตัว',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'query parameter `?year=gte.2020` ทำอะไร',
+    options: [
+      'สร้าง column ใหม่ชื่อ year โดยมีค่า default เป็น 2020',
+      'filter row ที่ year มากกว่าหรือเท่ากับ 2020',
+      'เรียงผลลัพธ์ตาม year เริ่มจาก 2020',
+      'เลือกเฉพาะ column year แล้วเปลี่ยนชื่อเป็น 2020',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'PostgREST รู้ได้อย่างไรว่า embed resource ที่เกี่ยวข้องอย่าง director เข้าไปใน response ของ movie ได้',
+    options: [
+      'ต้องเขียน custom resolver function ให้ทุกความสัมพันธ์',
+      'มันอ่าน foreign-key constraint จริงที่ประกาศไว้ใน schema',
+      'มันเดาจากชื่อ column ที่ตรงกัน',
+      'การ embed ทำได้แค่ผ่าน GraphQL เท่านั้น ใช้กับ REST ไม่ได้',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'นอกจาก REST แล้ว มี API style อื่นที่ได้มาโดยอัตโนมัติจาก schema เดียวกันไหม',
+    options: [
+      'SOAP ผ่าน compatibility layer แบบ legacy',
+      'GraphQL ผ่าน extension pg_graphql',
+      'gRPC ผ่าน protocol buffer compiler ในตัว',
+      'ไม่มี API style อื่นให้ใช้',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="auto-generated-api/the-rest-api-postgrest" questions={quizPostgrestApi} />
+
+<ProgressTracker client:visible id="auto-generated-api/the-rest-api-postgrest" />

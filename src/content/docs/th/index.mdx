@@ -1,0 +1,60 @@
+---
+title: Supabase — From Zero to Hero
+description: เชี่ยวชาญ Supabase ตั้งแต่พื้นฐาน — Postgres และ CLI, auto-generated REST/RPC API และ Data API exposure model, authentication และ Row Level Security, Realtime และ Storage, Edge Functions, TypeScript client SDK และการรัน Supabase บน production ด้วย Supavisor pooling, branching และ security checklist
+template: splash
+hero:
+  tagline: คอร์สแบบ standalone เน้น developer ว่าด้วย Supabase แพลตฟอร์ม Postgres แบบ open-source ตั้งแต่ database และ CLI ไปจนถึง auto-generated API, Row Level Security, Realtime, Storage และ Edge Functions สอนผ่าน TypeScript, SQL จริงและไดอะแกรม รายละเอียดที่มักผิดพลาด (RLS default, Data API exposure, Supavisor pooling) ถูก verify กับ docs ปัจจุบันแล้ว
+  actions:
+    - text: เริ่มที่นี่
+      link: /supabase/th/foundations/
+      icon: right-arrow
+      variant: primary
+    - text: ข้ามไปที่ Row Level Security
+      link: /supabase/th/auth-and-row-level-security/row-level-security-fundamentals/
+      icon: open-book
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+## สิ่งที่คุณจะได้เรียน
+
+<CardGrid>
+  <Card title="Foundations" icon="rocket">
+    Supabase คืออะไร, ตั้งค่า project และ CLI, table/schema/migration และภาพรวมว่าชิ้นส่วนต่าง ๆ ต่อกันยังไง [เริ่ม →](/supabase/th/foundations/)
+  </Card>
+  <Card title="Auto-Generated API" icon="seti:html">
+    REST API ของ PostgREST, การ query ด้วย client SDK, RPC function และ Data API exposure model [query →](/supabase/th/auto-generated-api/the-rest-api-postgrest/)
+  </Card>
+  <Card title="Auth & Row Level Security" icon="approve-check">
+    วิธี authenticate, session กับ JWT, RLS พื้นฐาน และ pattern กับข้อผิดพลาดที่พบบ่อยของ RLS [ป้องกัน →](/supabase/th/auth-and-row-level-security/authentication-methods/)
+  </Card>
+  <Card title="Realtime & Storage" icon="random">
+    Postgres Changes, Broadcast กับ Presence, storage bucket กับ policy และการแปลงรูปภาพ [ไปต่อแบบ live →](/supabase/th/realtime-and-storage/realtime-postgres-changes/)
+  </Card>
+  <Card title="Edge Functions" icon="seti:config">
+    function บน Deno, การเรียกใช้, การเข้าถึง database จาก function และ background task กับ webhook [deploy →](/supabase/th/edge-functions/what-are-edge-functions/)
+  </Card>
+  <Card title="Client Development" icon="seti:plan">
+    supabase-js client, auth ฝั่ง client, typed query และการรวม REST, Realtime กับ Storage เข้าด้วยกัน [สร้าง →](/supabase/th/client-development/the-supabase-js-client/)
+  </Card>
+  <Card title="Production & Ecosystem" icon="puzzle">
+    Supavisor connection pooling, branching กับ migration, performance กับ indexing และ production checklist [ขึ้น production →](/supabase/th/production-and-ecosystem/connection-pooling-and-supavisor/)
+  </Card>
+</CardGrid>
+
+## คอร์สนี้ทำงานยังไง
+
+<CardGrid>
+  <Card title="เป็น Postgres บวกของเพิ่ม" icon="rocket">
+    ทุกหัวข้อเริ่มจาก Postgres ที่อยู่ข้างใต้ — auto-generated API, Realtime และ Storage ล้วนเป็น layer บน database จริงตัวเดียว สิ่งที่คุณเรียนจึงใช้กับ Postgres ธรรมดาได้ด้วย
+  </Card>
+  <Card title="default ปัจจุบัน ที่ verify แล้ว" icon="random">
+    เขียนตามพฤติกรรมปัจจุบันของ Supabase และตรวจสอบกับ official docs ผ่าน context7 — รวมถึง Data API exposure model ที่ต้อง grant ชัดเจน และการเปิด Realtime ต่อ table ที่ tutorial เก่าหลายที่ข้ามไป
+  </Card>
+  <Card title="security สองชั้น ไม่ใช่ชั้นเดียว" icon="approve-check">
+    ไม่ใช่แค่ "เปิด RLS" แต่เป็นภาพรวมทั้งหมด — Data API เปิด table ไหนให้เข้าถึงได้บ้าง และ Row Level Security จำกัด row ไหนที่เห็นได้บ้าง สองคำถามที่แยกกันและมีคำตอบต่างกัน
+  </Card>
+  <Card title="ไดอะแกรมที่อธิบายได้" icon="puzzle">
+    สถาปัตยกรรมของ Supabase, เส้นทางตัดสินใจของ RLS, publication model ของ Realtime และโหมด pooling ของ Supavisor เป็นไดอะแกรม Mermaid ที่รองรับธีม สองภาษา (English / ไทย) พร้อมบันทึกความคืบหน้า quiz
+  </Card>
+</CardGrid>

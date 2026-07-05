@@ -1,0 +1,115 @@
+---
+title: 'Writing and Invoking a Function'
+description: 'A minimal Deno.serve function, calling it from supabase-js, and managing secrets for local and deployed environments.'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+An Edge Function is a plain `Deno.serve` handler that receives an HTTP request and returns a response, invoked from a client with `supabase.functions.invoke()`.
+
+## A minimal real function
+
+`Deno.serve` is a global provided by the Deno runtime — there is nothing to import for it. You hand it a callback that receives the incoming `Request` and returns a `Response`, exactly like the Fetch API you already know from the browser:
+
+```typescript
+Deno.serve(async (req) => {
+  const { name } = await req.json()
+  return new Response(JSON.stringify({ message: `Hello ${name}!` }), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+})
+```
+
+This file lives at `supabase/functions/hello-world/index.ts`. Once deployed, it is reachable at `https://<project-ref>.supabase.co/functions/v1/hello-world`, but you rarely construct that URL by hand — the client library does it for you.
+
+## Invoking it from a client
+
+`supabase-js` exposes a dedicated `functions.invoke()` method rather than a plain `fetch`, because it does useful work on your behalf:
+
+```typescript
+const { data, error } = await supabase.functions.invoke('hello-world', {
+  body: { name: 'World' },
+})
+```
+
+Beyond serializing `body` to JSON, `invoke()` automatically attaches an `Authorization` header — the currently signed-in user's access token if someone is logged in, or the project's anon key otherwise. That means your function can inspect who called it (or confirm no one is authenticated) without you wiring that header manually on every call.
+
+## Secrets and environment variables
+
+A function frequently needs a credential it should never expose to the client — a third-party API key, a signing secret. Set one for your deployed functions with the CLI:
+
+```bash
+supabase secrets set MY_API_KEY=sk_live_examplekey123
+```
+
+Read it inside the function with `Deno.env.get`:
+
+```typescript
+const apiKey = Deno.env.get('MY_API_KEY')
+```
+
+For local development, `supabase functions serve` reads a `.env` file placed under `supabase/functions/`, so the same `Deno.env.get` call works identically whether you are running locally or against the deployed function — only where the value comes from changes.
+
+<Mermaid title="A client invocation reaching a deployed Deno function" code={invokeFlowDiagram} />
+
+export const invokeFlowDiagram = `flowchart LR
+  client["supabase.functions.invoke('hello-world', { body })"] -->|"HTTP request + Authorization header"| edge["Deployed Deno function (Deno.serve)"]
+  edge -->|"Response"| client`;
+
+<Callout title="The one-line takeaway">
+An Edge Function is a `Deno.serve((req) => ...)` handler with **no import required** for `Deno.serve` itself, invoked from a client with `supabase.functions.invoke(name, { body })` which **automatically attaches an Authorization header** (user token or anon key), and secrets are set with `supabase secrets set` and read inside the function with `Deno.env.get`, backed locally by a `.env` file under `supabase/functions/`.
+</Callout>
+
+export const quizWritingInvoking = [
+  {
+    q: 'Do you need to import anything to use Deno.serve in an Edge Function',
+    options: [
+      'Yes, you must import it from a Deno standard library module',
+      'No, Deno.serve is a global provided by the runtime',
+      'Yes, you must install it via npm first',
+      'Only when running locally with supabase functions serve',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does supabase.functions.invoke() automatically attach to the request',
+    options: [
+      'Nothing, you must set every header manually',
+      'An Authorization header with the caller\'s access token or the anon key',
+      'A hard-coded service_role key',
+      'A random request id and nothing else',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'How do you set a secret for a deployed Edge Function',
+    options: [
+      'Write it directly into the index.ts file',
+      'supabase secrets set MY_API_KEY=value, then read it with Deno.env.get',
+      'Store it in a Postgres table and query it at request time',
+      'Secrets cannot be used inside Edge Functions',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'How does local development read environment variables for a function',
+    options: [
+      'It always calls the deployed secrets store over the network',
+      'From a .env file placed under supabase/functions/',
+      'It is not possible to use environment variables locally',
+      'From the project\'s package.json',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="edge-functions/writing-and-invoking-a-function" questions={quizWritingInvoking} />
+
+<ProgressTracker client:visible id="edge-functions/writing-and-invoking-a-function" />

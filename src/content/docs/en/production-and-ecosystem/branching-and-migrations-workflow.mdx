@@ -1,0 +1,121 @@
+---
+title: 'Branching and the Migrations Workflow'
+description: 'How Supabase branching creates isolated preview copies of your database tied to Git branches, and how migrations flow through them into production.'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+A Supabase branch is a full preview copy of your project tied to a Git branch or pull request — its own isolated Postgres schema, and optionally its own seeded data — so you can test schema changes in isolation before they ever touch production, the same way a preview deployment isolates your app code.
+
+## What a Supabase branch actually is
+
+Without branching, "testing a schema change" usually means running it against a shared staging database, or worse, against production directly. A Supabase branch instead provisions a genuinely separate Postgres instance for the lifetime of a Git branch or pull request: its own schema, its own Data API, its own Auth and Storage, and — if you ask for it — a clone of your production data.
+
+```bash
+# Create a persistent preview branch (stays around across pushes, not tied to a single PR)
+supabase --experimental branches create --persistent
+
+# Create a preview branch for a pull request, cloning production data into it
+supabase --experimental branches create feature-add-comments --with-data
+
+# List every preview branch on the linked project
+supabase --experimental branches list
+```
+
+This is not a feature flag toggled inside a single shared database — it is a fully separate database, which is exactly why it is safe to run destructive migrations, seed odd test data, or try a risky `alter table` against it without any risk to production.
+
+## Migrations: the file format that ties branches to production
+
+A branch only stays useful if the schema changes tested on it can be replayed reliably somewhere else. That is what migrations are for — plain SQL files, checked into version control, applied in order.
+
+```bash
+# Create a new, timestamped SQL migration file under supabase/migrations/
+supabase migration new add_comments_table
+
+# Apply all pending local migrations to the linked project or branch
+supabase db push
+
+# Capture a schema change made through the Studio GUI as a migration file after the fact
+supabase db diff --schema public
+```
+
+`supabase migration new` gives you an empty, timestamped `.sql` file to write your `create table` or `alter table` statements into by hand. `supabase db diff` covers the opposite case: someone made a change by clicking through the Studio GUI, and you want that change captured as a proper migration file instead of living only in the database. Either way, `supabase db push` applies every migration that has not yet run against whichever project or branch it is pointed at — the same command, whether the target is a preview branch or production.
+
+## Shipping migrations through CI, not by hand
+
+The value of branching mostly disappears if, after testing a migration on a branch, someone then opens a SQL editor and pastes it into production by hand. That step is exactly where typos, skipped files, and out-of-order migrations creep in. The fix is to make `supabase db push` part of the same CI pipeline that deploys your application code, so schema changes ship automatically and in order whenever a pull request merges.
+
+```bash
+# A representative CI step — runs after tests pass, before or alongside the app deploy
+supabase link --project-ref "$SUPABASE_PROJECT_REF"
+supabase db push
+```
+
+With this in place, a migration file merged to the main branch is applied to production the same way every time, by the same automated process that already tested it against a preview branch — no human running ad hoc SQL against a live database, and no environment silently drifting out of sync with what is in version control.
+
+<Mermaid title="A Git branch flows through an isolated Supabase preview branch, then merges to production" code={branchingDiagram} />
+
+export const branchingDiagram = `flowchart LR
+  pr["Git branch / pull request"] --> branch["Supabase preview branch (isolated schema copy)"]
+  branch --> mig["Migrations applied and tested on the branch"]
+  mig --> merge["Pull request merged"]
+  merge --> ci["CI runs supabase db push"]
+  ci --> prod[("Production Postgres")]`;
+
+<Callout title="The one-line takeaway">
+A Supabase **branch** is a real, isolated preview copy of your project tied to a Git branch or pull request, not a feature flag inside a shared database. **Migrations** — plain SQL files created with `supabase migration new` or captured after the fact with `supabase db diff` — are what let a schema change tested on a branch get replayed reliably elsewhere, and running `supabase db push` from **CI** rather than by hand is what keeps that replay consistent, ordered, and free of ad hoc production SQL.
+</Callout>
+
+export const quizBranchingMigrations = [
+  {
+    q: 'What does a Supabase preview branch actually give you?',
+    options: [
+      'A feature flag that toggles new columns on inside the shared production database',
+      'A genuinely isolated Postgres instance with its own schema, and optionally its own cloned data, tied to a Git branch or pull request',
+      'A read-only snapshot of production that cannot accept any writes',
+      'A separate frontend deployment with no database changes involved',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What is `supabase db diff` for?',
+    options: [
+      'Deleting all migrations that have already been applied',
+      'Capturing a schema change made through the Studio GUI as a migration file, after the fact',
+      'Comparing the row counts of two different tables',
+      'Listing every preview branch on the linked project',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why does running `supabase db push` through CI matter more than running it by hand against production?',
+    options: [
+      'It does not matter, both approaches are equally safe',
+      'Running it through CI applies migrations automatically, in order, as part of the same pipeline that already tested them on a branch, avoiding ad hoc SQL and skipped or out-of-order files',
+      'CI is required because `supabase db push` cannot be run from a local machine at all',
+      'It only matters for projects that do not use branching',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does `supabase db push` do?',
+    options: [
+      'It creates a brand-new preview branch',
+      'It applies every pending local migration to whichever linked project or branch it targets',
+      'It generates a migration file from a GUI schema change',
+      'It permanently deletes the linked project',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="production-and-ecosystem/branching-and-migrations-workflow" questions={quizBranchingMigrations} />
+
+<ProgressTracker client:visible id="production-and-ecosystem/branching-and-migrations-workflow" />

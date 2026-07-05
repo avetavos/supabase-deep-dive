@@ -1,0 +1,118 @@
+---
+title: 'Performance and Indexing'
+description: 'Why indexing columns referenced by RLS policies matters, how to read EXPLAIN ANALYZE, and what Supabase Studio surfaces automatically.'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+Index the columns your queries filter and join on, and in Supabase this matters doubly for any column referenced by a Row Level Security policy, because that policy condition runs on every row candidate for every single query against the table — an unindexed policy column can quietly turn a simple-looking query into a sequential scan as the table grows.
+
+## Why RLS-policy columns are a special indexing target
+
+A Row Level Security policy is not something that runs once per query — Postgres evaluates its condition against every row that could possibly be returned, on every query, for every user. A policy like `auth.uid() = user_id` looks like an innocuous one-line check, but if `user_id` has no index, Postgres has no way to jump straight to the matching rows. It has to walk the whole table, evaluating the policy condition row by row.
+
+The dangerous part is that this stays invisible for a long time. On a table with a few hundred rows, a sequential scan and an index scan both feel instant, and the query "looks" simple because it is a single `select` with no obvious complexity. The cost only shows up once the table grows into the tens or hundreds of thousands of rows, by which point it is a production incident rather than a code review comment.
+
+```sql
+-- A todos table, RLS-protected so users can only see their own rows
+create table public.todos (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users (id),
+  title text not null,
+  done boolean not null default false
+);
+
+alter table public.todos enable row level security;
+
+create policy "Users can view their own todos"
+on public.todos for select
+using (auth.uid() = user_id);
+
+-- Without this index, the policy above forces a sequential scan on every select
+create index idx_todos_user_id on public.todos (user_id);
+```
+
+Before the index, every `select * from todos` a user runs makes Postgres scan every row in the table and check `auth.uid() = user_id` against each one. After the index, Postgres can jump straight to the rows belonging to that user, and the query cost stops growing with the size of the whole table and starts scaling with the size of that one user's data instead — which is the shape almost every RLS-protected query actually has.
+
+## Reading `explain analyze` before something is already slow
+
+`explain analyze` is the direct way to see whether Postgres is actually using an index for a given query, rather than guessing from how fast it feels locally on a small table.
+
+```sql
+explain analyze
+select * from public.todos where user_id = auth.uid();
+```
+
+The output's top line names the plan Postgres chose. `Seq Scan on todos` means it read every row; `Index Scan using idx_todos_user_id on todos` means it used the index. `ANALYZE` also runs the query for real and reports actual execution time and row counts, not just Postgres's estimate, so it is worth checking against a `select` rather than only `insert`, `update`, or `delete` where re-running it has side effects. Making a habit of running this against any new RLS-protected query — before it ships, not after it is slow in production — catches missing indexes while they are still a one-line fix.
+
+## What Supabase Studio surfaces without manual `explain analyze` runs
+
+Supabase Studio ships with built-in Query Performance and Advisor tooling that surfaces a lot of this automatically, without reaching for `explain analyze` by hand for routine checks. Query Performance in the dashboard lists your slowest and most frequently run queries directly from Postgres's own statistics, and the Advisors panel flags missing indexes and other common performance issues — including, specifically, unindexed columns referenced by RLS policies. It is not a replacement for understanding `explain analyze`, but it is the tool worth checking first for an ongoing, low-effort read on where a project's real bottlenecks are.
+
+<Mermaid title="An unindexed RLS filter forces a sequential scan; an index on the same column turns it into an index scan" code={indexingDiagram} />
+
+export const indexingDiagram = `flowchart LR
+  q1["select * from todos where user_id = auth.uid()"] --> rls1["RLS policy checks user_id on every row"]
+  rls1 --> seq["No index on user_id"]
+  seq --> scan["Sequential scan - cost grows with table size"]
+  q2["Same query, after create index idx_todos_user_id"] --> rls2["RLS policy checks user_id on every row"]
+  rls2 --> idx["Index on user_id"]
+  idx --> iscan["Index scan - cost grows with matching rows only"]`;
+
+<Callout title="The one-line takeaway">
+Index the columns your queries actually filter and join on, and treat any column referenced in a **Row Level Security policy** as a mandatory candidate, since that policy condition runs on every row candidate for every query and an unindexed one silently degrades into a sequential scan as the table grows. Use `explain analyze` to check whether Postgres chose an **index scan** or a **sequential scan** for a given query, and lean on Supabase **Studio's Query Performance and Advisor** tooling for an ongoing, low-effort view of slow queries and missing indexes without running `explain analyze` by hand for every routine check.
+</Callout>
+
+export const quizPerformanceIndexing = [
+  {
+    q: 'Why are columns referenced by an RLS policy an especially important indexing target?',
+    options: [
+      'RLS policies only run once per session, so indexing them has no real effect',
+      'The policy condition is evaluated against every row candidate for every query, so an unindexed policy column can force a sequential scan that gets slower as the table grows',
+      'Postgres refuses to run queries against tables with RLS enabled unless every column is indexed',
+      'Indexing policy columns is required by Supabase for the Data API to work at all',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does `explain analyze` tell you that just running the query normally does not?',
+    options: [
+      'It tells you the exact number of active users currently connected',
+      'It shows the actual query plan Postgres chose - such as a sequential scan versus an index scan - along with real execution time and row counts',
+      'It automatically creates any missing indexes for you',
+      'It disables Row Level Security for that one query only',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What can Supabase Studio surface without you manually running `explain analyze`?',
+    options: [
+      'Nothing, Studio has no built-in performance tooling',
+      'Query Performance and Advisor panels that surface slow queries and missing-index suggestions, including unindexed RLS policy columns, directly from Postgres statistics',
+      'A guarantee that all queries are already optimally indexed',
+      'The ability to rewrite application code automatically to avoid slow queries',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'In the `todos` example, what does `create index idx_todos_user_id on public.todos (user_id);` change about the RLS-protected select query?',
+    options: [
+      'It disables the RLS policy so the query runs faster with no security check',
+      'It lets Postgres jump directly to a user\'s own rows instead of scanning the whole table, so cost scales with that user\'s data rather than the table size',
+      'It duplicates the todos table into a faster read-only replica',
+      'It has no effect because RLS always forces a sequential scan regardless of indexes',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="production-and-ecosystem/performance-and-indexing" questions={quizPerformanceIndexing} />
+
+<ProgressTracker client:visible id="production-and-ecosystem/performance-and-indexing" />

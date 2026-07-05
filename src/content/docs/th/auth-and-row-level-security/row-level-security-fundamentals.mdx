@@ -1,0 +1,107 @@
+---
+title: 'Row Level Security Fundamentals'
+description: 'Postgres row level security policy ทำงานยังไง ทำไม RLS ไม่เปิดมาให้ตั้งแต่ต้น และ using กับ with check คุมอะไรกันแน่'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## แนวคิดในหนึ่งประโยค
+
+**Row Level Security (RLS)** คือ feature ของ Postgres เองที่ผูก policy เข้ากับ table เพื่อให้ Postgres คัดกรอง row ที่ role หนึ่ง ๆ อ่านหรือเขียนได้ในทุก query โดยอัตโนมัติ — ไม่ใช่สิ่งที่โค้ดฝั่งแอปต้องมานั่งจำไปเติมเป็น `where` clause เอง
+
+## RLS ไม่เปิดจนกว่าคุณจะเปิดมันเอง
+
+table ใหม่ใน Postgres จะมี RLS **ปิดอยู่** เสมอ ไม่มีการกรองอะไรทั้งนั้น role ไหนก็ตามที่มี `grant` บน table นั้นเห็นและแก้ทุก row ได้หมด คุณต้องเปิดมันเองแบบ explicit
+
+```sql
+alter table public.todos enable row level security;
+```
+
+จุดที่คนเกือบทุกคนพลาดตอนเจอครั้งแรกคือตรงนี้ พอเปิด RLS บน table ที่ **ยังไม่มี policy เลยสักอัน** table นั้นจะกลายเป็น **เข้าไม่ได้เลย** สำหรับ role `anon` และ `authenticated` — ไม่ใช่ "เปิดกว้างโดย default" แต่คือ deny-by-default ถ้ารัน `alter table ... enable row level security` แค่บรรทัดเดียวข้างบน แล้ว query `todos` ผ่าน API จะได้ผลลัพธ์ว่างเปล่า (หรือ permission error) มันดูเหมือนอะไรบางอย่างพัง แต่จริง ๆ ไม่มีอะไรพังเลย RLS ที่ไม่มี policy หมายความว่าไม่มี role ไหนเห็นหรือแตะ row ได้จนกว่าคุณจะเพิ่ม policy ที่อนุญาตไว้ ทุก table ที่เปิด RLS ต้องมี policy อย่างน้อยหนึ่งอันต่อ operation ที่คุณต้องการให้ทำได้จริง
+
+## กายวิภาคของ policy: using vs with check
+
+policy สร้างด้วย `create policy` ผูกกับ table และหนึ่ง operation หรือมากกว่า (`select`, `insert`, `update`, `delete` หรือ `all`)
+
+```sql
+create policy "Users can view their own todos"
+on public.todos
+for select
+using (auth.uid() = user_id);
+
+create policy "Users can insert their own todos"
+on public.todos
+for insert
+with check (auth.uid() = user_id);
+```
+
+`using` คุม **row ที่มีอยู่แล้วจะมองเห็นได้หรือไม่** สำหรับ `select`, `update`, `delete` — คิดเหมือนตัวกรองที่ใช้กับ row ที่อยู่ใน table อยู่แล้ว ส่วน `with check` คุม **ว่า row ใหม่หรือ row ที่แก้ไขแล้วจะถูกเขียนได้หรือไม่** — ใช้กับ `insert` และ `update` โดยตรวจ row ในสภาพ *หลังจาก* เขียนแล้ว table หนึ่งใบสามารถ (และควร) กำหนดทั้งสองอย่าง `using` เพื่อตัดสินว่า update มองเห็นและแตะ row ไหนได้ ส่วน `with check` เพื่อตัดสินว่า row ที่ update แล้วต้องมีหน้าตายังไงถึงจะเขียนได้
+
+## auth.uid(): ตัวประกอบหลักที่ใช้บ่อยที่สุด
+
+`auth.uid()` คือ function ของ Postgres ที่ Supabase เตรียมไว้ให้ ดึง user ID ที่ authenticated แล้วของ request ปัจจุบันมาจาก JWT ที่พูดถึงในบทก่อนหน้าตรง ๆ มันคือ expression ที่พบบ่อยที่สุดใน RLS policy ของโลกจริง เพราะ "row นี้เป็นของ user คนปัจจุบันหรือเปล่า" คือกฎการเข้าถึงที่แอปต้องใช้บ่อยที่สุด
+
+<Mermaid title="A query is filtered per row by the matching policy" code={rlsFundamentalsDiagram} />
+
+export const rlsFundamentalsDiagram = `flowchart LR
+  req["Query arrives as anon/authenticated role"] --> pg[("Postgres evaluates RLS")]
+  pg --> using["using: filters existing rows (select/update/delete)"]
+  pg --> check["with check: validates new/modified rows (insert/update)"]
+  using --> result["Only matching rows returned or written"]
+  check --> result`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+**Row Level Security ไม่เปิดมาให้ตั้งแต่ต้น** — คุณต้องรัน `alter table your_table enable row level security;` เอง และพอเปิดแล้วแต่ **ไม่มี policy เลย** table จะถูกล็อกจนเข้าไม่ได้เลยสำหรับ `anon`/`authenticated` จนกว่าคุณจะเพิ่ม policy (deny-by-default ไม่ใช่ open-by-default) clause **`using`** ของ policy กรอง row ที่มีอยู่แล้วสำหรับ select/update/delete ส่วน **`with check`** ตรวจว่า row ใหม่หรือ row ที่แก้แล้วมีหน้าตายังไงถึงเขียนได้สำหรับ insert/update และ **`auth.uid()`** — ที่ดึง user ID ตรงจาก JWT ของ request — คือตัวประกอบหลักที่ policy ในโลกจริงเกือบทุกอันเขียนขึ้นรอบมัน
+</Callout>
+
+export const quizRlsFundamentals = [
+  {
+    q: 'Row Level Security เปิดมาให้โดย default บน table ใหม่ของ Postgres หรือไม่',
+    options: [
+      'ใช่ ทุก table มี RLS เปิดอัตโนมัติ',
+      'ไม่ ต้องเปิด RLS เองแบบ explicit ด้วย alter table ... enable row level security',
+      'เปิดให้เฉพาะ table ใน schema public เท่านั้น',
+      'เปิดให้เฉพาะ table ที่มี primary key เท่านั้น',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'จะเกิดอะไรขึ้นเมื่อเปิด RLS บน table ที่ยังไม่มี policy เลยสักอัน',
+    options: [
+      'table จะเปิดกว้างให้ทุก role เข้าถึงได้เต็มที่',
+      'table จะเข้าไม่ได้เลยสำหรับ role anon และ authenticated จนกว่าจะมี policy อย่างน้อยหนึ่งอัน',
+      'Postgres จะลบ table นั้นทิ้งอัตโนมัติ',
+      'RLS จะไม่ทำอะไรเลยจนกว่าจะเพิ่ม policy',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ความต่างระหว่าง using กับ with check ใน policy คืออะไร',
+    options: [
+      'ใช้แทนกันได้ ทำงานเหมือนกันทุกอย่าง',
+      'using กรอง row ที่มีอยู่แล้วสำหรับ select/update/delete ส่วน with check ตรวจว่า row ใหม่หรือ row ที่แก้แล้วเขียนได้หรือไม่',
+      'using ใช้ได้เฉพาะ insert ส่วน with check ใช้ได้เฉพาะ select',
+      'with check เลิกใช้แล้ว ให้ใช้ using แทน',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'auth.uid() คืนค่าอะไรภายใน RLS policy ของ Postgres',
+    options: [
+      'ชื่อของ database ปัจจุบัน',
+      'user ID ที่ authenticated แล้ว ซึ่งดึงมาจาก JWT ของ request ปัจจุบัน',
+      'UUID สุ่มที่สร้างใหม่ทุก query',
+      'Supabase project ID',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="auth-and-row-level-security/row-level-security-fundamentals" questions={quizRlsFundamentals} />
+
+<ProgressTracker client:visible id="auth-and-row-level-security/row-level-security-fundamentals" />

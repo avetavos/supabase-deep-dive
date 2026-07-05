@@ -1,0 +1,140 @@
+---
+title: 'Combining REST, Realtime, and Storage'
+description: 'Building one photo-upload feature that composes Storage upload, an RLS-protected REST insert, and a Postgres Changes subscription into a single coherent client flow.'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+A real feature rarely touches only one Supabase service — uploading a photo, saving a row that references it, and having other clients see it appear live is one flow that composes Storage, the RLS-protected REST API, and Realtime, and each piece is exactly what you already learned in an earlier lesson.
+
+## Step 1: upload the file to Storage
+
+This is the same `supabase.storage.from(bucket).upload()` call from the Storage half of the Realtime and Storage module. It sends the file's bytes to a bucket and, on success, returns the path the file was stored at:
+
+```typescript
+const file = fileInput.files[0];
+const filePath = `${userId}/${crypto.randomUUID()}-${file.name}`;
+
+const { data: uploadData, error: uploadError } = await supabase.storage
+  .from('photos')
+  .upload(filePath, file);
+
+if (uploadError) {
+  console.error('upload failed:', uploadError.message);
+  return;
+}
+```
+
+Checking `error` here matters as much as it did in the previous lesson: a network blip or a Storage policy rejecting the upload both surface through `uploadError`, not a thrown exception, and skipping this check means silently trying to insert a row that points at a file that was never actually saved.
+
+## Step 2: save a row that references it, protected by RLS
+
+With the file safely stored, the app saves a `posts` row pointing at it. This is a plain `.insert()` call, but it only succeeds because of the row level security policy from the Auth module — a policy that lets a user insert a row only when `user_id` matches `auth.uid()`. Nothing new is required on the client to get that protection; it is enforced automatically by Postgres for every request the client sends:
+
+```typescript
+const { data: post, error: insertError } = await supabase
+  .from('posts')
+  .insert({
+    user_id: userId,
+    photo_path: uploadData.path,
+  })
+  .select()
+  .single();
+
+if (insertError) {
+  console.error('insert failed:', insertError.message);
+  return;
+}
+```
+
+If `userId` did not match the signed-in user's `auth.uid()`, RLS would reject the insert and `insertError` would be populated — the same `{ data, error }` pattern applies here as it did to the upload, and the same rule from the previous lesson applies too: branch on `insertError.code` if you need to distinguish a policy rejection from something else, rather than parsing the message text.
+
+## Step 3: another client sees it live
+
+A second, already-connected client — someone else browsing the same feed — is subscribed to `postgres_changes` on the `posts` table, exactly as covered in the Realtime module. The moment the insert from step 2 commits, Postgres replicates that change out and this subscription fires with the new row as its payload:
+
+```typescript
+supabase
+  .channel('posts-feed')
+  .on(
+    'postgres_changes',
+    { event: 'INSERT', schema: 'public', table: 'posts' },
+    (payload) => {
+      // payload.new is the row just inserted in step 2
+      addPostToFeed(payload.new);
+    }
+  )
+  .subscribe();
+```
+
+This only works because `posts` was added to the `supabase_realtime` publication — the setup step from the Realtime module. Without that, the table's changes are never replicated out, no matter how correctly this `.on('postgres_changes', ...)` listener is written; the insert in step 2 would still succeed, but this callback would simply never fire.
+
+## Three services, one feature
+
+Nothing here is a special integration between Storage, the REST API, and Realtime — each service does exactly what it does in its own module, and the client code is what ties them together into a single user-facing feature. The uploading client never talks to the subscribing client directly; the flow works because both are talking to the same Supabase project, and Postgres's replication stream is what connects the write on one side to the notification on the other.
+
+<Mermaid title="One feature, three services: upload, insert under RLS, then a live notification" code={combinedFlowDiagram} />
+
+export const combinedFlowDiagram = `flowchart LR
+  upload["storage.from('photos').upload(file)"] --> insert["from('posts').insert({ photo_path, user_id })"]
+  insert -->|"allowed only if RLS policy passes"| commit[("Row committed in Postgres")]
+  commit -->|"replicated because posts is in supabase_realtime"| notify["postgres_changes INSERT event"]
+  notify --> other["Other client's .on('postgres_changes', ...) callback fires"]`;
+
+<Callout title="The one-line takeaway">
+A realistic feature composes services rather than living in just one: `storage.from('photos').upload()` saves the file (Storage), `.from('posts').insert()` saves a row referencing it and only succeeds because of an **RLS policy** tying `user_id` to `auth.uid()` (REST, protected the way the Auth module covered), and a separate client's `.channel().on('postgres_changes', { event: 'INSERT', table: 'posts' }, ...)` subscription fires the moment that row commits (Realtime, and only because `posts` was added to the **`supabase_realtime`** publication). Every step still returns `{ data, error }`, and checking `error` at each step remains just as necessary in a three-step composed flow as it was in a single call.
+</Callout>
+
+export const quizCombinedFlow = [
+  {
+    q: 'In the photo-upload feature, which Supabase service does storage.from(\'photos\').upload() belong to?',
+    options: [
+      'Storage',
+      'The REST API',
+      'Realtime',
+      'Auth',
+    ],
+    answer: 0,
+  },
+  {
+    q: 'Why does the .from(\'posts\').insert() call in step 2 succeed only for the correct user?',
+    options: [
+      'Because the anon key blocks other users automatically',
+      'Because a row level security policy restricts inserts to rows where user_id matches auth.uid(), the same mechanism covered in the Auth module',
+      'Because Storage validates the user_id column before the insert runs',
+      'Because the insert is wrapped in a database transaction',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why does the other client\'s postgres_changes subscription depend on something from the Realtime module specifically?',
+    options: [
+      'It does not depend on anything else; postgres_changes always works once .subscribe() is called',
+      'The posts table must first be added to the supabase_realtime publication, or no change events are ever replicated to subscribers',
+      'It depends on the RLS policy from step 2 instead',
+      'It depends on the storage bucket being set to public',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why does error handling still matter in a multi-step flow like upload, then insert, then subscribe?',
+    options: [
+      'It does not; only the final step needs an error check',
+      'Each step can fail independently, and skipping a check (such as after the upload) can let later steps proceed on bad data, like inserting a row that points at a file that was never saved',
+      'Because postgres_changes automatically retries failed inserts',
+      'Because TypeScript would refuse to compile without try/catch around each call',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="client-development/combining-rest-realtime-and-storage" questions={quizCombinedFlow} />
+
+<ProgressTracker client:visible id="client-development/combining-rest-realtime-and-storage" />

@@ -1,0 +1,158 @@
+---
+title: 'Error Handling and Typed Queries'
+description: 'shape ของ PostgrestError ที่ query ที่ fail ทุกอันคืนกลับมา ทำไม match บน error.code ดีกว่า parse error.message และ generated Database type จับ insert ที่ผิดได้ตั้งแต่ compile time'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+ทุก call ของ `supabase-js` resolve เป็น `{ data, error }` แทนที่จะ throw ดังนั้น pattern มาตรฐานคือเช็ก `error` ก่อน — พอเช็กแล้ว TypeScript จะ narrow type ของ `data` ให้เอง และถ้า `error` เป็น `PostgrestError` ควร branch ตาม `code` ที่ stable แทนที่จะดู `message` ที่เป็นข้อความอ่านง่าย
+
+## เช็ก `error` ก่อนเชื่อ `data`
+
+pattern นี้เห็นมาแล้วในบทก่อน ตอนนี้จะพูดให้เป็นทางการ ไม่มี call ไหนของ `supabase-js` throw ตอน request fail มันจะ resolve ตามปกติเสมอ โดยผลลัพธ์ถูกแบ่งเป็น `data` กับ `error`
+
+```typescript
+const { data, error } = await supabase
+  .from('profiles')
+  .select('id, username')
+  .eq('id', userId)
+  .single();
+
+if (error) {
+  console.error(error.message);
+} else {
+  // TypeScript now knows data is not null here
+  console.log(data.username);
+}
+```
+
+เพราะไม่มีอะไรถูก throw request ที่ fail แล้วลืมเช็ก ก็แค่ดูเหมือน `data` เป็น `null` เฉย ๆ ไม่มี stack trace มาบังคับให้สังเกต การเช็ก `error` ก่อนไม่ใช่แค่ best practice แต่เป็นวิธีเดียวที่บอกได้ชัดว่าสำเร็จหรือ fail และมันยังเป็นสิ่งที่ทำให้ TypeScript narrow type ของ `data` ได้ด้วย ใน branch `else` (หรือหลัง early `return` ตอน error) `data` จะถูกรู้ว่าไม่ใช่ null แน่นอน
+
+## shape ของ `PostgrestError`
+
+ตอน `error` มีค่า มันจะเป็น `PostgrestError` ที่มี field น่ารู้สี่ตัว
+
+- **`message`** — คำอธิบายที่คนอ่านเข้าใจได้ว่าเกิดอะไรขึ้น
+- **`code`** — code ที่ stable ไม่ว่าจะเป็น Postgres error code (เช่น `23505` สำหรับ unique-constraint violation) หรือ code เฉพาะของ PostgREST
+- **`details`** — context เพิ่มเติมจาก Postgres ถ้ามี
+- **`hint`** — คำแนะนำวิธีแก้ ถ้า Postgres หรือ PostgREST เสนอมาให้ได้
+
+กฎที่ใช้จริงคือ match บน `error.code` สำหรับการตัดสินใจแบบ programmatic ไม่ใช่ `error.message` ข้อความ message มีไว้ให้คนอ่าน และอาจเปลี่ยนคำระหว่าง version ส่วน code คือสัญญาที่ stable ที่ branch ตามได้อย่างปลอดภัย
+
+```typescript
+const { error } = await supabase
+  .from('profiles')
+  .insert({ id: userId, username: 'ada' });
+
+if (error) {
+  if (error.code === '23505') {
+    // Postgres unique_violation — a stable code, unlike the message text
+    showError('That username is taken.');
+  } else {
+    showError('Something went wrong, please try again.');
+  }
+}
+```
+
+## Generated type จับ query ที่ผิดได้ก่อนรันจริง
+
+เอา `Database` type จากบทก่อนไปใส่ให้ `createClient<Database>()` แปลว่าทุก `.select()`, `.insert()` และ `.update()` จะถูกเช็กกับ schema จริงตอน compile time
+
+```typescript
+import { createClient } from '@supabase/supabase-js';
+import type { Database } from './database.types';
+
+const supabase = createClient<Database>(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_ANON_KEY!
+);
+
+type ProfileInsert = Database['public']['Tables']['profiles']['Insert'];
+
+async function createProfile(profile: ProfileInsert) {
+  const { data, error } = await supabase
+    .from('profiles')
+    .insert(profile)
+    .select()
+    .single();
+
+  if (error) {
+    if (error.code === '23505') {
+      throw new Error('That username is taken.');
+    }
+    throw error;
+  }
+
+  return data;
+}
+```
+
+พอตั้งค่าแบบนี้แล้ว การ select column ที่ไม่มีอยู่จริงใน `profiles` หรือเรียก `createProfile` ด้วย object ที่ขาด field ที่จำเป็นจาก `Insert` จะกลายเป็น TypeScript error ตอน build — รู้ตั้งแต่ตอนเขียนโค้ด ไม่ใช่มารู้จาก request ที่ fail ตอน production
+
+<Mermaid title="Branch on error, and specifically on error.code, before trusting data" code={typedQueriesDiagram} />
+
+export const typedQueriesDiagram = `flowchart LR
+  call[".from('profiles').insert(profile)"] --> result["{ data, error }"]
+  result --> check{"error present?"}
+  check -->|"yes"| code{"error.code"}
+  code -->|"23505"| unique["Show: username already taken"]
+  code -->|"other"| generic["Show a generic failure message"]
+  check -->|"no"| typed["Use typed data safely"]`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+ทุก call ของ `supabase-js` resolve เป็น **`{ data, error }`** แทนที่จะ throw ดังนั้นเช็ก `error` ก่อนเสมอ แล้ว TypeScript จะ narrow `data` ให้เอง `error` ที่มีค่าคือ `PostgrestError` ที่มี **`message`**, **`code`**, **`details`** และ **`hint`** ให้ branch ตาม **`error.code`** ที่ stable (เช่น `23505` สำหรับ unique-constraint violation) แทนการ parse ข้อความ `error.message` ที่เปลี่ยนคำได้ เอา generated `Database` type ไปใส่ `createClient<Database>()` แล้ว `.select()`, `.insert()` และ `.update()` จะถูกเช็กกับ schema จริงตั้งแต่ **compile time** ทำให้ column ผิดหรือ field ที่จำเป็นหายไปกลายเป็น build error แทนเรื่องเซอร์ไพรส์ตอน runtime
+</Callout>
+
+export const quizTypedQueries = [
+  {
+    q: 'ผลลัพธ์ query ของ supabase-js มี shape แบบไหน และรู้ได้อย่างไรว่า fail',
+    options: [
+      'มัน throw exception ที่ต้องดักด้วย try/catch',
+      'มัน resolve เป็น { data, error } และต้องเช็ก error เองแทนที่จะพึ่ง exception ที่ถูก throw',
+      'มันคืนแค่ data โดย request ที่ fail จะกลายเป็น array ว่างแบบเงียบ ๆ',
+      'มันคืน HTTP status code ตัวเลขที่ต้อง interpret เอง',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไม match บน error.code ถึง robust กว่า match บน error.message',
+    options: [
+      'error.message ไม่มีอยู่บน PostgrestError',
+      'error.code เป็น identifier ที่ stable (เช่น Postgres error code) ในขณะที่ error.message เป็นข้อความอ่านง่ายที่เปลี่ยนคำได้',
+      'error.code มีให้แค่ตอน network failure เท่านั้น',
+      'สองอย่างนี้ไม่มีความต่างในทางปฏิบัติ',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'การเอา generated Database type ไปใส่ createClient ให้ประโยชน์อะไรตอน compile-time กับ insert และ update',
+    options: [
+      'มัน retry insert ที่ fail ให้อัตโนมัติ',
+      'call จะถูกเช็กกับ schema จริง ทำให้ field ที่จำเป็นหายไปหรือ column ที่ไม่มีอยู่จริงกลายเป็น TypeScript error ก่อนโค้ดจะรันด้วยซ้ำ',
+      'มันปิด row level security สำหรับ call นั้น',
+      'มันเปลี่ยนทุก error ให้กลายเป็น exception ที่ถูก throw',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Postgres error code ที่มักเห็นตอน insert ละเมิด unique constraint คืออะไร',
+    options: [
+      '23505',
+      '404',
+      '500',
+      'PGRST100',
+    ],
+    answer: 0,
+  },
+];
+
+<Quiz client:visible id="client-development/error-handling-and-typed-queries" questions={quizTypedQueries} />
+
+<ProgressTracker client:visible id="client-development/error-handling-and-typed-queries" />

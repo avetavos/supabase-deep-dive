@@ -1,0 +1,116 @@
+---
+title: 'Realtime: Postgres Changes'
+description: 'How Supabase Realtime streams INSERT, UPDATE, and DELETE events out of the Postgres write-ahead log, and why every table is silent until you explicitly turn replication on.'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+**Postgres Changes** streams your database's own write-ahead log to subscribed clients as `INSERT`/`UPDATE`/`DELETE` events, but this is **disabled by default for every table** until you explicitly add it to a publication.
+
+## From a row change to a client callback
+
+Postgres already keeps a durable, ordered record of every write in its **write-ahead log (WAL)** — it uses this internally for crash recovery and replication. Supabase Realtime reads that same WAL through Postgres's **logical replication** feature and turns each committed change into a message it can push over a WebSocket. A client subscribes to a channel, tells it which table and which event types it cares about, and gets a callback fired for every matching row change, live, without polling the table on an interval.
+
+The critical fact to internalize before writing any code: **this pipeline is off by default for every table you create**. Realtime does not watch your whole schema automatically — a table's writes only reach the WAL stream that Realtime taps into once that table is added to the `supabase_realtime` publication. Until you do that, a client can subscribe all day and receive nothing.
+
+Turn it on with plain SQL:
+
+```sql
+alter publication supabase_realtime add table public.messages;
+```
+
+The same toggle exists as a switch in the Studio's **Database > Replication** settings, if you would rather not run SQL by hand — it does exactly the same thing under the hood.
+
+## Subscribing from the client
+
+Once `public.messages` is in the publication, a `supabase-js` client can subscribe to changes on it:
+
+```typescript
+const channel = supabase
+  .channel('room1')
+  .on(
+    'postgres_changes',
+    { event: 'INSERT', schema: 'public', table: 'messages' },
+    (payload) => {
+      console.log('New message:', payload.new);
+    }
+  )
+  .subscribe();
+```
+
+`event` accepts `INSERT`, `UPDATE`, `DELETE`, or `*` to receive all three. `schema` and `table` scope the subscription to one table; you can register multiple `.on('postgres_changes', ...)` handlers on the same channel to listen for several event types or tables at once.
+
+There is one more gap worth closing. By default, Postgres only includes the **primary key** columns of the old row in an `UPDATE` or `DELETE` payload — not the full previous row. If your application logic needs to compare the old and new values (for example, to know what a field changed *from*), set the table's replica identity to `full`:
+
+```sql
+alter table public.messages replica identity full;
+```
+
+With `replica identity full` in place, `payload.old` on an `UPDATE` or `DELETE` event contains every column of the row as it existed before the change, not just its primary key.
+
+<Mermaid title="A row change only reaches a client if the table is in the publication" code={postgresChangesDiagram} />
+
+export const postgresChangesDiagram = `flowchart LR
+  insert["Postgres INSERT/UPDATE/DELETE"] --> wal["Write-ahead log (WAL)"]
+  wal --> gate{"Is the table added to supabase_realtime publication?"}
+  gate -->|no| nothing["No event is ever sent"]
+  gate -->|yes| realtime["Realtime server reads WAL via logical replication"]
+  realtime --> client["Client's postgres_changes callback fires"]`;
+
+<Callout title="The one-line takeaway">
+**Postgres Changes** reads Postgres's own write-ahead log via logical replication and pushes `INSERT`/`UPDATE`/`DELETE` events to subscribed clients, but this is **disabled by default for every table** — you must run `alter publication supabase_realtime add table your_table;` (or flip the equivalent toggle in Studio's Replication settings) before any `channel.on('postgres_changes', ...)` subscription receives anything, and you need `alter table your_table replica identity full;` if you also want the full previous row on `UPDATE`/`DELETE` payloads.
+</Callout>
+
+export const quizPostgresChanges = [
+  {
+    q: 'Do Postgres Changes work on a newly created table by default',
+    options: [
+      'Yes, every table streams changes automatically the moment it is created',
+      'No, the table must first be explicitly added to the supabase_realtime publication',
+      'Only SELECT queries are streamed by default, not writes',
+      'Yes, but only for the public schema and never for others',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What SQL statement enables Postgres Changes for a specific table',
+    options: [
+      'create trigger supabase_realtime on your_table;',
+      'alter publication supabase_realtime add table your_table;',
+      'grant realtime on your_table to authenticated;',
+      'select enable_realtime(\'your_table\');',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why would you set replica identity full on a table used with Postgres Changes',
+    options: [
+      'It is required before the table can be added to any publication at all',
+      'It makes INSERT events fire twice for redundancy',
+      'It ensures the old row payload on UPDATE/DELETE events contains every column, not just the primary key',
+      'It disables logical replication for that table',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'Which fields does a channel.on(\'postgres_changes\', ...) subscription use to scope what it listens to',
+    options: [
+      'Only a free-text SQL where clause string',
+      'event, schema, and table',
+      'Only the channel name, nothing else',
+      'A GraphQL query document',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="realtime-and-storage/realtime-postgres-changes" questions={quizPostgresChanges} />
+
+<ProgressTracker client:visible id="realtime-and-storage/realtime-postgres-changes" />

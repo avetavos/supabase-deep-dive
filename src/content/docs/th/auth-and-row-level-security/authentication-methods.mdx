@@ -1,0 +1,126 @@
+---
+title: 'Authentication Methods'
+description: 'วิธี sign-in ที่ Supabase Auth รองรับมาให้เลย ตั้งแต่ email กับ password, magic link, phone OTP ไปจนถึง OAuth provider'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## แนวคิดในหนึ่งประโยค
+
+Supabase Auth สร้างขึ้นบน **GoTrue** server แบบ open-source และรองรับวิธีพิสูจน์ตัวตนของ user หลายแบบ — password, magic link, phone OTP หรือ OAuth — และทุกวิธีจบลงที่จุดเดียวกันคือ row ที่ถูกสร้างหรือ match ใน table `auth.users` ที่มีมาให้
+
+## วิธี sign-in หลัก ๆ
+
+`supabase-js` เปิด method สำหรับแต่ละวิธี sign-in ไว้ที่ `supabase.auth` แบบ email กับ password คือ flow คลาสสิก ส่วน magic link จะส่งลิงก์ sign-in แบบใช้ครั้งเดียวไปทาง email แทนการถาม password — user กดลิงก์แล้ว sign-in เข้าได้เลย ไม่ต้องพิมพ์หรือกลัวลืม phone OTP ทำงานคล้ายกันแต่ส่งรหัสแบบใช้ครั้งเดียวผ่าน SMS แทน ส่วน OAuth จะส่ง user ไปให้ third-party provider (Google, GitHub และอื่น ๆ) จัดการ และ Supabase ดูแลขั้นตอน redirect กับการแลก token ให้ทั้งหมด
+
+```typescript
+import { createClient } from '@supabase/supabase-js';
+
+const supabase = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_ANON_KEY!
+);
+
+// Email + password
+const { data, error } = await supabase.auth.signUp({
+  email: 'jane@example.com',
+  password: 'correct-horse-battery-staple',
+});
+
+// Magic link — no password, just a one-time sign-in link emailed to the user
+const { error: otpError } = await supabase.auth.signInWithOtp({
+  email: 'jane@example.com',
+});
+
+// OAuth — Supabase handles the redirect dance with the provider for you
+const { error: oauthError } = await supabase.auth.signInWithOAuth({
+  provider: 'github',
+});
+```
+
+## user จริง ๆ อยู่ที่ไหน: `auth.users`
+
+ไม่ว่าจะ sign-up หรือ sign-in ด้วยวิธีไหนก็ตาม ผลลัพธ์คือ row ใน `auth.users` ถูกสร้างหรือถูกใช้ยืนยันตัวตน table นี้อยู่ใน schema แยกต่างหากชื่อ `auth` ไม่ใช่ `public` — มันถูกจัดการโดย Supabase Auth เองและเก็บแค่สิ่งที่ Auth ต้องใช้ (email, phone, password ที่ hash แล้ว, ข้อมูล provider และอื่น ๆ) ไม่ได้ออกแบบมาให้เพิ่ม column ของแอปเราเข้าไปตรง ๆ
+
+pattern ที่พบบ่อยคือ table `public.profiles` ที่ primary key อ้างอิงกลับไปที่ `auth.users(id)` เก็บข้อมูลเฉพาะของแอปที่ Auth เองไม่เก็บให้ — username, avatar URL, subscription tier หรืออะไรก็ตามที่โปรดักต์ต้องการ
+
+```sql
+-- public.profiles holds app-specific data auth.users does not store
+create table public.profiles (
+  id uuid primary key references auth.users (id) on delete cascade,
+  username text unique,
+  avatar_url text,
+  created_at timestamptz default now()
+);
+```
+
+trigger บน `auth.users` ที่ insert row `public.profiles` ที่ match กันตอน sign-up คือวิธีที่นิยมใช้เพื่อให้สอง table ตรงกันเสมอ แต่รายละเอียดของ trigger นั้นอยู่นอกเหนือบทนี้
+
+<Mermaid title="Every sign-in method converges on the same auth.users row" code={authMethodsDiagram} />
+
+export const authMethodsDiagram = `flowchart LR
+  user["User"] --> pw["Email + password"]
+  user --> magic["Magic link"]
+  user --> otp["Phone OTP"]
+  user --> oauth["OAuth provider"]
+  pw --> gotrue["Supabase Auth (GoTrue)"]
+  magic --> gotrue
+  otp --> gotrue
+  oauth --> gotrue
+  gotrue --> table[("auth.users row created/matched")]`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+Supabase Auth (**GoTrue**) รองรับ sign-in แบบ **password**, **magic link**, **phone OTP** และ **OAuth** มาให้เลย ไม่ว่า user จะเลือกวิธีไหน ผลลัพธ์เหมือนกันคือ row ที่ถูกสร้างหรือ match ใน **`auth.users`** — schema `auth` แยกต่างหากที่คุณต่อยอดด้วยการอ้างอิงจาก table **`public.profiles`** ของตัวเอง แทนที่จะไปแก้ไขมันตรง ๆ
+</Callout>
+
+export const quizAuthenticationMethods = [
+  {
+    q: 'ข้อใดคือวิธี sign-in ที่ Supabase Auth รองรับมาให้เลย',
+    options: [
+      'มีแค่ email กับ password เท่านั้น',
+      'Email กับ password, magic link, phone OTP และ OAuth provider',
+      'มีแค่ OAuth provider เท่านั้น',
+      'มีแค่ phone OTP เท่านั้น',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Supabase Auth สร้างหรืออัปเดต table ไหนทุกครั้งที่มีการ sign-up หรือ sign-in',
+    options: [
+      'public.users',
+      'auth.users',
+      'public.profiles',
+      'auth.sessions',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไม table public.profiles แยกต่างหากถึงเป็น pattern ที่นิยม แทนที่จะเก็บทุกอย่างไว้ใน auth.users',
+    options: [
+      'auth.users เก็บข้อมูลอะไรไม่ได้เลย',
+      'auth.users ถูกจัดการโดย Supabase Auth เองและเก็บแค่สิ่งที่ Auth ต้องใช้ ข้อมูลเฉพาะของแอปจึงควรอยู่ใน table ที่เราคุมเองและอ้างอิงกลับไป',
+      'public.profiles จำเป็นต่อการทำงานของ OAuth',
+      'ไม่มีประโยชน์จริงจัง เป็นแค่ธรรมเนียมปฏิบัติ',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Magic link sign-in ช่วยให้ไม่ต้องใช้อะไร',
+    options: [
+      'email address',
+      'password',
+      'การเชื่อมต่ออินเทอร์เน็ต',
+      'Supabase project',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="auth-and-row-level-security/authentication-methods" questions={quizAuthenticationMethods} />
+
+<ProgressTracker client:visible id="auth-and-row-level-security/authentication-methods" />

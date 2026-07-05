@@ -1,0 +1,113 @@
+---
+title: 'Connection Pooling and Supavisor'
+description: 'How Supavisor pools Postgres connections for serverless and edge workloads, and when to reach for transaction mode versus session mode.'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+Postgres has a hard limit on concurrent direct connections, so Supabase sits **Supavisor** in front of it as a connection pooler with two modes — transaction mode on port `6543` for the many short-lived clients serverless and edge environments create, and session mode on port `5432` for the few long-lived clients that need full Postgres feature parity.
+
+## Why connections are a scarce resource
+
+Every Postgres connection costs memory and a backend process on the database server, so Postgres caps how many can be open at once — by default in the low hundreds, and Supabase's managed Postgres is no different. That limit is easy to live with from a traditional long-running server that opens a handful of connections and reuses them for its whole lifetime.
+
+Serverless and edge environments break that assumption. An Edge Function, a serverless API route, or any framework that spins up a new short-lived instance per request can each try to open their own direct connection to Postgres. Under real traffic that quickly adds up to far more concurrent connections than Postgres allows, and requests start failing with connection errors — not because the database is slow, but because it has simply run out of connection slots.
+
+## Supavisor: transaction mode vs session mode
+
+Supavisor is Supabase's connection pooler. It sits between your application and Postgres, holds a smaller pool of real Postgres connections, and hands them out to many more logical clients than Postgres could serve directly. It has two modes, and the mode is selected by which port you connect to:
+
+- **Transaction mode (port `6543`)** — a connection is only held for the duration of a single transaction, then returned to the pool immediately. This lets a small pool serve a very large number of short-lived clients, which is exactly the shape of serverless and Edge Function traffic. The trade-off: it does not support session-level Postgres features like prepared statements, since the underlying connection can be handed to a different client between transactions.
+- **Session mode (port `5432`)** — a client gets a dedicated connection for the whole time it is connected, exactly like talking to Postgres directly. That gives full feature parity, including prepared statements, but each connected client consumes one slot in the pool for as long as it stays connected, so it does not scale to huge numbers of concurrent short-lived clients the way transaction mode does.
+
+```bash
+# Transaction mode — best for serverless functions, Edge Functions, and other short-lived clients
+export DATABASE_URL="postgres://postgres.<project-ref>:[YOUR-PASSWORD]@aws-0-us-east-1.pooler.supabase.com:6543/postgres"
+
+# Session mode — for long-lived processes, or anything that specifically needs prepared statements
+export DIRECT_URL="postgres://postgres.<project-ref>:[YOUR-PASSWORD]@aws-0-us-east-1.pooler.supabase.com:5432/postgres"
+```
+
+## Which mode should you use
+
+Default to transaction mode for anything serverless or short-lived: Edge Functions, most application backends running on serverless platforms, and API routes that open a connection per request. It is the mode built for exactly that traffic shape.
+
+Reach for session mode only when you specifically need session-level features — prepared statements, `LISTEN`/`NOTIFY`, or a long-lived server process (a traditional backend that holds a connection pool of its own, or a migration tool) that stays connected and benefits from a dedicated connection rather than a pooled one. If you are unsure which one your framework or ORM needs, check its docs for pooler compatibility before picking a mode — some ORMs need the session-mode URL for migrations and the transaction-mode URL for runtime queries.
+
+<Mermaid title="Transaction mode pools many short-lived clients; session mode dedicates one connection per client" code={connPoolDiagram} />
+
+export const connPoolDiagram = `flowchart LR
+  subgraph short["Many short-lived clients"]
+    e1["Edge Function"]
+    e2["Serverless request"]
+    e3["Serverless request"]
+  end
+  subgraph long["Few long-lived clients"]
+    s1["Long-lived server process"]
+    s2["Tool needing prepared statements"]
+  end
+  e1 --> tx["Supavisor - transaction mode, port 6543"]
+  e2 --> tx
+  e3 --> tx
+  tx --> pool[("Small shared pool of Postgres connections")]
+  s1 --> sess["Supavisor - session mode, port 5432"]
+  s2 --> sess
+  sess --> dedicated[("One dedicated Postgres connection per client")]`;
+
+<Callout title="The one-line takeaway">
+Postgres has a hard cap on concurrent connections, and **Supavisor** is Supabase's pooler that sits in front of it so serverless and edge clients do not exhaust that cap directly. Use **transaction mode** (port `6543`) for the common case of many short-lived clients like Edge Functions, accepting that it does not support prepared statements; reserve **session mode** (port `5432`) for long-lived processes or anything that genuinely needs full session-level Postgres features, knowing each client there holds a dedicated connection for as long as it stays connected.
+</Callout>
+
+export const quizConnPooling = [
+  {
+    q: 'What problem does Supavisor primarily solve?',
+    options: [
+      'It replaces Postgres with a faster database engine',
+      'Postgres has a hard limit on concurrent connections, and many short-lived serverless or edge clients can exhaust it if they connect directly',
+      'It encrypts connections between the client and Postgres',
+      'It removes the need for an anon key',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which port does Supavisor transaction mode use, and what does it not support?',
+    options: [
+      'Port 5432, and it does not support any SQL queries',
+      'Port 6543, and it does not support session-level features like prepared statements',
+      'Port 5432, and it does not support transactions',
+      'Port 6543, and it does not support SELECT statements',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why does session mode not scale to huge numbers of concurrent short-lived clients the way transaction mode does?',
+    options: [
+      'Session mode is slower per query',
+      'Each connected client holds a dedicated connection in the pool for as long as it stays connected, rather than releasing it after each transaction',
+      'Session mode only allows read-only queries',
+      'Session mode requires a different database engine',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which mode should an Edge Function generally use, and why?',
+    options: [
+      'Session mode, because Edge Functions are long-lived processes',
+      'Transaction mode, because Edge Function invocations are short-lived and holding connections only per-transaction lets a small pool serve many of them',
+      'Neither, Edge Functions should never connect to Postgres',
+      'Session mode, because Edge Functions need prepared statements',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="production-and-ecosystem/connection-pooling-and-supavisor" questions={quizConnPooling} />
+
+<ProgressTracker client:visible id="production-and-ecosystem/connection-pooling-and-supavisor" />

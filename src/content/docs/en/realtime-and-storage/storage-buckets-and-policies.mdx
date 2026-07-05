@@ -1,0 +1,133 @@
+---
+title: 'Storage: Buckets and Policies'
+description: 'How Supabase Storage organizes files into public and private buckets, and how access to every object is actually enforced by Row Level Security policies on the storage.objects table.'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+Supabase Storage is S3-compatible object storage organized into **buckets**, and access to every object is enforced by ordinary **Row Level Security** policies on a Postgres table — the same mechanism you already know from the RLS module, not a separate permission system.
+
+## Buckets: public and private containers
+
+A **bucket** is a top-level container for files, similar to an S3 bucket — you might have an `avatars` bucket for profile pictures and a `public-assets` bucket for marketing images. A bucket can be marked **public**, meaning anyone with the object's URL can read it with no authentication, or **private**, meaning access is controlled per-request.
+
+Uploading, downloading, and reading files from `supabase-js` all operate on a named bucket:
+
+```typescript
+// Upload a file into a path inside the bucket
+const { data, error } = await supabase.storage
+  .from('avatars')
+  .upload('user123/photo.png', file);
+
+// Download the raw file bytes
+const { data: fileData } = await supabase.storage
+  .from('avatars')
+  .download('user123/photo.png');
+
+// Get a public URL — only meaningful for a public bucket
+const { data: publicUrlData } = supabase.storage
+  .from('avatars')
+  .getPublicUrl('user123/photo.png');
+
+// Get a time-limited signed URL — for a private bucket
+const { data: signedUrlData } = await supabase.storage
+  .from('avatars')
+  .createSignedUrl('user123/photo.png', 60);
+```
+
+`getPublicUrl` just builds a URL string — it does not check anything, so calling it on a private bucket's object gives you a URL that will still be rejected. `createSignedUrl` is what you actually want for private content: it mints a URL, valid for the number of seconds you pass in (`60` above), that embeds a signed token granting temporary access to that one object.
+
+## What actually enforces access: Row Level Security
+
+Here is the fact worth internalizing: Storage does not have its own bespoke permission language. Every uploaded object's metadata — its bucket, its path, its owner, its content type — lives as a row in a real Postgres table, `storage.objects`. Access control is just **Row Level Security policies on that table**, written with the exact same `using` and `with check` syntax you already use for any other table in this course.
+
+A common pattern is to let a user manage only files under their own folder prefix, keyed by their `auth.uid()`:
+
+```sql
+create policy "Users can upload their own avatar"
+on storage.objects
+for insert
+to authenticated
+with check (
+  bucket_id = 'avatars'
+  and (storage.foldername(name))[1] = auth.uid()::text
+);
+
+create policy "Users can read their own avatar"
+on storage.objects
+for select
+to authenticated
+using (
+  bucket_id = 'avatars'
+  and (storage.foldername(name))[1] = auth.uid()::text
+);
+```
+
+With policies like these, a file uploaded to `avatars/user123/photo.png` is only writable and readable by the user whose id is `user123` — because `name` (the object's full path) is checked against `auth.uid()` on every request, exactly like RLS on any other table gates rows by the requesting user.
+
+<Mermaid title="Every Storage request is gated by RLS on storage.objects, the same mechanism as table RLS" code={storagePoliciesDiagram} />
+
+export const storagePoliciesDiagram = `flowchart LR
+  client["Client upload/download request"] --> api["Storage API"]
+  api --> objects[("storage.objects metadata row: bucket_id, name, owner")]
+  objects --> rls{"RLS policy: using / with check against auth.uid()"}
+  rls -->|allowed| data["Underlying object data returned or written"]
+  rls -->|denied| reject["403 rejected"]`;
+
+<Callout title="The one-line takeaway">
+Supabase Storage groups files into **buckets** that are either **public** (readable by anyone with the URL, via `getPublicUrl`) or **private** (access-gated, served through a time-limited `createSignedUrl`), and under the hood every object's metadata is just a row in the **`storage.objects`** table — access is enforced entirely by **Row Level Security policies** on that table, using the exact same `using`/`with check`/`auth.uid()` syntax as any other RLS-protected table, commonly matching a path prefix like `avatars/{user_id}/...` to the requesting user.
+</Callout>
+
+export const quizStoragePolicies = [
+  {
+    q: 'What is the difference between a public and a private Storage bucket',
+    options: [
+      'There is no difference, both require the same authentication',
+      'A public bucket\'s objects are readable by anyone with the URL; a private bucket requires access to be checked per request',
+      'A private bucket only allows uploads, never downloads',
+      'A public bucket cannot store images, only text files',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What actually enforces who can upload, read, or delete a given Storage object',
+    options: [
+      'A proprietary permission list stored outside of Postgres entirely',
+      'Row Level Security policies on the storage.objects table, the same mechanism used for any other table',
+      'A fixed rule that only the uploader can ever access a file, with no policies involved',
+      'Storage has no access control by default and every object is always public',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What is a signed URL for',
+    options: [
+      'Permanently making a private bucket public',
+      'A time-limited URL that grants temporary access to one object in a private bucket',
+      'Encrypting a file before it is uploaded',
+      'Renaming a file inside a bucket',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'In a policy restricting a user to their own avatar folder, what is typically compared against auth.uid()',
+    options: [
+      'The bucket\'s public/private flag',
+      'The first segment of the object\'s path, e.g. via storage.foldername(name)',
+      'The HTTP method of the request',
+      'The file\'s byte size',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="realtime-and-storage/storage-buckets-and-policies" questions={quizStoragePolicies} />
+
+<ProgressTracker client:visible id="realtime-and-storage/storage-buckets-and-policies" />

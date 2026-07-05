@@ -1,0 +1,147 @@
+---
+title: 'Edge Functions and the Database'
+description: 'How the key you initialize a supabase-js client with inside an Edge Function decides whether RLS applies or is bypassed entirely.'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+Inside an Edge Function you can query the database with `supabase-js` exactly like client-side code, but which **key** you initialize that client with decides whether Row Level Security applies or is bypassed entirely.
+
+## Same client, two very different keys
+
+An Edge Function is just server-side TypeScript, so nothing stops it from creating a `supabase-js` client and running queries the same way a browser would:
+
+```typescript
+import { createClient } from 'jsr:@supabase/supabase-js@2'
+
+const authHeader = req.headers.get('Authorization')!
+
+const supabase = createClient(
+  Deno.env.get('SUPABASE_URL')!,
+  Deno.env.get('SUPABASE_ANON_KEY')!,
+  { global: { headers: { Authorization: authHeader } } },
+)
+```
+
+Forwarding the caller's own `Authorization` header — the same token `supabase.functions.invoke()` attached automatically, as covered in the last lesson — means every query this client runs is scoped to that user. Row Level Security applies exactly as if the client had queried Postgres directly. The function has not gained any extra access; it is simply adding server-side logic in front of the access the user already had.
+
+## The service_role key bypasses RLS entirely
+
+The alternative is initializing the client with the **service_role key** instead of the anon key plus a forwarded token:
+
+```typescript
+const supabaseAdmin = createClient(
+  Deno.env.get('SUPABASE_URL')!,
+  Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,
+)
+```
+
+Queries made with this client run with RLS **bypassed entirely** — every row in every table is visible and writable, regardless of policies. This is a legitimate, common pattern, because an Edge Function is trusted server-side code, unlike a browser that could be inspected or tampered with by its own user. But it comes with a real shift in responsibility: once RLS is out of the picture, the database is no longer checking anything on this client's behalf. Whatever access control is required now has to be written, correctly, in the function's own code.
+
+## A concrete example: an admin-only report
+
+Suppose you need an endpoint that returns an aggregate report — total revenue across all customers — that no ordinary user's RLS policies should ever allow them to see. RLS cannot selectively "allow this one aggregate query"; it either lets a user see rows or it does not. An Edge Function is the natural place to enforce that exception:
+
+```typescript
+Deno.serve(async (req) => {
+  const authHeader = req.headers.get('Authorization')!
+
+  // Check the caller's identity and role using their own forwarded token
+  const supabase = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_ANON_KEY')!,
+    { global: { headers: { Authorization: authHeader } } },
+  )
+  const { data: { user } } = await supabase.auth.getUser()
+
+  const { data: profile } = await supabase
+    .from('profiles')
+    .select('is_admin')
+    .eq('id', user?.id)
+    .single()
+
+  if (!profile?.is_admin) {
+    return new Response('Forbidden', { status: 403 })
+  }
+
+  // Only after that check passes, query freely with service_role
+  const supabaseAdmin = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,
+  )
+  const { data: report } = await supabaseAdmin.rpc('total_revenue_report')
+
+  return new Response(JSON.stringify(report), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+})
+```
+
+The function itself is the trust boundary here, not RLS: it checks who is calling with the user's own token, and only then reaches for `service_role` to fetch data that RLS alone could never expose safely.
+
+<Mermaid title="Two ways to initialize a Supabase client inside an Edge Function" code={edgeDbKeysDiagram} />
+
+export const edgeDbKeysDiagram = `flowchart LR
+  req["Incoming request"] --> edge["Edge Function"]
+  edge -->|"forwarded user token"| userClient["supabase-js client (anon key + user token)"]
+  edge -->|"service_role key"| adminClient["supabase-js client (service_role key)"]
+  userClient -->|"RLS applies"| db[("Postgres")]
+  adminClient -->|"RLS bypassed"| db`;
+
+<Callout title="The one-line takeaway">
+Inside an Edge Function, initializing a `supabase-js` client with the **caller's forwarded auth token** keeps queries running **as that user with RLS enforced**, while initializing it with the **service_role key** runs queries with **RLS bypassed entirely** — a legitimate pattern for trusted server-side code, but one that shifts responsibility for correct access control onto the function's own code, as in an admin-only report the function itself gates before querying freely.
+</Callout>
+
+export const quizEdgeFunctionsDatabase = [
+  {
+    q: 'What happens to RLS when an Edge Function forwards the caller\'s own auth token to supabase-js',
+    options: [
+      'RLS is bypassed because the function is trusted code',
+      'RLS applies exactly as it would for a direct client query',
+      'RLS is disabled for the whole project',
+      'RLS only applies to insert statements',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What happens to RLS when an Edge Function uses the service_role key',
+    options: [
+      'RLS still applies, just with elevated limits',
+      'RLS is bypassed entirely; every row is visible and writable',
+      'RLS blocks the service_role key by default',
+      'Nothing changes compared to the anon key',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'When is using the service_role key inside a function an appropriate choice',
+    options: [
+      'Never, it should not be used inside functions',
+      'When the function\'s own logic correctly enforces the access rules that RLS would otherwise provide',
+      'Only for read-only queries',
+      'Only when the anon key is unavailable',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why does using service_role shift responsibility onto the function\'s code',
+    options: [
+      'Because the database still checks everything automatically',
+      'Because the database no longer enforces row-level access, so the function must get that logic right itself',
+      'It does not shift any responsibility',
+      'Because service_role queries are always slower',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="edge-functions/edge-functions-and-the-database" questions={quizEdgeFunctionsDatabase} />
+
+<ProgressTracker client:visible id="edge-functions/edge-functions-and-the-database" />

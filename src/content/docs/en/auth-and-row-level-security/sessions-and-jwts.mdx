@@ -1,0 +1,115 @@
+---
+title: 'Sessions and JWTs'
+description: 'How Supabase Auth issues and refreshes JWT access tokens, and how those tokens flow into Postgres for row level security.'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+A successful sign-in gets you a short-lived **JWT access token** plus a longer-lived **refresh token**, `supabase-js` stores and silently refreshes both for you, and it is the claims inside that JWT — the user's ID and role — that Postgres uses to decide what a request is allowed to see.
+
+## What you get back after signing in
+
+Every sign-in returns a session containing an `access_token` (a JWT, short-lived, typically an hour) and a `refresh_token` (long-lived, used to silently mint a new access token when the old one expires). `supabase-js` handles the storage and the refresh cycle for you — you do not need to manually track expiry or call a refresh endpoint yourself.
+
+```typescript
+const {
+  data: { session },
+} = await supabase.auth.getSession();
+
+console.log(session?.access_token); // short-lived JWT
+console.log(session?.refresh_token); // used to silently mint a new access token later
+```
+
+The JWT itself carries claims — a `sub` claim holding the user's ID, plus a `role` claim (typically `authenticated` for a signed-in user, `anon` for an unauthenticated request). Every request `supabase-js` makes to the auto-generated API attaches this JWT, and Postgres and PostgREST read those claims on the way in. That is exactly what powers `auth.uid()` inside a row level security policy, which the next lesson covers in depth — the JWT sent with a request is what lets a policy check whether a row belongs to the current user.
+
+## Reading the current session: getSession vs getUser
+
+`supabase.auth.getSession()` reads the session directly from local storage (refreshing it if the access token has expired), so it returns instantly without a round trip to the Auth server. `supabase.auth.getUser()` instead sends the access token to the Auth server to be revalidated, so it is slower but authoritative — reach for `getUser()` whenever you need a guarantee that the token has not been tampered with or revoked, such as before performing a sensitive server-side action.
+
+```typescript
+// Fast: reads the locally stored session, refreshing it if needed
+const { data: { session } } = await supabase.auth.getSession();
+
+// Authoritative: revalidates the access token against the Auth server
+const { data: { user }, error } = await supabase.auth.getUser();
+```
+
+## Staying in sync: onAuthStateChange
+
+Sign-in, sign-out, and token refresh all happen asynchronously, so UI code needs a way to react to them rather than polling. `supabase.auth.onAuthStateChange` registers a listener that fires on every one of those events with the event name and the current session, which is the standard way to keep client-side UI state (a signed-in nav bar, a redirect after logout, and so on) in sync with the actual auth state.
+
+```typescript
+const { data: authListener } = supabase.auth.onAuthStateChange((event, session) => {
+  console.log(event, session?.user?.id);
+  // event is one of: SIGNED_IN, SIGNED_OUT, TOKEN_REFRESHED, USER_UPDATED, ...
+});
+
+// Later, when the listener is no longer needed:
+authListener.subscription.unsubscribe();
+```
+
+<Mermaid title="From sign-in to a JWT Postgres can evaluate" code={sessionFlowDiagram} />
+
+export const sessionFlowDiagram = `flowchart LR
+  signin["User signs in"] --> issue["Auth issues access token (JWT) + refresh token"]
+  issue --> attach["supabase-js attaches JWT to every API request"]
+  attach --> pg[("Postgres / PostgREST reads JWT claims")]
+  pg --> uid["auth.uid() available inside RLS policies"]`;
+
+<Callout title="The one-line takeaway">
+Signing in returns a short-lived **JWT access token** plus a longer-lived **refresh token**, both managed automatically by `supabase-js`; the JWT's claims (the user's ID in `sub`, plus `role`) are what Postgres reads on every request, which is exactly what makes **`auth.uid()`** work inside a row level security policy. Use **`getSession()`** for a fast, locally-stored read and **`getUser()`** when you need the Auth server to revalidate the token, and use **`onAuthStateChange`** to keep UI state in sync with sign-in, sign-out, and token refresh events.
+</Callout>
+
+export const quizSessionsAndJwts = [
+  {
+    q: 'What does a JWT issued by Supabase Auth make available inside a row level security policy?',
+    options: [
+      'Nothing, RLS cannot read JWT claims',
+      'The current user ID (via auth.uid(), sourced from the sub claim) and role',
+      'The user password in plain text',
+      'Only the refresh token',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What is onAuthStateChange used for?',
+    options: [
+      'Encrypting the JWT',
+      'Registering a listener that fires on sign-in, sign-out, token refresh, and similar auth events, so UI code can stay in sync',
+      'Creating a new Postgres row level security policy',
+      'Rotating the Supabase project API keys',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What is the key difference between getSession() and getUser()?',
+    options: [
+      'They are identical in every way',
+      'getSession() reads the locally stored session without necessarily hitting the Auth server, while getUser() revalidates the token against the Auth server',
+      'getUser() only works for OAuth sign-ins',
+      'getSession() always fails if the user is signed in',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What two tokens does supabase-js manage on your behalf after sign-in?',
+    options: [
+      'An API key and a database password',
+      'A short-lived JWT access token and a longer-lived refresh token',
+      'Two identical access tokens',
+      'A session cookie and a CSRF token only',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="auth-and-row-level-security/sessions-and-jwts" questions={quizSessionsAndJwts} />
+
+<ProgressTracker client:visible id="auth-and-row-level-security/sessions-and-jwts" />

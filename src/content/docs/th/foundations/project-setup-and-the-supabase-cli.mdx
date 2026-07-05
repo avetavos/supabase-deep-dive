@@ -1,0 +1,129 @@
+---
+title: 'ตั้งค่า Project และ Supabase CLI'
+description: 'สร้าง hosted project, key anon กับ service_role และใช้ Supabase CLI link local project แล้วรัน full stack บนเครื่องตัวเองด้วย Docker'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+Supabase project เริ่มต้นจาก Postgres instance แบบ hosted พร้อม API key สองตัวที่ระดับความน่าเชื่อถือต่างกันมาก และ Supabase CLI คือสิ่งที่ทำให้คุณ link folder บนเครื่องเข้ากับ project นั้น แล้วรันทั้ง stack บนเครื่องตัวเองด้วย Docker ได้
+
+## สร้าง project และ key สองตัวของมัน
+
+คุณสร้าง hosted project ใหม่ได้จาก dashboard ของ Supabase หรือ shortcut `database.new` เบื้องหลังมันจะ provision Postgres instance ของคุณเอง, API URL และ API key สองตัว
+
+- **`anon` key** — public ใช้ใน client-side code ได้ปลอดภัย (browser bundle, mobile app) request ที่ใช้ key นี้ต้องผ่าน Row Level Security
+- **`service_role` key** — secret, full-access, **bypass Row Level Security ทั้งหมด** ใช้เฉพาะกับ server-side code ที่เชื่อถือได้เท่านั้น
+
+<Callout title="ห้าม expose service_role key ใน client-side code เด็ดขาด">
+`service_role` key ข้าม RLS policy ทุกอันในทุก table ถ้ามันหลุดไปอยู่ใน browser bundle, mobile app หรือ code ที่ user เปิดดูได้ ใครก็ตามที่มี key นี้อ่านและเขียน database ทั้งหมดของคุณได้เลย เก็บมันไว้ใน environment variable ฝั่ง server เท่านั้น ห้ามอยู่ใน code ที่ ship ไปหา client เด็ดขาด นี่คือกฎที่คอร์สนี้จะย้ำอีกหลายครั้ง
+</Callout>
+
+```typescript
+// Server-side only — e.g. an API route, a cron job, an Edge Function.
+// process.env.SUPABASE_SERVICE_ROLE_KEY must never be bundled into client code.
+import { createClient } from '@supabase/supabase-js';
+
+const supabaseAdmin = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!
+);
+```
+
+## Supabase CLI
+
+CLI คือวิธีจัดการ project เป็น code แทนที่จะทำผ่าน dashboard อย่างเดียว
+
+```bash
+# Scaffold a local supabase/ config directory in your project
+npx supabase init
+
+# Authenticate the CLI with your Supabase account
+supabase login
+
+# Connect this local project folder to a specific hosted project
+supabase link --project-ref <project-ref>
+```
+
+`supabase link` คือคำสั่งที่บอกว่า folder `supabase/` บนเครื่องคุณตรงกับ hosted project ตัวไหน — `db push` หรือ `db diff` ครั้งต่อ ๆ ไปจะเล็งไปที่ project ที่ link ไว้นี้เสมอ
+
+## Local development ด้วย `supabase start`
+
+```bash
+supabase start
+```
+
+คำสั่งนี้จะสตาร์ท **Supabase stack ทั้งชุดบนเครื่องตัวเองผ่าน Docker** — Postgres, Studio, Auth, Storage, Realtime และอื่น ๆ รันเป็น container บนเครื่องคุณทั้งหมด นั่นแปลว่าคุณ develop และ test schema, RLS policy และ client code ได้แบบ offline เต็มรูปแบบ โดยไม่มีความเสี่ยงต่อ hosted project เลย ก่อนที่จะรัน `supabase db push` ใส่มันจริง ๆ
+
+<Mermaid title="Local Docker-based stack ที่ link เข้ากับ hosted project" code={cliSetupDiagram} />
+
+export const cliSetupDiagram = `flowchart LR
+  subgraph local["Local machine (supabase start)"]
+    lpg[("Postgres")]
+    lstudio["Studio"]
+    lauth["Auth"]
+    lstorage["Storage"]
+  end
+  subgraph hosted["Hosted project"]
+    hpg[("Postgres")]
+    hapi["API URL + anon/service_role keys"]
+  end
+  local -- "supabase link --project-ref" --> hosted
+  local -- "supabase db push" --> hosted`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+Hosted project ให้ Postgres มาพร้อม API URL, key **`anon`** สำหรับ client code (ต้องผ่าน RLS) และ key **`service_role`** สำหรับ server code ที่เชื่อถือได้ (bypass RLS — ห้าม ship ไปหา client เด็ดขาด) คำสั่ง CLI อย่าง `supabase init`, `supabase login` และ `supabase link --project-ref` เชื่อม local folder เข้ากับ project นั้น ส่วน `supabase start` รันทั้ง stack บนเครื่องตัวเองผ่าน Docker ทำให้ develop แบบ offline ได้เต็มรูปแบบ
+</Callout>
+
+export const quizCliSetup = [
+  {
+    q: 'anon key กับ service_role key ต่างกันตรงไหนหลัก ๆ',
+    options: [
+      'ไม่ต่างกันเลย ใช้แทนกันได้',
+      'anon key ต้องผ่าน Row Level Security ส่วน service_role key bypass RLS ทั้งหมดและต้องอยู่ฝั่ง server เท่านั้น',
+      'anon key เป็น secret ส่วน service_role key เป็น public',
+      'service_role key ใช้ได้เฉพาะตอน local development เท่านั้น',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไม service_role key ห้ามหลุดไปถึง client-side code',
+    options: [
+      'มันหมดอายุหลังใช้ครั้งเดียว',
+      'มันใช้ได้แค่กับ GraphQL ไม่ใช่ REST',
+      'มัน bypass Row Level Security ดังนั้นใครก็ตามที่มี key นี้อ่านเขียน database ทั้งหมดได้',
+      'มันช้ากว่า anon key',
+    ],
+    answer: 2,
+  },
+  {
+    q: '`supabase start` ทำอะไร',
+    options: [
+      'ลบ hosted project ทิ้ง',
+      'รัน Supabase stack ทั้งชุดบนเครื่องตัวเองผ่าน Docker รวมถึง Postgres, Studio, Auth, Storage และ Realtime',
+      'push migration บนเครื่องขึ้น hosted project',
+      'สตาร์ทแค่ Postgres client เท่านั้น ไม่มีอย่างอื่น',
+    ],
+    answer: 1,
+  },
+  {
+    q: '`supabase link --project-ref <ref>` ทำอะไร',
+    options: [
+      'สร้าง hosted project ใหม่ทั้งหมด',
+      'เชื่อม local project folder เข้ากับ hosted project ตัวที่มีอยู่แล้ว',
+      'สร้าง anon key กับ service_role key',
+      'สตาร์ท local Docker stack',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="foundations/project-setup-and-the-supabase-cli" questions={quizCliSetup} />
+
+<ProgressTracker client:visible id="foundations/project-setup-and-the-supabase-cli" />

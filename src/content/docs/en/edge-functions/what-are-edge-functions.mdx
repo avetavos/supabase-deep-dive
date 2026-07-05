@@ -1,0 +1,118 @@
+---
+title: 'What Are Edge Functions'
+description: 'Server-side TypeScript functions that run on Deno at the edge, and when to reach for one instead of a Postgres RPC function.'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+**Edge Functions** are server-side TypeScript functions that run on **Deno**, deployed globally close to your users, for whenever your logic is not a database query.
+
+## Not Node.js, not a database query
+
+Every layer covered so far in this course lives close to Postgres: PostgREST turns tables into a REST API, RPC functions run SQL-adjacent logic inside the database, and RLS enforces access at the row level. Edge Functions are the layer for everything that does not fit that shape — calling a third-party API, holding a secret that should never sit in the database, doing CPU-bound work outside SQL, or exposing a stateless HTTP endpoint with fully custom request and response handling.
+
+The runtime detail matters: Edge Functions run on **Deno**, not Node.js. Deno ships with a global `Deno.serve` for handling HTTP requests, first-class TypeScript support with no build step, and secure-by-default sandboxing. If you have written Node.js server code before, the request/response shape will feel familiar, but the APIs and permission model are Deno's.
+
+```typescript
+// supabase/functions/hello-world/index.ts
+Deno.serve((req) => {
+  return new Response('Hello from the edge')
+})
+```
+
+## Choosing an Edge Function over a Postgres RPC function
+
+The Auto-Generated API module already gave you a way to run custom logic close to the data: a Postgres RPC function. That is still the right tool when the logic is fundamentally a database operation — best expressed in SQL, or needs to run inside a single transaction alongside other writes. Reach for an Edge Function instead when any of the following is true:
+
+- You need to call an external, third-party API (a payment provider, an email service, an AI model).
+- The logic depends on a secret (an API key, a signing key) that must never be readable from the database or the client.
+- The work is CPU-bound in a way SQL cannot express cleanly (image processing, complex string parsing, calling out to another library).
+- You want a plain stateless HTTP endpoint with full control over headers, status codes, and the request/response cycle.
+
+If none of those apply and the operation is really just "read or write some rows with some logic," an RPC function is usually simpler and faster because it never leaves the database.
+
+## The CLI workflow
+
+The Supabase CLI treats Edge Functions as ordinary files in your project, deployed with a single command:
+
+```bash
+# Scaffold a new function at supabase/functions/hello-world/index.ts
+supabase functions new hello-world
+
+# Run all functions locally for development
+supabase functions serve
+
+# Ship a function to your live project
+supabase functions deploy hello-world
+```
+
+`supabase functions new` creates the boilerplate file and folder. `supabase functions serve` starts a local Deno runtime so you can iterate without deploying. `supabase functions deploy` uploads the function so Supabase's edge infrastructure runs it close to wherever the request comes from.
+
+<Mermaid title="An Edge Function as a third path alongside the REST/RPC API and direct database access" code={edgeFunctionsOverviewDiagram} />
+
+export const edgeFunctionsOverviewDiagram = `flowchart LR
+  client["Client app"] -->|"GET/POST via PostgREST"| rest["Auto-generated REST API"]
+  client -->|"rpc()"| rpcfn["Postgres RPC function"]
+  client -->|"functions.invoke()"| edge["Edge Function (Deno, deployed at the edge)"]
+  rest --> db[("Postgres")]
+  rpcfn --> db
+  edge -->|"optional"| db
+  edge -->|"optional"| ext["Third-party API"]`;
+
+<Callout title="The one-line takeaway">
+**Edge Functions** are server-side TypeScript functions running on **Deno** (not Node.js), deployed globally at the edge, scaffolded with `supabase functions new`, run locally with `supabase functions serve`, and shipped with `supabase functions deploy` — reach for one instead of a Postgres RPC function whenever you need a **third-party API call**, a **secret** the database should not hold, **CPU-bound work**, or a **custom HTTP endpoint**.
+</Callout>
+
+export const quizWhatAreEdgeFunctions = [
+  {
+    q: 'What runtime do Supabase Edge Functions run on',
+    options: [
+      'Node.js',
+      'Deno',
+      'Bun',
+      'A custom Python interpreter',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'When should you choose an Edge Function over a Postgres RPC function',
+    options: [
+      'Whenever you need to read a single row from a table',
+      'When the logic needs to call a third-party API, use a secret, or do CPU-bound work outside SQL',
+      'Never, RPC functions can always replace Edge Functions',
+      'Only when the project has no database at all',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does `supabase functions deploy hello-world` do',
+    options: [
+      'Runs the function only on your local machine',
+      'Ships the function so it runs on Supabase edge infrastructure',
+      'Deletes the function from the project',
+      'Generates TypeScript types for the function',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which command runs Edge Functions locally for development',
+    options: [
+      'supabase functions new',
+      'supabase functions deploy',
+      'supabase functions serve',
+      'supabase start functions',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="edge-functions/what-are-edge-functions" questions={quizWhatAreEdgeFunctions} />
+
+<ProgressTracker client:visible id="edge-functions/what-are-edge-functions" />

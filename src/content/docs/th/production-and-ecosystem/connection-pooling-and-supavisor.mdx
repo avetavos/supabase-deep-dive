@@ -1,0 +1,113 @@
+---
+title: 'Connection Pooling และ Supavisor'
+description: 'Supavisor pool connection ของ Postgres ให้ serverless กับ edge workload ยังไง และควรใช้ transaction mode หรือ session mode ตอนไหน'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+Postgres มีขีดจำกัดของ concurrent connection ที่ต่อตรงเข้ามาได้ ดังนั้น Supabase จึงวาง **Supavisor** ไว้ด้านหน้ามันเป็น connection pooler ที่มีสองโหมด — transaction mode บน port `6543` สำหรับ client อายุสั้นจำนวนมากที่ serverless กับ edge environment สร้างขึ้นมา และ session mode บน port `5432` สำหรับ client อายุยืนจำนวนน้อยที่ต้องการ feature ของ Postgres แบบครบถ้วน
+
+## ทำไม connection ถึงเป็นทรัพยากรที่มีจำกัด
+
+connection ของ Postgres แต่ละอันกิน memory และ backend process บนฝั่ง database server ดังนั้น Postgres จึงจำกัดจำนวนที่เปิดพร้อมกันได้ — โดย default อยู่ที่หลักร้อยต้น ๆ และ managed Postgres ของ Supabase ก็ไม่ต่างกัน ขีดจำกัดนี้อยู่ร่วมกับ server แบบดั้งเดิมที่รันยาว ๆ ได้ง่าย เพราะมันเปิด connection ไม่กี่อันแล้วใช้ซ้ำตลอดอายุการทำงานของมัน
+
+serverless กับ edge environment ทำลายสมมติฐานนั้น Edge Function, serverless API route หรือ framework ไหนก็ตามที่สร้าง instance อายุสั้นใหม่ทุกครั้งต่อ request ล้วนพยายามเปิด connection ตรงของตัวเองไปยัง Postgres ภายใต้ traffic จริง สิ่งนี้รวมกันอย่างรวดเร็วจนเกิน concurrent connection ที่ Postgres รับไหว แล้ว request ก็เริ่ม fail ด้วย connection error — ไม่ใช่เพราะ database ช้า แต่เพราะมัน connection slot หมดไปเฉย ๆ
+
+## Supavisor คือ transaction mode เทียบกับ session mode
+
+Supavisor คือ connection pooler ของ Supabase มันอยู่ระหว่างแอปของคุณกับ Postgres ถือ pool ของ connection จริงที่มีจำนวนน้อยกว่า แล้วแจกจ่ายให้กับ logical client จำนวนมากกว่าที่ Postgres จะรับตรง ๆ ได้ มันมีสองโหมด และเลือกโหมดจาก port ที่คุณต่อเข้าไป
+
+- **Transaction mode (port `6543`)** — connection หนึ่งจะถูกถือไว้แค่ช่วงของ transaction เดียวเท่านั้น แล้วคืนกลับเข้า pool ทันที สิ่งนี้ทำให้ pool เล็ก ๆ รองรับ client อายุสั้นจำนวนมากได้ ซึ่งตรงกับรูปแบบ traffic ของ serverless กับ Edge Function พอดี ข้อแลกเปลี่ยนคือมันไม่รองรับ feature ระดับ session ของ Postgres อย่าง prepared statement เพราะ connection ที่อยู่ข้างใต้อาจถูกส่งต่อไปให้ client คนอื่นระหว่าง transaction
+- **Session mode (port `5432`)** — client หนึ่งจะได้ connection เฉพาะของตัวเองตลอดเวลาที่ต่ออยู่ เหมือนคุยกับ Postgres ตรง ๆ เป๊ะ ๆ สิ่งนี้ให้ feature ครบถ้วนทุกอย่าง รวมถึง prepared statement แต่ client ที่ต่ออยู่แต่ละตัวจะกิน slot หนึ่งใน pool ตลอดเวลาที่มันยังต่ออยู่ จึงไม่ scale ไปถึง client อายุสั้นจำนวนมหาศาลพร้อมกันได้แบบที่ transaction mode ทำได้
+
+```bash
+# Transaction mode — best for serverless functions, Edge Functions, and other short-lived clients
+export DATABASE_URL="postgres://postgres.<project-ref>:[YOUR-PASSWORD]@aws-0-us-east-1.pooler.supabase.com:6543/postgres"
+
+# Session mode — for long-lived processes, or anything that specifically needs prepared statements
+export DIRECT_URL="postgres://postgres.<project-ref>:[YOUR-PASSWORD]@aws-0-us-east-1.pooler.supabase.com:5432/postgres"
+```
+
+## ควรใช้โหมดไหน
+
+ให้ default เป็น transaction mode สำหรับอะไรก็ตามที่เป็น serverless หรืออายุสั้น เช่น Edge Function, backend ของแอปส่วนใหญ่ที่รันบน serverless platform และ API route ที่เปิด connection ต่อ request มันคือโหมดที่ถูกสร้างมาสำหรับ traffic รูปแบบนั้นโดยตรง
+
+ให้ใช้ session mode เฉพาะตอนที่คุณต้องการ feature ระดับ session จริง ๆ เช่น prepared statement, `LISTEN`/`NOTIFY` หรือ process ฝั่ง server อายุยืน (backend แบบดั้งเดิมที่มี connection pool ของตัวเองอยู่แล้ว หรือ migration tool) ที่ต่ออยู่ตลอดและได้ประโยชน์จาก connection เฉพาะตัวมากกว่า connection แบบ pool ถ้าไม่แน่ใจว่า framework หรือ ORM ของคุณต้องการอันไหน ให้เช็ก doc ของมันเรื่อง pooler compatibility ก่อนเลือกโหมด — ORM บางตัวต้องการ session-mode URL สำหรับ migration และ transaction-mode URL สำหรับ query ตอน runtime
+
+<Mermaid title="Transaction mode pools many short-lived clients; session mode dedicates one connection per client" code={connPoolDiagram} />
+
+export const connPoolDiagram = `flowchart LR
+  subgraph short["Many short-lived clients"]
+    e1["Edge Function"]
+    e2["Serverless request"]
+    e3["Serverless request"]
+  end
+  subgraph long["Few long-lived clients"]
+    s1["Long-lived server process"]
+    s2["Tool needing prepared statements"]
+  end
+  e1 --> tx["Supavisor - transaction mode, port 6543"]
+  e2 --> tx
+  e3 --> tx
+  tx --> pool[("Small shared pool of Postgres connections")]
+  s1 --> sess["Supavisor - session mode, port 5432"]
+  s2 --> sess
+  sess --> dedicated[("One dedicated Postgres connection per client")]`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+Postgres มีเพดาน concurrent connection ตายตัว และ **Supavisor** คือ pooler ของ Supabase ที่อยู่ด้านหน้ามันเพื่อไม่ให้ client ฝั่ง serverless กับ edge ไปชนเพดานนั้นตรง ๆ ใช้ **transaction mode** (port `6543`) สำหรับกรณีทั่วไปที่มี client อายุสั้นจำนวนมากอย่าง Edge Function โดยยอมรับว่ามันไม่รองรับ prepared statement ส่วน **session mode** (port `5432`) เก็บไว้ใช้กับ process อายุยืนหรืออะไรก็ตามที่ต้องการ feature ระดับ session ของ Postgres แบบเต็ม ๆ จริง ๆ โดยรู้ไว้ว่า client แต่ละตัวที่นั่นจะถือ connection เฉพาะตัวไว้ตลอดเวลาที่ยังต่ออยู่
+</Callout>
+
+export const quizConnPooling = [
+  {
+    q: 'Supavisor แก้ปัญหาอะไรเป็นหลัก',
+    options: [
+      'มันแทนที่ Postgres ด้วย database engine ที่เร็วกว่า',
+      'Postgres มีเพดาน concurrent connection ตายตัว และ client ฝั่ง serverless หรือ edge อายุสั้นจำนวนมากอาจทำให้เพดานนั้นหมดถ้าต่อตรงเข้ามาเอง',
+      'มันเข้ารหัส connection ระหว่าง client กับ Postgres',
+      'มันทำให้ไม่ต้องใช้ anon key อีกต่อไป',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Supavisor transaction mode ใช้ port ไหน และมันไม่รองรับอะไร',
+    options: [
+      'Port 5432 และไม่รองรับ SQL query ใด ๆ เลย',
+      'Port 6543 และไม่รองรับ feature ระดับ session อย่าง prepared statement',
+      'Port 5432 และไม่รองรับ transaction',
+      'Port 6543 และไม่รองรับคำสั่ง SELECT',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไม session mode ถึง scale ไปถึง client อายุสั้นจำนวนมหาศาลพร้อมกันไม่ได้แบบที่ transaction mode ทำได้',
+    options: [
+      'session mode ช้ากว่าต่อ query',
+      'client แต่ละตัวที่ต่ออยู่จะถือ connection เฉพาะตัวไว้ใน pool ตลอดเวลาที่ยังต่ออยู่ แทนที่จะปล่อยคืนหลังจบแต่ละ transaction',
+      'session mode รองรับแค่ query แบบ read-only เท่านั้น',
+      'session mode ต้องใช้ database engine คนละตัว',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Edge Function ควรใช้โหมดไหนโดยทั่วไป และทำไม',
+    options: [
+      'session mode เพราะ Edge Function เป็น process อายุยืน',
+      'transaction mode เพราะการ invoke Edge Function มีอายุสั้น และการถือ connection แค่ต่อ transaction ทำให้ pool เล็ก ๆ รองรับมันได้จำนวนมาก',
+      'ไม่ควรใช้โหมดไหนเลย Edge Function ไม่ควรต่อกับ Postgres',
+      'session mode เพราะ Edge Function ต้องการ prepared statement',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="production-and-ecosystem/connection-pooling-and-supavisor" questions={quizConnPooling} />
+
+<ProgressTracker client:visible id="production-and-ecosystem/connection-pooling-and-supavisor" />

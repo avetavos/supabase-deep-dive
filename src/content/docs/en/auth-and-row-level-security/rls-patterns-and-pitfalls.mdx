@@ -1,0 +1,159 @@
+---
+title: 'RLS Patterns and Pitfalls'
+description: 'Common real-world row level security patterns plus the per-operation and performance pitfalls that trip up new Supabase projects.'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+Most real-world RLS setups are combinations of a small handful of patterns — owner-only, public-read-owner-write, role-based — and most real-world RLS bugs come from forgetting a policy for one operation or forgetting to index the column a policy filters on.
+
+## Owner-only rows
+
+The pattern from the previous lesson: a row is only visible or writable by the user who owns it, using `auth.uid() = user_id` in both `using` and `with check`.
+
+```sql
+create policy "Owners can update their own rows"
+on public.todos
+for update
+using (auth.uid() = user_id)
+with check (auth.uid() = user_id);
+```
+
+## Public read, owner-only write
+
+A very common shape for content like blog posts or comments: anyone can read, but only the owner can create, edit, or delete their own rows. This needs **two separate policies**, one per direction, because `using (true)` for `select` says nothing about who is allowed to write:
+
+```sql
+-- Anyone (including anon) can read
+create policy "Anyone can read posts"
+on public.posts
+for select
+using (true);
+
+-- Only the owner can update their own post
+create policy "Owners can update their posts"
+on public.posts
+for update
+using (auth.uid() = user_id)
+with check (auth.uid() = user_id);
+```
+
+## Role-based access
+
+Sometimes access depends on a role rather than ownership — an admin who can moderate everyone's content, for example. A common approach is a `user_roles` table joined inside the policy condition (custom claims embedded directly in the JWT are another option, but a joined table is easier to manage without reissuing tokens):
+
+```sql
+create policy "Admins can delete any post"
+on public.posts
+for delete
+using (
+  exists (
+    select 1 from public.user_roles
+    where user_roles.user_id = auth.uid()
+    and user_roles.role = 'admin'
+  )
+);
+```
+
+## The pitfall: one policy does not cover every operation
+
+RLS is evaluated **per operation** — `select`, `insert`, `update`, and `delete` are each checked against their own policies independently. A table can easily end up with a working `select` policy and no `insert` policy at all: reads succeed, and every write silently fails with a permission error, which looks like a bug in application code when it is actually just a missing policy. Before shipping a table, check off each operation you expect the app to perform against it and make sure a policy exists for every single one.
+
+## The performance pitfall: unindexed policy columns
+
+A policy's condition runs against every row Postgres considers for a query, exactly like a `where` clause would. If the column your policy filters on — `user_id` in most of the examples above — has no index, a query that looks trivial can turn into a full sequential scan once the table has real volume. Index the columns your RLS policies reference just as you would for any other frequently-filtered column:
+
+```sql
+create index on public.posts (user_id);
+```
+
+A related optimization worth knowing: wrapping `auth.uid()` in a `select` inside the policy condition lets Postgres evaluate it once per query instead of once per row, which matters once a table has many rows:
+
+```sql
+create policy "Owners can update their posts"
+on public.posts
+for update
+using ((select auth.uid()) = user_id);
+```
+
+## Testing a policy before you ship it
+
+Do not assume a policy behaves correctly — test it as the user it is meant to restrict. Supabase Studio's table editor has an impersonation feature for exactly this. The same thing can be done directly in a SQL session by switching role and setting the JWT claims a real request would carry:
+
+```sql
+set role authenticated;
+set request.jwt.claims = '{"sub": "11111111-1111-1111-1111-111111111111", "role": "authenticated"}';
+
+select * from public.posts; -- now runs exactly as that user would see it
+
+reset role;
+```
+
+<Mermaid title="A missing policy silently blocks one operation while others keep working" code={rlsPitfallsDiagram} />
+
+export const rlsPitfallsDiagram = `flowchart TB
+  subgraph missing["Table with only a SELECT policy"]
+    m1["select policy: present"] --> m2["Reads work"]
+    m3["insert policy: missing"] --> m4["Writes silently blocked"]
+  end
+  subgraph covered["Table with all four policies"]
+    c1["select / insert / update / delete: all present"] --> c2["Reads and writes both work as intended"]
+  end`;
+
+<Callout title="The one-line takeaway">
+Real-world RLS is built from a small set of patterns — **owner-only**, **public-read-owner-write** (which needs two separate policies, one for select and one for the write operations), and **role-based access** via a joined `user_roles` table or custom JWT claims — but the same two mistakes cause most real bugs: forgetting a policy for **one operation** while others keep working (reads succeed, writes silently fail), and referencing an **unindexed column** in a policy condition, which turns an innocent-looking query into a sequential scan at scale. Always test a policy by impersonating the user it is meant to restrict before shipping it.
+</Callout>
+
+export const quizRlsPatterns = [
+  {
+    q: 'Why does public read, owner-only write need two separate policies instead of one?',
+    options: [
+      'Postgres requires at least two policies per table no matter what',
+      'A select policy only governs who can read; it says nothing about who can insert, update, or delete, so a separate write-scoped policy is required',
+      'It does not, one policy is always enough',
+      'with check cannot be combined with using in any policy',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What is the specific pitfall of forgetting a policy for one operation on a table?',
+    options: [
+      'The entire table becomes readable to everyone',
+      'That operation is silently blocked (e.g. writes fail) even though other operations with their own policies keep working, since RLS is evaluated per operation',
+      'Postgres refuses to start',
+      'All existing policies on the table are automatically disabled',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why can an RLS policy condition on an unindexed column hurt performance at scale?',
+    options: [
+      'RLS policies are not affected by indexes at all',
+      'The policy condition is evaluated per row considered by the query, so without an index Postgres may fall back to a full sequential scan',
+      'Unindexed columns cause the policy to be skipped entirely',
+      'It only affects insert operations, never select',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What is a practical way to verify an RLS policy behaves as intended before shipping it?',
+    options: [
+      'Read the SQL and assume it is correct',
+      'Impersonate the target user via Studio or set role/request.jwt.claims in a SQL session and run the query as that user',
+      'Disable RLS temporarily to check the results',
+      'There is no way to test RLS before production',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="auth-and-row-level-security/rls-patterns-and-pitfalls" questions={quizRlsPatterns} />
+
+<ProgressTracker client:visible id="auth-and-row-level-security/rls-patterns-and-pitfalls" />

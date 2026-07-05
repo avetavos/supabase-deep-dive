@@ -1,0 +1,147 @@
+---
+title: 'Edge Functions กับฐานข้อมูล'
+description: 'key ที่คุณใช้สร้าง supabase-js client ใน Edge Function เป็นตัวตัดสินว่า RLS จะทำงานหรือถูก bypass ไปเลย'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## แนวคิดในหนึ่งประโยค
+
+ใน Edge Function คุณ query ฐานข้อมูลด้วย `supabase-js` ได้เหมือนโค้ดฝั่ง client เป๊ะ ๆ แต่ **key** ที่ใช้สร้าง client นั้นต่างหากที่ตัดสินว่า Row Level Security จะทำงานหรือถูก bypass ไปเลย
+
+## client เดียวกัน แต่ key ต่างกันคนละเรื่อง
+
+Edge Function เป็นแค่ TypeScript ฝั่งเซิร์ฟเวอร์ ไม่มีอะไรห้ามมันสร้าง `supabase-js` client แล้ว query แบบเดียวกับที่ browser ทำ
+
+```typescript
+import { createClient } from 'jsr:@supabase/supabase-js@2'
+
+const authHeader = req.headers.get('Authorization')!
+
+const supabase = createClient(
+  Deno.env.get('SUPABASE_URL')!,
+  Deno.env.get('SUPABASE_ANON_KEY')!,
+  { global: { headers: { Authorization: authHeader } } },
+)
+```
+
+การ forward header `Authorization` ของผู้เรียกเอง ซึ่งเป็น token เดียวกับที่ `supabase.functions.invoke()` แนบให้อัตโนมัติตามที่บทก่อนหน้าพูดถึง หมายความว่าทุก query ที่ client นี้รันจะถูกจำกัดขอบเขตตาม user คนนั้น Row Level Security ทำงานเหมือนกับที่ client เรียก Postgres ตรง ๆ ทุกประการ function ไม่ได้สิทธิ์เพิ่มขึ้นเลย มันแค่เพิ่ม logic ฝั่งเซิร์ฟเวอร์เข้าไปคลุมสิทธิ์ที่ user มีอยู่แล้ว
+
+## service_role key bypass RLS ทั้งหมด
+
+ทางเลือกอีกแบบคือสร้าง client ด้วย **service_role key** แทนที่จะใช้ anon key พร้อม forward token
+
+```typescript
+const supabaseAdmin = createClient(
+  Deno.env.get('SUPABASE_URL')!,
+  Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,
+)
+```
+
+query ที่ทำผ่าน client นี้จะ**bypass RLS ทั้งหมด** ทุก row ในทุก table มองเห็นและเขียนได้หมด ไม่สนใจ policy ใด ๆ นี่เป็น pattern ที่ถูกต้องและใช้กันทั่วไป เพราะ Edge Function เป็นโค้ดฝั่งเซิร์ฟเวอร์ที่เชื่อถือได้ ต่างจาก browser ที่ user ของตัวเองสามารถตรวจดูหรือแก้ไขได้ แต่มันมาพร้อมความรับผิดชอบที่เปลี่ยนไปจริง ๆ เมื่อ RLS ไม่ได้อยู่ในสมการแล้ว ฐานข้อมูลจะไม่ตรวจสอบอะไรแทน client นี้อีกต่อไป การควบคุมสิทธิ์ที่จำเป็นต้องเขียนให้ถูกต้องเองในโค้ดของ function
+
+## ตัวอย่างจริง รายงานสำหรับ admin เท่านั้น
+
+สมมติว่าคุณต้องการ endpoint ที่คืนรายงานสรุปยอด เช่น revenue รวมของลูกค้าทั้งหมด ซึ่ง RLS policy ของ user ทั่วไปไม่ควรอนุญาตให้เห็นเลย RLS เลือก "อนุญาต query สรุปนี้เฉพาะกรณีนี้" ไม่ได้ มันแค่ให้เห็น row หรือไม่ให้เห็นเท่านั้น Edge Function จึงเป็นที่ที่เหมาะสมสำหรับบังคับข้อยกเว้นนี้
+
+```typescript
+Deno.serve(async (req) => {
+  const authHeader = req.headers.get('Authorization')!
+
+  // Check the caller's identity and role using their own forwarded token
+  const supabase = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_ANON_KEY')!,
+    { global: { headers: { Authorization: authHeader } } },
+  )
+  const { data: { user } } = await supabase.auth.getUser()
+
+  const { data: profile } = await supabase
+    .from('profiles')
+    .select('is_admin')
+    .eq('id', user?.id)
+    .single()
+
+  if (!profile?.is_admin) {
+    return new Response('Forbidden', { status: 403 })
+  }
+
+  // Only after that check passes, query freely with service_role
+  const supabaseAdmin = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,
+  )
+  const { data: report } = await supabaseAdmin.rpc('total_revenue_report')
+
+  return new Response(JSON.stringify(report), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+})
+```
+
+ตัวฟังก์ชันเองคือ trust boundary ในตัวอย่างนี้ ไม่ใช่ RLS มันตรวจสอบว่าใครเรียกด้วย token ของ user คนนั้นเอง แล้วค่อยหยิบ `service_role` มาดึงข้อมูลที่ RLS เพียงอย่างเดียวไม่มีทางเปิดเผยได้อย่างปลอดภัย
+
+<Mermaid title="สองวิธีสร้าง Supabase client ใน Edge Function" code={edgeDbKeysDiagram} />
+
+export const edgeDbKeysDiagram = `flowchart LR
+  req["Incoming request"] --> edge["Edge Function"]
+  edge -->|"forwarded user token"| userClient["supabase-js client (anon key + user token)"]
+  edge -->|"service_role key"| adminClient["supabase-js client (service_role key)"]
+  userClient -->|"RLS applies"| db[("Postgres")]
+  adminClient -->|"RLS bypassed"| db`;
+
+<Callout title="สรุปในบรรทัดเดียว">
+ใน Edge Function การสร้าง `supabase-js` client ด้วย**forwarded token ของผู้เรียก** ทำให้ query รันในฐานะ user คนนั้นและ**บังคับใช้ RLS**ตามปกติ ส่วนการสร้างด้วย **service_role key** ทำให้ query รันแบบ**bypass RLS ทั้งหมด** ซึ่งเป็น pattern ที่ถูกต้องสำหรับโค้ดฝั่งเซิร์ฟเวอร์ที่เชื่อถือได้ แต่ผลักภาระการควบคุมสิทธิ์ที่ถูกต้องไปไว้ที่โค้ดของ function เอง เหมือนตัวอย่างรายงานสำหรับ admin ที่ function เองเป็นคนตรวจสอบก่อนจะ query แบบเปิดกว้าง
+</Callout>
+
+export const quizEdgeFunctionsDatabase = [
+  {
+    q: 'เกิดอะไรขึ้นกับ RLS เมื่อ Edge Function forward auth token ของผู้เรียกไปให้ supabase-js',
+    options: [
+      'RLS ถูก bypass เพราะ function เป็นโค้ดที่เชื่อถือได้',
+      'RLS ทำงานเหมือนกับที่ client query ตรง ๆ ทุกประการ',
+      'RLS ถูกปิดทั้งโปรเจกต์',
+      'RLS มีผลกับคำสั่ง insert เท่านั้น',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'เกิดอะไรขึ้นกับ RLS เมื่อ Edge Function ใช้ service_role key',
+    options: [
+      'RLS ยังทำงานอยู่ แค่ยกระดับ limit ให้',
+      'RLS ถูก bypass ทั้งหมด ทุก row มองเห็นและเขียนได้',
+      'service_role key ถูก RLS บล็อกเป็นค่าเริ่มต้น',
+      'ไม่มีอะไรต่างจาก anon key',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'การใช้ service_role key ใน function เป็นตัวเลือกที่เหมาะสมเมื่อไหร่',
+    options: [
+      'ไม่ควรใช้ใน function เลย',
+      'เมื่อ logic ของ function เองบังคับใช้กฎการเข้าถึงที่ RLS ควรจะทำให้ได้อย่างถูกต้อง',
+      'เฉพาะ query แบบอ่านอย่างเดียวเท่านั้น',
+      'เฉพาะตอนที่ไม่มี anon key ให้ใช้',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไมการใช้ service_role ถึงผลักภาระไปที่โค้ดของ function',
+    options: [
+      'เพราะฐานข้อมูลยังตรวจสอบทุกอย่างให้อัตโนมัติอยู่ดี',
+      'เพราะฐานข้อมูลไม่บังคับสิทธิ์ระดับ row ให้อีกต่อไป function จึงต้องเขียน logic นั้นให้ถูกต้องเอง',
+      'ไม่มีการผลักภาระใด ๆ เลย',
+      'เพราะ query ผ่าน service_role ช้ากว่าเสมอ',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="edge-functions/edge-functions-and-the-database" questions={quizEdgeFunctionsDatabase} />
+
+<ProgressTracker client:visible id="edge-functions/edge-functions-and-the-database" />

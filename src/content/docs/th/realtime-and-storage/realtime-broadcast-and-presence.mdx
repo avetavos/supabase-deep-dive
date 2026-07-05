@@ -1,0 +1,130 @@
+---
+title: 'Realtime: Broadcast and Presence'
+description: 'Broadcast กับ Presence ให้ pub/sub แบบ latency ต่ำและติดตามว่าใคร online อยู่บน Realtime channel ได้ยังไง โดยไม่ต้องตั้งค่า publication หรือ replication ใด ๆ ในฝั่ง database เลย'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+**Broadcast** กับ **Presence** คือ layer pub/sub และ tracking การ online ทั่วไปที่วางอยู่บน Realtime channel และต่างจาก Postgres Changes ตรงที่มัน**เปิดอยู่โดย default** ไม่ต้องตั้งค่า table หรือ replication ใด ๆ เลย
+
+## Broadcast: ส่ง message อะไรก็ได้เข้า channel
+
+Postgres Changes (ที่คุยไปในบทก่อน) จะยิงก็ต่อเมื่อ row ใน database เปลี่ยนแปลงจริง ๆ เท่านั้น แต่ฟีเจอร์ realtime หลายอย่างไม่ต้องการ — และไม่ควรต้องจ่ายต้นทุนของ — การ write ลง database เลยด้วยซ้ำ เช่น ตำแหน่ง cursor แบบสด, flag "user กำลังพิมพ์อยู่" หรือ chat message ที่แค่ต้องถึงคนที่อยู่ในห้องตอนนั้นพอ **Broadcast** ครอบคลุมเคสนี้ตรง ๆ client ที่ subscribe channel ไหนก็ส่ง JSON payload ได้ แล้ว subscriber คนอื่นบน channel เดียวกันจะได้รับตรง ๆ โดยไม่มี table ใน `public`, ไม่มี publication และไม่มี WAL เข้ามาเกี่ยวข้องเลย
+
+ส่ง broadcast message จาก `supabase-js`
+
+```typescript
+const channel = supabase.channel('room1');
+
+channel.on('broadcast', { event: 'cursor-pos' }, (payload) => {
+  console.log('Cursor moved:', payload.payload);
+});
+
+channel.subscribe();
+
+channel.send({
+  type: 'broadcast',
+  event: 'cursor-pos',
+  payload: { x: 120, y: 340 },
+});
+```
+
+subscriber ทุกตัวที่ลงทะเบียน `.on('broadcast', { event: 'cursor-pos' }, ...)` ไว้บน `room1` จะได้รับ payload นี้ ปกติภายในหลักสิบมิลลิวินาที ไม่มี round trip ไป database เลยบน hot path
+
+## Presence: ตอนนี้มีใครอยู่บ้าง
+
+**Presence** ต่อยอดจาก channel mechanism เดียวกันเพื่อแก้ปัญหาคนละแบบ คือรู้ว่า client ไหนกำลังต่ออยู่กับ channel ตอนนี้บ้าง และแต่ละคนอยากแชร์ state อะไร (username, ตำแหน่ง cursor, flag "online" หรือ "typing") แทนที่คุณจะต้อง broadcast message "เข้าร่วมแล้ว" กับ "ออกแล้ว" เองแล้วมา reconcile เอง channel ที่เปิด Presence จะเก็บ **ชุด client ที่ present อยู่แบบ sync กันตลอด** และ push update ให้ทุกคนที่ subscribe อยู่ทุกครั้งที่มีคนเข้าร่วม, ออก หรืออัปเดต state ที่ track ไว้
+
+client ประกาศ presence ของตัวเองด้วย `track` และอ่านชุด client ที่ present อยู่ตอนนี้ทั้งหมดด้วย `presenceState`
+
+```typescript
+const channel = supabase.channel('room1');
+
+channel.on('presence', { event: 'sync' }, () => {
+  const state = channel.presenceState();
+  console.log('Currently online:', state);
+});
+
+channel.subscribe(async (status) => {
+  if (status === 'SUBSCRIBED') {
+    await channel.track({ user_id: 'user-42', online_at: new Date().toISOString() });
+  }
+});
+```
+
+event `sync` จะยิงทุกครั้งที่ presence set เปลี่ยนไปสำหรับใครก็ตามบน channel และ `presenceState()` จะคืนภาพรวมปัจจุบันเต็ม ๆ เสมอ โดย key ด้วย presence key แต่ละตัวถือ state ที่ client นั้น track ไว้
+
+## ทั้งสองอย่างไม่แตะ database เลย
+
+นี่คือความต่างที่ควรจำไว้ต่อจากบทก่อน Postgres Changes ทำงานได้ก็ต่อเมื่อคุณรัน `alter publication supabase_realtime add table ...` ให้ table นั้นก่อน เพราะโดยพื้นฐานมันคือการ stream ออกมาจาก replication log ของ Postgres เอง **Broadcast กับ Presence ไม่เกี่ยวกับเรื่องนั้นเลย** — มันคือ layer messaging และ state-sync ที่อยู่ในตัว Realtime server ล้วน ๆ เปิดใช้งานได้ทันทีที่ต่อ channel โดยไม่มีอะไรต้องตั้งค่าในฝั่ง database เลย
+
+<Mermaid title="Broadcast ส่งตรงระหว่าง client; Presence sync state ที่แชร์กัน — ทั้งคู่ไม่แตะ Postgres" code={broadcastPresenceDiagram} />
+
+export const broadcastPresenceDiagram = `flowchart LR
+  subgraph channel["Realtime channel room1"]
+    c1["Client A"]
+    c2["Client B"]
+  end
+  c1 -->|"channel.send broadcast cursor-pos"| c2
+  c1 -->|"channel.track presence state"| sync["Synced presence state"]
+  c2 -->|"channel.track presence state"| sync
+  sync -->|"presence sync event"| c1
+  sync -->|"presence sync event"| c2`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+**Broadcast** ให้ client ไหนก็ส่ง JSON payload ตรงไปหา subscriber คนอื่นบน channel เดียวกันได้ (`channel.send({ type: 'broadcast', ... })` กับ `channel.on('broadcast', { event }, callback)`) ส่วน **Presence** ต่อยอด state "ใครอยู่บ้าง" ที่ sync กันไว้บน channel เดียวกัน (`channel.track(state)` กับ `channel.presenceState()`) และที่สำคัญคือทั้งสองอย่าง**เปิดอยู่โดย default** ไม่ต้องมี publication `supabase_realtime` และไม่ต้องตั้ง replica identity ใด ๆ — ต่างจาก Postgres Changes ที่ไม่ได้ผูกกับ table ใน database เลย
+</Callout>
+
+export const quizBroadcastPresence = [
+  {
+    q: 'Broadcast กับ Presence ต้องเพิ่ม table เข้า publication supabase_realtime เหมือน Postgres Changes หรือไม่',
+    options: [
+      'ต้อง ตั้งค่า publication แบบเดียวกันเป๊ะ',
+      'ไม่ต้อง Broadcast กับ Presence เปิดอยู่โดย default และไม่ผูกกับ table หรือ publication ใด ๆ ใน database',
+      'เฉพาะ Presence เท่านั้นที่ต้อง ส่วน Broadcast ไม่ต้อง',
+      'เฉพาะ Broadcast เท่านั้นที่ต้อง ส่วน Presence ไม่ต้อง',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Broadcast เหมาะกับอะไรที่สุด เทียบกับ Postgres Changes',
+    options: [
+      'เก็บทุก message ลง table ใน Postgres แบบถาวร',
+      'message ที่ latency ต่ำและไม่ต้อง persist อย่างตำแหน่ง cursor ที่ไม่ต้องเก็บลง database เลย',
+      'รัน batch job ตามตารางเวลากับ database',
+      'บังคับใช้ row level security policy',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Presence track อะไรจริง ๆ',
+    options: [
+      'ประวัติ row ทุกตัวที่เคยเปลี่ยนใน table ทั้งหมด',
+      'client ไหนกำลังต่ออยู่กับ channel ตอนนี้บ้าง และ state ที่แต่ละคนแชร์ไว้',
+      'query plan ของ SQL statement ล่าสุดที่รัน',
+      'รายชื่อ publication ทั้งหมดใน database',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'method ตัวไหนใช้ประกาศ state ของ client ตัวเองให้ subscriber คนอื่นบน channel ที่ใช้ Presence เห็น',
+    options: [
+      'channel.subscribe()',
+      'channel.track(state)',
+      'channel.presenceState()',
+      'channel.send({ type: \'broadcast\' })',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="realtime-and-storage/realtime-broadcast-and-presence" questions={quizBroadcastPresence} />
+
+<ProgressTracker client:visible id="realtime-and-storage/realtime-broadcast-and-presence" />

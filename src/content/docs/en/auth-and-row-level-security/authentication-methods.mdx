@@ -1,0 +1,126 @@
+---
+title: 'Authentication Methods'
+description: 'The sign-in methods Supabase Auth supports out of the box, from email and password to magic links, phone OTP, and OAuth providers.'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+Supabase Auth is built on the open-source **GoTrue** server and supports several ways for a user to prove who they are — password, magic link, phone OTP, or OAuth — and every one of them ends the same way: a row is created or matched in the built-in `auth.users` table.
+
+## The main sign-in methods
+
+`supabase-js` exposes each sign-in method as a method on `supabase.auth`. Email and password is the classic flow. A magic link sends the user a one-time sign-in link by email instead of asking for a password — the user clicks it and is signed in, nothing to type or forget. Phone OTP works the same way but delivers a one-time code by SMS. OAuth hands the user off to a third-party provider (Google, GitHub, and others) and Supabase handles the redirect dance and token exchange for you.
+
+```typescript
+import { createClient } from '@supabase/supabase-js';
+
+const supabase = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_ANON_KEY!
+);
+
+// Email + password
+const { data, error } = await supabase.auth.signUp({
+  email: 'jane@example.com',
+  password: 'correct-horse-battery-staple',
+});
+
+// Magic link — no password, just a one-time sign-in link emailed to the user
+const { error: otpError } = await supabase.auth.signInWithOtp({
+  email: 'jane@example.com',
+});
+
+// OAuth — Supabase handles the redirect dance with the provider for you
+const { error: oauthError } = await supabase.auth.signInWithOAuth({
+  provider: 'github',
+});
+```
+
+## Where the user actually lives: `auth.users`
+
+Every sign-up or sign-in, regardless of method, creates or authenticates a row in `auth.users`. That table lives in a separate `auth` schema, not `public` — it is managed by Supabase Auth itself and holds only what Auth needs (email, phone, hashed password, provider metadata, and so on). It is not meant to be extended directly with your own app columns.
+
+The common pattern is a `public.profiles` table whose primary key references `auth.users(id)`, holding whatever app-specific data Auth itself does not store — a username, an avatar URL, a subscription tier, anything your product needs.
+
+```sql
+-- public.profiles holds app-specific data auth.users does not store
+create table public.profiles (
+  id uuid primary key references auth.users (id) on delete cascade,
+  username text unique,
+  avatar_url text,
+  created_at timestamptz default now()
+);
+```
+
+A trigger on `auth.users` that inserts a matching `public.profiles` row on sign-up is a common way to keep the two in sync, though the details of that trigger are outside this lesson.
+
+<Mermaid title="Every sign-in method converges on the same auth.users row" code={authMethodsDiagram} />
+
+export const authMethodsDiagram = `flowchart LR
+  user["User"] --> pw["Email + password"]
+  user --> magic["Magic link"]
+  user --> otp["Phone OTP"]
+  user --> oauth["OAuth provider"]
+  pw --> gotrue["Supabase Auth (GoTrue)"]
+  magic --> gotrue
+  otp --> gotrue
+  oauth --> gotrue
+  gotrue --> table[("auth.users row created/matched")]`;
+
+<Callout title="The one-line takeaway">
+Supabase Auth (**GoTrue**) supports **password**, **magic link**, **phone OTP**, and **OAuth** sign-in out of the box, and no matter which one a user chooses, the result is the same: a row created or matched in **`auth.users`** — a separate `auth` schema you extend by referencing it from your own **`public.profiles`** table rather than editing directly.
+</Callout>
+
+export const quizAuthenticationMethods = [
+  {
+    q: 'Which of these does Supabase Auth support as a built-in sign-in method?',
+    options: [
+      'Only email and password, nothing else',
+      'Email and password, magic links, phone OTP, and OAuth providers',
+      'Only OAuth providers',
+      'Only phone OTP',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What table does Supabase Auth create or update on every sign-up or sign-in?',
+    options: [
+      'public.users',
+      'auth.users',
+      'public.profiles',
+      'auth.sessions',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why is a separate public.profiles table a common pattern instead of storing everything in auth.users?',
+    options: [
+      'auth.users cannot store any data at all',
+      'auth.users is managed by Supabase Auth itself and holds only what Auth needs, so app-specific data belongs in a table you own that references it',
+      'public.profiles is required for OAuth to function',
+      'It has no real benefit, it is just a convention',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does a magic link sign-in avoid needing?',
+    options: [
+      'An email address',
+      'A password',
+      'An internet connection',
+      'A Supabase project',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="auth-and-row-level-security/authentication-methods" questions={quizAuthenticationMethods} />
+
+<ProgressTracker client:visible id="auth-and-row-level-security/authentication-methods" />

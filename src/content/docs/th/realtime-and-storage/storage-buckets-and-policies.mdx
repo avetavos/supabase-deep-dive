@@ -1,0 +1,133 @@
+---
+title: 'Storage: Buckets and Policies'
+description: 'Supabase Storage จัดไฟล์เข้า bucket แบบ public และ private ยังไง และ access ของทุก object จริง ๆ แล้วถูกบังคับด้วย Row Level Security policy บน table storage.objects'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+Supabase Storage คือ object storage แบบ S3-compatible จัดเป็น **bucket** และ access ของทุก object ถูกบังคับด้วย **Row Level Security** policy ธรรมดาบน table Postgres — mechanism เดียวกับที่คุณรู้จักแล้วจาก module RLS ไม่ใช่ระบบสิทธิ์แยกต่างหากอีกชุด
+
+## Bucket: container แบบ public และ private
+
+**bucket** คือ container ระดับบนสุดสำหรับไฟล์ คล้าย S3 bucket เช่นคุณอาจมี bucket `avatars` สำหรับรูปโปรไฟล์ และ bucket `public-assets` สำหรับรูป marketing bucket หนึ่งตั้งเป็น **public** ได้ หมายความว่าใครก็ตามที่มี URL ของ object อ่านได้เลยโดยไม่ต้อง authenticate หรือตั้งเป็น **private** หมายความว่า access ถูกเช็คทุก request
+
+การ upload, download และอ่านไฟล์จาก `supabase-js` ทำงานผ่านชื่อ bucket ทั้งหมด
+
+```typescript
+// Upload a file into a path inside the bucket
+const { data, error } = await supabase.storage
+  .from('avatars')
+  .upload('user123/photo.png', file);
+
+// Download the raw file bytes
+const { data: fileData } = await supabase.storage
+  .from('avatars')
+  .download('user123/photo.png');
+
+// Get a public URL — only meaningful for a public bucket
+const { data: publicUrlData } = supabase.storage
+  .from('avatars')
+  .getPublicUrl('user123/photo.png');
+
+// Get a time-limited signed URL — for a private bucket
+const { data: signedUrlData } = await supabase.storage
+  .from('avatars')
+  .createSignedUrl('user123/photo.png', 60);
+```
+
+`getPublicUrl` แค่สร้าง URL string ขึ้นมาเฉย ๆ ไม่ได้เช็คอะไรเลย ดังนั้นเรียกกับ object ใน private bucket ก็ยังได้ URL กลับมา แต่ URL นั้นจะถูก reject อยู่ดี `createSignedUrl` คือตัวที่ต้องใช้จริงสำหรับ private content มันสร้าง URL ที่ valid ตามจำนวนวินาทีที่คุณส่งเข้าไป (`60` ในตัวอย่างข้างบน) โดยฝัง signed token ที่ให้ access ชั่วคราวกับ object ตัวนั้นตัวเดียว
+
+## สิ่งที่บังคับ access จริง ๆ คือ Row Level Security
+
+นี่คือข้อเท็จจริงที่ควรจำไว้ Storage ไม่มีภาษาสิทธิ์เฉพาะของตัวเองเลย metadata ของทุก object ที่ upload ไป — bucket, path, owner, content type — ถูกเก็บเป็น row จริงใน table Postgres ชื่อ `storage.objects` access control ก็คือแค่ **Row Level Security policy บน table นั้น** เขียนด้วย syntax `using` กับ `with check` เดียวกันเป๊ะกับที่คุณใช้กับ table อื่นในคอร์สนี้
+
+pattern ที่พบบ่อยคือให้ user จัดการได้แค่ไฟล์ใต้ folder prefix ของตัวเอง โดย key ด้วย `auth.uid()` ของเขา
+
+```sql
+create policy "Users can upload their own avatar"
+on storage.objects
+for insert
+to authenticated
+with check (
+  bucket_id = 'avatars'
+  and (storage.foldername(name))[1] = auth.uid()::text
+);
+
+create policy "Users can read their own avatar"
+on storage.objects
+for select
+to authenticated
+using (
+  bucket_id = 'avatars'
+  and (storage.foldername(name))[1] = auth.uid()::text
+);
+```
+
+ด้วย policy แบบนี้ ไฟล์ที่ upload ไปที่ `avatars/user123/photo.png` จะเขียนได้และอ่านได้เฉพาะ user ที่ id เป็น `user123` เท่านั้น — เพราะ `name` (path เต็มของ object) ถูกเช็คกับ `auth.uid()` ทุก request เหมือนกับที่ RLS บน table อื่นกรอง row ตาม user ที่ request เข้ามาเป๊ะ ๆ
+
+<Mermaid title="ทุก request ของ Storage ถูกกรองด้วย RLS บน storage.objects mechanism เดียวกับ table RLS" code={storagePoliciesDiagram} />
+
+export const storagePoliciesDiagram = `flowchart LR
+  client["Client upload/download request"] --> api["Storage API"]
+  api --> objects[("storage.objects metadata row: bucket_id, name, owner")]
+  objects --> rls{"RLS policy: using / with check against auth.uid()"}
+  rls -->|allowed| data["Underlying object data returned or written"]
+  rls -->|denied| reject["403 rejected"]`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+Supabase Storage จัดไฟล์เป็น **bucket** ที่เป็นได้ทั้ง **public** (อ่านได้ทุกคนที่มี URL ผ่าน `getPublicUrl`) หรือ **private** (ถูกกรอง access ให้ผ่าน `createSignedUrl` ที่ time-limited) และเบื้องหลัง metadata ของทุก object ก็คือ row หนึ่งใน table **`storage.objects`** — access ถูกบังคับด้วย **Row Level Security policy** บน table นั้นล้วน ๆ ใช้ syntax `using`/`with check`/`auth.uid()` เดียวกับ table ที่ป้องกันด้วย RLS ตัวอื่น ๆ ทั่วไป มักจับคู่ path prefix แบบ `avatars/{user_id}/...` กับ user ที่ request เข้ามา
+</Callout>
+
+export const quizStoragePolicies = [
+  {
+    q: 'bucket แบบ public กับ private ใน Storage ต่างกันยังไง',
+    options: [
+      'ไม่ต่างกันเลย ทั้งคู่ต้อง authenticate เหมือนกัน',
+      'object ใน bucket แบบ public อ่านได้ทุกคนที่มี URL ส่วน private ต้องเช็ค access ทุก request',
+      'bucket แบบ private อัปโหลดได้อย่างเดียว ดาวน์โหลดไม่ได้เลย',
+      'bucket แบบ public เก็บได้แค่ text file เก็บรูปไม่ได้',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'สิ่งที่บังคับจริง ๆ ว่าใคร upload, read หรือ delete object ใน Storage ได้คืออะไร',
+    options: [
+      'permission list แบบ proprietary ที่เก็บนอก Postgres ทั้งหมด',
+      'Row Level Security policy บน table storage.objects mechanism เดียวกับ table อื่น ๆ',
+      'กฎตายตัวว่าคนอัปโหลดเท่านั้นที่ access ไฟล์ได้ ไม่มี policy เกี่ยวข้อง',
+      'Storage ไม่มี access control โดย default ทุก object เป็น public หมด',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'signed URL มีไว้ทำอะไร',
+    options: [
+      'ทำให้ private bucket กลายเป็น public แบบถาวร',
+      'URL ที่ time-limited ให้ access ชั่วคราวกับ object หนึ่งตัวใน private bucket',
+      'เข้ารหัสไฟล์ก่อน upload',
+      'เปลี่ยนชื่อไฟล์ใน bucket',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'policy ที่จำกัดให้ user จัดการได้แค่ folder avatar ของตัวเอง มักเทียบค่าอะไรกับ auth.uid()',
+    options: [
+      'flag public/private ของ bucket',
+      'ส่วนแรกของ path ของ object เช่นผ่าน storage.foldername(name)',
+      'HTTP method ของ request',
+      'ขนาดไฟล์เป็น byte',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="realtime-and-storage/storage-buckets-and-policies" questions={quizStoragePolicies} />
+
+<ProgressTracker client:visible id="realtime-and-storage/storage-buckets-and-policies" />

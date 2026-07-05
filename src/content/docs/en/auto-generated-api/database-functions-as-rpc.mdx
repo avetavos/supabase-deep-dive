@@ -1,0 +1,115 @@
+---
+title: 'Database Functions as RPC'
+description: 'How Postgres functions become callable RPC endpoints through PostgREST, why atomic operations belong in the database, and when to reach for rpc() instead of from().'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+A Postgres function is automatically exposed as a callable **RPC** endpoint, so logic that needs to run **atomically** or as multiple steps can live in the database instead of being composed from the client.
+
+## When a query is not enough
+
+`.from()` queries are great for direct table and view access, but some operations do not fit a single `select`/`insert`/`update`. Multi-step logic, logic that must run as one atomic unit, or logic you want to keep out of application code entirely, is often easier and safer to express as a Postgres function written in `plpgsql` or `sql`.
+
+```sql
+create function public.increment_view_count(post_id uuid)
+returns void
+language sql
+as $$
+  update public.posts
+  set view_count = view_count + 1
+  where id = post_id;
+$$;
+```
+
+## PostgREST exposes functions as `/rpc/<function_name>`
+
+Just like it does for tables, PostgREST introspects your schema for functions and exposes each one as a `POST` endpoint under `/rpc`:
+
+```bash
+POST /rest/v1/rpc/increment_view_count
+```
+
+From `supabase-js`, you call it with `.rpc()`, passing the function name and an object of argument names to values:
+
+```typescript
+const { data, error } = await supabase.rpc('increment_view_count', {
+  post_id: '3b8f1c1e-7f2e-4b7a-9c1a-8b2f6a2d9e10',
+});
+
+if (error) {
+  console.error('failed to increment view count:', error.message);
+}
+```
+
+## Why this beats a client-side read-then-write
+
+Imagine incrementing the same counter from the client instead: read the current `view_count`, add one, write it back. Under concurrent requests, two clients can read the same starting value before either writes, and one increment is silently lost — a classic race condition. The Postgres function above does the read and write in a single atomic `update` statement executed by the database itself, so concurrent calls never race each other.
+
+This is the general shape of when RPC earns its place: **`.from()` queries are for direct table/view access, and `.rpc()` is for functions** — custom logic, potentially multi-statement or transactional, that genuinely belongs inside the database. Reach for RPC when the logic needs that guarantee, not as a default replacement for ordinary queries.
+
+<Mermaid title="A Postgres function exposed as a callable RPC endpoint" code={rpcDiagram} />
+
+export const rpcDiagram = `flowchart LR
+  fn["create function increment_view_count(post_id uuid)"] --> introspect["PostgREST introspects functions"]
+  introspect --> endpoint["POST /rest/v1/rpc/increment_view_count"]
+  endpoint --> call["supabase.rpc('increment_view_count', { post_id })"]
+  call --> atomic["Single atomic UPDATE in Postgres"]`;
+
+<Callout title="The one-line takeaway">
+Postgres functions are automatically exposed by PostgREST as **RPC** endpoints under `/rpc/<function_name>`, callable from `supabase-js` with **`.rpc(name, args)`** — reach for RPC when logic needs to run **atomically** or as multiple steps inside the database (like an atomic counter increment, which avoids the race condition of a client-side read-then-write), while plain **`.from()`** stays the tool for direct table and view access.
+</Callout>
+
+export const quizRpcFunctions = [
+  {
+    q: 'How does a Postgres function become callable over the Data API?',
+    options: [
+      'You must manually register it in a separate routes file',
+      'PostgREST introspects the schema and exposes it automatically as a /rpc endpoint',
+      'Functions are never reachable over the API, only tables and views are',
+      'You must rewrite it as a REST controller in TypeScript first',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why is an atomic view-count increment a good candidate for an RPC function rather than a client-side read-then-write?',
+    options: [
+      'Because RPC calls are always faster over the network, regardless of logic',
+      'Because a single atomic UPDATE avoids the race condition where two concurrent reads see the same stale value before either writes back',
+      'Because .from() queries cannot update numeric columns at all',
+      'Because RPC functions are the only way to filter rows in Postgres',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What is the conceptual difference between .from() queries and .rpc() calls?',
+    options: [
+      'There is no difference, they are interchangeable in every case',
+      '.from() is for direct table/view access, while .rpc() calls custom functions, useful for logic that must live in the database',
+      '.rpc() can only be used for read operations, never writes',
+      '.from() is deprecated in favor of .rpc() for all queries',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'From supabase-js, how do you call a Postgres function named increment_view_count with an argument?',
+    options: [
+      'supabase.from("increment_view_count").call({ post_id })',
+      'supabase.rpc("increment_view_count", { post_id })',
+      'supabase.function("increment_view_count").run(post_id)',
+      'supabase.exec("increment_view_count(post_id)")',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="auto-generated-api/database-functions-as-rpc" questions={quizRpcFunctions} />
+
+<ProgressTracker client:visible id="auto-generated-api/database-functions-as-rpc" />

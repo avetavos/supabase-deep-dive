@@ -1,0 +1,115 @@
+---
+title: 'Database Functions as RPC'
+description: 'Postgres function กลายเป็น RPC endpoint ที่เรียกได้ผ่าน PostgREST อย่างไร ทำไม atomic operation ควรอยู่ในฐานข้อมูล และเมื่อไรควรใช้ rpc() แทน from()'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+Postgres function ถูก expose เป็น endpoint แบบ **RPC** ที่เรียกได้ให้อัตโนมัติ ดังนั้น logic ที่ต้องรันแบบ **atomic** หรือเป็นหลายขั้นตอนสามารถอยู่ในฐานข้อมูลแทนที่จะประกอบขึ้นฝั่ง client
+
+## เมื่อ query อย่างเดียวไม่พอ
+
+query `.from()` เหมาะกับการเข้าถึง table และ view ตรง ๆ แต่บาง operation ไม่เข้ากับ `select`/`insert`/`update` เดี่ยว ๆ logic ที่มีหลายขั้นตอน logic ที่ต้องรันเป็น unit เดียวแบบ atomic หรือ logic ที่อยากเก็บไว้นอก application code เลย มักจะเขียนเป็น Postgres function ด้วยภาษา `plpgsql` หรือ `sql` ได้ง่ายและปลอดภัยกว่า
+
+```sql
+create function public.increment_view_count(post_id uuid)
+returns void
+language sql
+as $$
+  update public.posts
+  set view_count = view_count + 1
+  where id = post_id;
+$$;
+```
+
+## PostgREST expose function เป็น `/rpc/<function_name>`
+
+เหมือนที่ทำกับ table PostgREST introspect schema หา function แล้ว expose แต่ละตัวเป็น endpoint แบบ `POST` ภายใต้ `/rpc`
+
+```bash
+POST /rest/v1/rpc/increment_view_count
+```
+
+จาก `supabase-js` เรียกผ่าน `.rpc()` โดยส่งชื่อ function พร้อม object ของชื่อ argument กับค่า
+
+```typescript
+const { data, error } = await supabase.rpc('increment_view_count', {
+  post_id: '3b8f1c1e-7f2e-4b7a-9c1a-8b2f6a2d9e10',
+});
+
+if (error) {
+  console.error('failed to increment view count:', error.message);
+}
+```
+
+## ทำไมวิธีนี้ดีกว่า read-then-write ฝั่ง client
+
+ลองนึกภาพว่าเพิ่ม counter ตัวเดียวกันนี้จากฝั่ง client แทน อ่านค่า `view_count` ปัจจุบัน บวกหนึ่ง แล้วเขียนกลับ ถ้ามี request พร้อมกัน client สองตัวอาจอ่านค่าตั้งต้นเดียวกันก่อนที่ตัวไหนจะเขียนกลับ ทำให้การเพิ่มค่าหนึ่งครั้งหายไปเงียบ ๆ — เป็น race condition แบบคลาสสิก ส่วน Postgres function ด้านบนทำทั้งอ่านและเขียนในคำสั่ง `update` เดียวแบบ atomic ที่ database รันเอง ทำให้ request พร้อมกันไม่มีทาง race กัน
+
+นี่คือภาพรวมว่า RPC คุ้มค่าตอนไหน **`.from()` query เหมาะกับการเข้าถึง table/view ตรง ๆ ส่วน `.rpc()` เหมาะกับ function** — logic เฉพาะทางที่อาจมีหลาย statement หรือต้องเป็น transaction ซึ่งควรอยู่ในฐานข้อมูลจริง ๆ ใช้ RPC เมื่อ logic ต้องการ guarantee แบบนี้ ไม่ใช่ใช้แทน query ธรรมดาเป็น default
+
+<Mermaid title="Postgres function ที่ expose เป็น RPC endpoint ที่เรียกได้" code={rpcDiagram} />
+
+export const rpcDiagram = `flowchart LR
+  fn["create function increment_view_count(post_id uuid)"] --> introspect["PostgREST introspects functions"]
+  introspect --> endpoint["POST /rest/v1/rpc/increment_view_count"]
+  endpoint --> call["supabase.rpc('increment_view_count', { post_id })"]
+  call --> atomic["Single atomic UPDATE in Postgres"]`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+Postgres function ถูก PostgREST expose ให้อัตโนมัติเป็น endpoint แบบ **RPC** ภายใต้ `/rpc/<function_name>` เรียกได้จาก `supabase-js` ด้วย **`.rpc(name, args)`** — ใช้ RPC เมื่อ logic ต้องรันแบบ **atomic** หรือเป็นหลายขั้นตอนในฐานข้อมูล (เช่น เพิ่ม counter แบบ atomic ที่หลีกเลี่ยง race condition ของ read-then-write ฝั่ง client) ส่วน **`.from()`** ธรรมดายังคงเป็นเครื่องมือสำหรับเข้าถึง table และ view ตรง ๆ
+</Callout>
+
+export const quizRpcFunctions = [
+  {
+    q: 'Postgres function กลายเป็นเรียกได้ผ่าน Data API ได้อย่างไร',
+    options: [
+      'ต้อง register เองในไฟล์ route แยกต่างหาก',
+      'PostgREST introspect schema แล้ว expose ให้เป็น /rpc endpoint อัตโนมัติ',
+      'function ไม่มีทางเรียกผ่าน API ได้ มีแค่ table และ view เท่านั้น',
+      'ต้องเขียนใหม่เป็น REST controller ด้วย TypeScript ก่อน',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไมการเพิ่ม view-count แบบ atomic ถึงเหมาะกับ RPC function มากกว่า read-then-write ฝั่ง client',
+    options: [
+      'เพราะ RPC call เร็วกว่าผ่าน network เสมอ ไม่ว่า logic จะเป็นอะไร',
+      'เพราะคำสั่ง UPDATE แบบ atomic เดียวหลีกเลี่ยง race condition ที่การอ่านพร้อมกันสองครั้งเห็นค่าเก่าเดียวกันก่อนที่ตัวไหนจะเขียนกลับ',
+      'เพราะ query .from() อัปเดต column ตัวเลขไม่ได้เลย',
+      'เพราะ RPC function เป็นวิธีเดียวที่ filter row ใน Postgres ได้',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ความต่างเชิงแนวคิดระหว่าง query .from() กับการเรียก .rpc() คืออะไร',
+    options: [
+      'ไม่ต่างกันเลย ใช้แทนกันได้ทุกกรณี',
+      '.from() เข้าถึง table/view ตรง ๆ ส่วน .rpc() เรียก function ที่เขียนเอง เหมาะกับ logic ที่ต้องอยู่ในฐานข้อมูล',
+      '.rpc() ใช้ได้แค่ operation อ่านอย่างเดียว เขียนไม่ได้',
+      '.from() ถูก deprecate ให้ใช้ .rpc() แทนในทุก query',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'จาก supabase-js เรียก Postgres function ชื่อ increment_view_count พร้อม argument อย่างไร',
+    options: [
+      'supabase.from("increment_view_count").call({ post_id })',
+      'supabase.rpc("increment_view_count", { post_id })',
+      'supabase.function("increment_view_count").run(post_id)',
+      'supabase.exec("increment_view_count(post_id)")',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="auto-generated-api/database-functions-as-rpc" questions={quizRpcFunctions} />
+
+<ProgressTracker client:visible id="auto-generated-api/database-functions-as-rpc" />

@@ -1,0 +1,113 @@
+---
+title: 'สถาปัตยกรรมของ Supabase'
+description: 'ทุก request พก Postgres role (anon, authenticated หรือ service_role) มายังไง ทำไม PostgREST ไม่ enforce อะไรเอง และ Auth, Storage, Realtime เกี่ยวข้องกับ database เดียวกันยังไง'
+sidebar:
+  order: 5
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+ทุก request ที่เข้ามาที่ auto-generated API ของ Supabase จะไปถึง Postgres พร้อมพก **Postgres role** ตัวใดตัวหนึ่งเสมอ — `anon`, `authenticated` หรือ `service_role` — และ role นี้แหละคือแกนหลักทางสถาปัตยกรรมที่ทุกอย่างอื่น (Data API, Row Level Security) สร้างต่อยอดขึ้นมา
+
+## ทุก request พก role มาด้วย
+
+auto-generated API ของ Supabase authenticate ทุก request หรือไม่ก็ปฏิบัติกับมันแบบ anonymous อย่างชัดเจน ไม่ว่าจะเป็นแบบไหน request จะไปถึง Postgres ในฐานะหนึ่งในสาม role นี้
+
+- **`anon`** — request ที่ไม่ได้ authenticate ไม่มี user login อยู่
+- **`authenticated`** — request จาก user ที่ login แล้ว พก JWT claim มาด้วย รวมถึง `auth.uid()` สำหรับระบุว่าเป็น user คนไหน
+- **`service_role`** — server-side code ที่เชื่อถือได้ role นี้ **bypass Row Level Security ทั้งหมด** เป็น key ตัวเดียวกับที่คุณเจอในบทก่อนหน้า
+
+```sql
+-- Inside a Row Level Security policy, this is exactly how you tell roles apart.
+create policy "Users can view their own profile"
+on public.profiles
+for select
+to authenticated
+using (auth.uid() = id);
+```
+
+## PostgREST แปล HTTP เป็น SQL มันไม่ enforce อะไรเอง
+
+**PostgREST** คือ service ที่แปล HTTP request แบบ `GET /rest/v1/profiles?select=*` ให้กลายเป็น SQL query จริง แล้วรัน query นั้น **ในฐานะ role ที่ request นั้นพกมา** จุดนี้สำคัญกว่าที่มันดูเผิน ๆ PostgREST ไม่ได้ implement authorization system แยกของตัวเองเลย มันพึ่งพา access control ของ Postgres เองทั้งหมด — permission แบบ `grant`/`revoke` ธรรมดา และ policy **Row Level Security** — เพื่อตัดสินว่า role นั้นทำอะไรได้จริงบ้าง access control อยู่ที่ database ไม่ใช่ที่ API layer ที่อยู่ด้านหน้า
+
+```typescript
+// This client call becomes an HTTP request to PostgREST, executed as
+// whatever role the current session carries (anon or authenticated).
+const { data, error } = await supabase
+  .from('profiles')
+  .select('id, username')
+  .eq('id', userId);
+```
+
+## service อื่น ๆ ก็แค่อ่านเขียน Postgres เหมือนกัน
+
+Auth, Storage และ Realtime เป็น service แยก (process แยก) แต่ไม่มีตัวไหนสร้าง storage layer ของตัวเองขึ้นมาใหม่เลย ทุกตัวสุดท้ายอ่านเขียน Postgres database เดียวกันนี้
+
+- **Auth (GoTrue)** จัดการ schema `auth` — `auth.users`, session และ table ที่เกี่ยวข้อง
+- **Storage** จัดการ metadata table ของตัวเอง (bucket, object, permission) ใน schema `storage` ตัวไฟล์จริงอยู่ใน object store แต่ access rule เป็น row ใน Postgres
+- **Realtime** อ่าน write-ahead log (WAL) ของ Postgres เพื่อ stream การเปลี่ยนแปลงของ row นอกเหนือจากการมี broadcast/presence channel แบบ ephemeral ให้ใช้
+
+<Mermaid title="role ของ request เดินทางผ่าน PostgREST เข้า Postgres service อื่นใช้ database เดียวกัน" code={architectureDiagram} />
+
+export const architectureDiagram = `flowchart LR
+  client["Client request (anon / authenticated / service_role)"] --> postgrest["PostgREST"]
+  postgrest -->|"executes SQL as that role"| pg[("Postgres\n(grants + RLS enforced here)")]
+  auth["Auth (GoTrue)"] --> pg
+  storage["Storage"] --> pg
+  realtime["Realtime (reads WAL)"] --> pg`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+ทุก request พก **Postgres role** มาด้วยเสมอ — `anon` สำหรับ request ที่ไม่ได้ authenticate, `authenticated` สำหรับ user ที่ login แล้ว (มี `auth.uid()` ใช้ได้) และ `service_role` สำหรับ server code ที่เชื่อถือได้ซึ่ง bypass **Row Level Security** **PostgREST** แปล HTTP เป็น SQL แล้วรันในฐานะ role นั้น แต่ไม่ enforce อะไรเอง access control อยู่ที่ grant และ RLS policy ของ Postgres ทั้งหมด **Auth**, **Storage** และ **Realtime** เป็น service แยกกัน แต่สุดท้ายทุกตัวอ่านเขียน Postgres database เดียวกันนี้
+</Callout>
+
+export const quizArchitecture = [
+  {
+    q: 'request ที่ไม่ได้ authenticate ใช้ Postgres role ไหน',
+    options: [
+      'service_role',
+      'authenticated',
+      'anon',
+      'ไม่มี role เลย request ที่ไม่ได้ authenticate ถูกปฏิเสธก่อนถึง Postgres',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'access control ของ auto-generated API ใน Supabase ถูก enforce อยู่ที่ไหนจริง ๆ',
+    options: [
+      'อยู่ใน PostgREST ซึ่งมี authorization engine เป็นของตัวเองแยกต่างหาก',
+      'อยู่ใน Postgres เอง ผ่าน grant และ Row Level Security policy',
+      'อยู่ใน supabase-js client library',
+      'ไม่มีการ enforce ที่ไหนเลย อาศัยความไม่รู้ของผู้โจมตี',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'server-side code ที่เชื่อถือได้ใช้ role ไหนเพื่อ bypass Row Level Security',
+    options: [
+      'anon',
+      'authenticated',
+      'service_role',
+      'admin',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'Auth, Storage และ Realtime เกี่ยวข้องกับ Postgres database ข้างล่างยังไง',
+    options: [
+      'เป็นระบบที่แยกกันเด็ดขาด แต่ละตัวมี database ของตัวเอง',
+      'เป็น service แยกกัน แต่สุดท้ายทุกตัวอ่านเขียน Postgres database เดียวกัน (schema auth, schema storage และ write-ahead log)',
+      'มีแค่ Auth เท่านั้นที่แตะ Postgres ส่วน Storage กับ Realtime ไม่แตะ',
+      'ทั้งสามตัวแทนที่ Postgres ไปเลยสำหรับข้อมูลของตัวเอง',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="foundations/the-supabase-architecture" questions={quizArchitecture} />
+
+<ProgressTracker client:visible id="foundations/the-supabase-architecture" />

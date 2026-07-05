@@ -1,0 +1,119 @@
+---
+title: 'Securing the Data API'
+description: 'โมเดล security สองชั้นของ Supabase API — Data API exposure ที่ตัดสินว่า table หรือ function เข้าถึงได้เลยไหม กับ Row Level Security ที่ตัดสินว่า request ที่เข้าถึงได้เห็น row ไหนบ้าง'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+table หรือ function ต้องผ่าน **สองด่านแยกกัน** ก่อนที่ request จะทั้งปลอดภัยและสำเร็จ **Data API exposure** ตัดสินว่ามันเข้าถึงผ่าน API ได้เลยไหม ส่วน **Row Level Security** ตัดสินว่า request ที่เข้าถึงได้แล้วเห็นหรือแก้ row ไหนได้บ้าง
+
+## ด่านที่ 1 — Data API exposure
+
+tutorial เก่า ๆ ของ Supabase หลายอันเล่าแค่เรื่อง RLS เหมือนมันคือทั้งหมด แต่ไม่ใช่ ก่อนที่ RLS จะถูกประเมินด้วยซ้ำ Postgres ต้อง grant สิทธิ์ให้ role ที่ request เข้ามา — `anon`, `authenticated` หรือ `service_role` — ให้แตะต้อง table หรือ function นั้นได้ก่อน ในโปรเจกต์ Supabase ปัจจุบัน ขั้นตอนนี้ไม่ได้เกิดขึ้นอัตโนมัติ คุณต้อง expose table และ function ที่ต้องการไว้ในหน้า **Integrations → Data API** ของ dashboard หรือเปิด **Default privileges for new entities** เพื่อให้ object ใหม่ที่สร้างใน schema `public` ได้สิทธิ์เข้าถึงไปเรื่อย ๆ
+
+เบื้องหลังคือคำสั่ง `grant` ธรรมดาของ Postgres
+
+```sql
+-- Table grants: what each role is allowed to attempt
+grant select on public.your_table to anon;
+grant select, insert, update, delete on public.your_table to authenticated;
+grant all on public.your_table to service_role;
+
+-- Function grants: who may call this RPC endpoint
+grant execute on function public.your_function to authenticated, service_role;
+```
+
+ถ้า role ไหนไม่มี `grant` บน table นั้นเลย table นั้นจะมองไม่เห็นสำหรับ role นั้นผ่าน Data API — request จะล้มเหลวก่อนที่ RLS จะถูกเช็คด้วยซ้ำ ไม่ว่า RLS policy ของคุณจะหลวมแค่ไหนก็ตาม นี่คือด่านระดับ **table/function** ที่ตอบคำถามว่า "role นี้แตะ object นี้ได้เลยไหม" ไม่ใช่ "เห็น row ไหนบ้าง"
+
+## ด่านที่ 2 — Row Level Security
+
+เมื่อ table ผ่านด่าน exposure แล้ว **Row Level Security** (RLS) จะเข้ามาทำงานต่อและตอบคำถามที่แคบลง สำหรับ request ที่เข้ามาในนาม `anon`, `authenticated` หรือ user ที่ authenticated ตัวใดตัวหนึ่ง มันเห็นหรือแก้ **row** ไหนได้บ้าง RLS policy เป็นหัวข้อของ module ถัดไปทั้งหมด ดังนั้นสิ่งที่ต้องจำจากบทนี้คือแค่เส้นแบ่งระหว่างสองชั้นนี้
+
+- **Data API exposure** — ระดับ table/function object นี้เข้าถึงผ่าน API ได้เลยไหม
+- **Row Level Security** — ระดับ row ในเมื่อเข้าถึงได้แล้ว request นี้เห็น row ไหนบ้าง
+
+ทั้งสองต้อง config ให้ถูกทั้งคู่ มี exposure แต่ไม่มี RLS หมายความว่า table ที่เข้าถึงได้ทางเทคนิคจะคืนทุก row ให้ใครก็ตามที่ได้สิทธิ์เข้าถึง มี RLS แต่ไม่มี exposure หมายความว่า policy ที่ scope ไว้ถูกต้องแล้วจะไม่มี request ไหนไปถึงมันได้เลย เพราะ table ไม่เคยถูก expose ตั้งแต่แรก
+
+```sql
+-- Layer 2 lives on the table once it clears layer 1
+alter table public.your_table enable row level security;
+
+create policy "users read their own rows"
+on public.your_table
+for select
+to authenticated
+using (auth.uid() = user_id);
+```
+
+## `service_role` ข้าม RLS ไปเลยทั้งหมด
+
+Postgres จะข้าม row level security ให้ role ใดก็ตามที่มี attribute `BYPASSRLS` และ `service_role` มี attribute นี้ request ที่ authenticate ด้วย `service_role` key ยังต้องผ่านด่าน 1 อยู่ (ต้องมี grant รองรับ แม้ปกติ `service_role` จะได้สิทธิ์กว้างอยู่แล้ว) แต่พอผ่านแล้ว RLS policy จะไม่ถูกใช้กับมันเลย มันเห็นและแก้ได้ทุก row นี่คือเหตุผลที่ `service_role` key ต้องไม่หลุดไปอยู่ใน browser หรือ mobile client เด็ดขาด สอดคล้องกับคำเตือนจาก module Foundations key นี้มีไว้สำหรับโค้ดฝั่ง server ที่เชื่อถือได้เท่านั้น ที่คุณต้อง enforce กฎการเข้าถึงเองแทนที่จะพึ่ง RLS
+
+<Mermaid title="Request ที่ผ่านด่าน exposure แล้วต่อด้วย RLS" code={securityLayersDiagram} />
+
+export const securityLayersDiagram = `flowchart TB
+  req["Incoming request as anon, authenticated, or service_role"] --> gate1{"Layer 1: Data API exposure — is the table/function reachable at all?"}
+  gate1 -- "no grant" --> reject1["Rejected: not reachable"]
+  gate1 -- "granted" --> role{"Role has BYPASSRLS?"}
+  role -- "yes (service_role)" --> allrows["All rows visible, RLS skipped entirely"]
+  role -- "no" --> gate2{"Layer 2: Row Level Security — which rows?"}
+  gate2 -- "no matching policy" --> reject2["Rejected: no rows returned/modified"]
+  gate2 -- "policy matches" --> scoped["Only matching rows visible/modifiable"]`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+security ของ Data API ใน Supabase มี **สองชั้น** ไม่ใช่ชั้นเดียว **Data API exposure** — ผ่านหน้า dashboard **Integrations → Data API** "Default privileges for new entities" หรือคำสั่ง `grant` ธรรมดาของ Postgres ให้ `anon`/`authenticated`/`service_role` — เป็นด่านระดับ table/function ที่ตัดสินว่า object นั้นเข้าถึงผ่าน API ได้ **เลยไหม** และเมื่อ request ผ่านด่านนั้นแล้วเท่านั้น **Row Level Security** ถึงจะตัดสินว่ามันเห็นหรือแก้ **row** ไหนได้บ้าง `service_role` มี attribute `BYPASSRLS` และข้าม RLS ไปทั้งหมด นี่คือเหตุผลที่ key ตัวนี้ต้องอยู่ฝั่ง server เท่านั้น
+</Callout>
+
+export const quizSecuringApi = [
+  {
+    q: 'ชั้น Data API exposure ควบคุมอะไรจริง ๆ',
+    options: [
+      'ควบคุม row แต่ละแถวที่ request เห็นได้ เหมือนที่ RLS ควบคุม',
+      'ควบคุมว่า table หรือ function เข้าถึงผ่าน API ได้เลยไหม แยกออกจาก RLS',
+      'นโยบายรหัสผ่านของ authenticated user',
+      'กฎ firewall ระดับ network ของ port Postgres',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ถ้า table มี RLS policy ที่หลวมมาก แต่ไม่มี grant ให้ role authenticated เลย จะเกิดอะไรขึ้น',
+    options: [
+      'RLS policy ยังทำงานอยู่ และ authenticated user อ่าน row ที่ตรงเงื่อนไขได้',
+      'request จะไม่ไปถึงจุดที่ประเมิน RLS เลย เพราะ table เข้าถึงไม่ได้ตั้งแต่แรก',
+      'Supabase จะ grant สิทธิ์ให้อัตโนมัติตาม RLS policy ที่มีอยู่',
+      'table จะอ่านได้แค่จาก anon เท่านั้น ไม่ใช่จาก authenticated',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไม request ที่ใช้ service_role key ถึงข้าม Row Level Security ไปทั้งหมด',
+    options: [
+      'เพราะ request จาก service_role ถูกปฏิเสธก่อนถึง RLS เสมอ',
+      'เพราะ service_role มี attribute BYPASSRLS ซึ่ง Postgres เคารพด้วยการข้ามการเช็ค RLS ให้ role นั้น',
+      'เพราะ RLS ใช้กับ role anon เท่านั้น ไม่ใช้กับ service_role หรือ authenticated',
+      'เพราะ service_role ไม่ผ่านด่าน Data API exposure โดยอัตโนมัติ',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไม config แค่ Row Level Security อย่างเดียวถึงไม่พอ',
+    options: [
+      'RLS ถูก deprecate แล้วและไม่ถูก enforce ในโปรเจกต์ Supabase ปัจจุบัน',
+      'เพราะ RLS ตัดสินแค่ว่า row ไหนมองเห็นได้ สำหรับ request ที่ผ่านด่าน Data API exposure แยกต่างหากมาแล้ว ดังนั้น table ที่ไม่เคย expose จะเข้าถึงไม่ได้เลยไม่ว่า policy จะเป็นอย่างไร',
+      'RLS กับ Data API exposure คือ setting เดียวกันแค่เรียกชื่อต่างกัน',
+      'เพราะ RLS policy เขียนได้แค่ด้วย plpgsql เท่านั้น เขียนด้วย SQL ธรรมดาไม่ได้',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="auto-generated-api/securing-the-data-api" questions={quizSecuringApi} />
+
+<ProgressTracker client:visible id="auto-generated-api/securing-the-data-api" />

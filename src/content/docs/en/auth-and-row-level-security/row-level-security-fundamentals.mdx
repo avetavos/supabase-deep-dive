@@ -1,0 +1,107 @@
+---
+title: 'Row Level Security Fundamentals'
+description: 'How Postgres row level security policies work, why RLS is never on by default, and what using and with check actually control.'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+**Row Level Security (RLS)** is a native Postgres feature that attaches policies to a table so Postgres itself filters which rows a given role can read or write on every query — it is never something your application code has to remember to add as a `where` clause.
+
+## RLS is off until you turn it on
+
+A brand new Postgres table has RLS **disabled**. Nothing is filtered, and any role with a `grant` on the table can see and modify every row. You have to explicitly enable it:
+
+```sql
+alter table public.todos enable row level security;
+```
+
+Here is the part that catches almost everyone the first time: once RLS is enabled on a table with **zero policies defined**, that table becomes **completely inaccessible** to the `anon` and `authenticated` roles — not "open by default," but deny-by-default. If you run only the `alter table ... enable row level security` statement above and then query `todos` through the API, you will get back nothing (or a permission error), and it will look like something broke. Nothing broke — RLS with no policies means no role can see or touch any row until you add a policy that says otherwise. Every table you enable RLS on needs at least one policy per operation you actually want to allow.
+
+## Policy anatomy: using vs with check
+
+A policy is created with `create policy`, scoped to a table and one or more operations (`select`, `insert`, `update`, `delete`, or `all`):
+
+```sql
+create policy "Users can view their own todos"
+on public.todos
+for select
+using (auth.uid() = user_id);
+
+create policy "Users can insert their own todos"
+on public.todos
+for insert
+with check (auth.uid() = user_id);
+```
+
+`using` controls **which existing rows are visible** for `select`, `update`, and `delete` — think of it as the filter applied to rows already in the table. `with check` controls **whether a new or modified row is allowed to be written** — it applies to `insert` and `update`, checking the row as it would exist *after* the write. A table can (and often should) define both: `using` to decide what an update can see and touch, `with check` to decide what the updated row is allowed to look like once written.
+
+## auth.uid(): the building block
+
+`auth.uid()` is a Postgres function Supabase provides that extracts the current request's authenticated user ID straight from the JWT covered in the previous lesson. It is by far the most common expression inside real-world RLS policies, because "does this row belong to the current user" is by far the most common access rule an application needs.
+
+<Mermaid title="A query is filtered per row by the matching policy" code={rlsFundamentalsDiagram} />
+
+export const rlsFundamentalsDiagram = `flowchart LR
+  req["Query arrives as anon/authenticated role"] --> pg[("Postgres evaluates RLS")]
+  pg --> using["using: filters existing rows (select/update/delete)"]
+  pg --> check["with check: validates new/modified rows (insert/update)"]
+  using --> result["Only matching rows returned or written"]
+  check --> result`;
+
+<Callout title="The one-line takeaway">
+**Row Level Security is never on by default** — you must run `alter table your_table enable row level security;` explicitly, and once it is on with **zero policies**, the table is completely locked down to `anon`/`authenticated` until you add policies (deny-by-default, not open-by-default). A policy's **`using`** clause filters which existing rows are visible for select/update/delete, its **`with check`** clause validates what a new or modified row is allowed to look like for insert/update, and **`auth.uid()`** — reading the user ID straight out of the request's JWT — is the building block nearly every real policy is written around.
+</Callout>
+
+export const quizRlsFundamentals = [
+  {
+    q: 'Is Row Level Security enabled by default on a new Postgres table?',
+    options: [
+      'Yes, every table has RLS enabled automatically',
+      'No, RLS must be explicitly enabled with alter table ... enable row level security',
+      'Only for tables in the public schema',
+      'Only if the table has a primary key',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What happens when RLS is enabled on a table that has zero policies defined?',
+    options: [
+      'The table becomes fully open to every role',
+      'The table becomes completely inaccessible to anon and authenticated roles until at least one policy is added',
+      'Postgres automatically deletes the table',
+      'RLS silently does nothing until a policy is added',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What is the difference between using and with check in a policy?',
+    options: [
+      'They are interchangeable and do the same thing',
+      'using filters which existing rows are visible for select/update/delete, while with check validates whether a new or modified row is allowed to be written',
+      'using only applies to insert, with check only applies to select',
+      'with check is deprecated in favor of using',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does auth.uid() return inside a Postgres RLS policy?',
+    options: [
+      'The name of the current database',
+      'The authenticated user ID extracted from the current request JWT',
+      'A random UUID generated per query',
+      'The Supabase project ID',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="auth-and-row-level-security/row-level-security-fundamentals" questions={quizRlsFundamentals} />
+
+<ProgressTracker client:visible id="auth-and-row-level-security/row-level-security-fundamentals" />

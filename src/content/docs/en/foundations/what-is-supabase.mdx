@@ -1,0 +1,131 @@
+---
+title: 'What Is Supabase'
+description: 'Supabase as an open-source Backend as a Service built on real Postgres, the core services it bundles, and how it differs from Firebase and rolling your own backend.'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+Supabase is an open-source **Backend as a Service** built around a real, unmodified **Postgres** database — you get an auto-generated API, auth, storage, and realtime for free, but the core is still plain Postgres you can query with plain SQL any time you want.
+
+## Postgres first, services second
+
+If you built a backend from scratch, you would end up writing an authentication service, some kind of query API, a realtime layer for pushing live updates, and a file storage service — on top of whatever database you chose. Supabase's pitch is that it gives you all of that already built, wired together, and running against **a database you fully own and can query directly**.
+
+That last part is the important distinction from Firebase. Firebase's Firestore is a proprietary, schemaless NoSQL document store — your data model and your queries are locked into Firebase's specific API shape, and there is no SQL escape hatch. Supabase is the opposite bet: the database is standard Postgres, so:
+
+- You can connect with `psql`, any Postgres driver, or any ORM that speaks Postgres.
+- Your schema is relational tables, foreign keys, and constraints — not implicit document shapes.
+- If you ever need to leave Supabase, you can `pg_dump` your database and run it anywhere Postgres runs.
+
+```sql
+-- This is just Postgres. No proprietary query language, no vendor-specific data model.
+select id, username, created_at
+from public.profiles
+where created_at > now() - interval '7 days'
+order by created_at desc;
+```
+
+## The core services at a glance
+
+One Supabase project is one Postgres database plus a set of managed services layered around it. Each of these gets its own module later in this course, so keep this as an orientation map, not the deep dive:
+
+- **Postgres database** — the actual data store, plain SQL, full relational features.
+- **Auto-generated API** — a REST/RPC API via **PostgREST**, and a GraphQL API via **pg_graphql**, generated directly from your schema.
+- **Auth (GoTrue)** — user sign-up, sign-in, session management, and social/SSO providers.
+- **Storage** — an S3-compatible object store for files, with its own access policies.
+- **Realtime** — subscribe to database changes, or use ephemeral broadcast/presence channels, over WebSockets.
+- **Edge Functions** — custom server-side logic written in TypeScript, running on Deno at the edge.
+
+All of it is configurable from the **Supabase Studio** dashboard (a web GUI) or from the **Supabase CLI**, which you will set up in the next lesson.
+
+```typescript
+import { createClient } from '@supabase/supabase-js';
+
+const supabase = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_ANON_KEY!
+);
+
+// Under the hood this is a PostgREST request against the profiles table.
+const { data, error } = await supabase
+  .from('profiles')
+  .select('id, username, created_at')
+  .order('created_at', { ascending: false });
+```
+
+<Mermaid title="One Postgres database with services layered around it" code={whatIsSupabaseDiagram} />
+
+export const whatIsSupabaseDiagram = `flowchart TB
+  pg[("Postgres database")]
+  api["REST/RPC API (PostgREST) + GraphQL (pg_graphql)"]
+  auth["Auth (GoTrue)"]
+  storage["Storage"]
+  realtime["Realtime"]
+  functions["Edge Functions (Deno)"]
+  api --> pg
+  auth --> pg
+  storage --> pg
+  realtime --> pg
+  functions --> pg`;
+
+## Why not just roll your own?
+
+Nothing here is magic you could not build yourself — PostgREST, GoTrue, and the rest are open-source projects you could self-host individually. What Supabase actually saves you is the integration work: one project, one set of credentials, one dashboard, and services that already know how to talk to each other and to the same Postgres instance. You still write the schema, the SQL, and the access rules — Supabase just removes the plumbing around them.
+
+<Callout title="The one-line takeaway">
+Supabase is **Postgres plus a set of services layered around it** — a REST/RPC API (PostgREST) and GraphQL API (pg_graphql), **Auth**, **Storage**, **Realtime**, and **Edge Functions** — all managed through **Studio** or the **CLI**, and unlike Firebase, the underlying data model is always plain, portable, queryable Postgres.
+</Callout>
+
+export const quizWhatIsSupabase = [
+  {
+    q: 'What is Supabase fundamentally built on?',
+    options: [
+      'A proprietary NoSQL document database',
+      'A real, unmodified Postgres database with services layered around it',
+      'A custom query language with no relational model',
+      'A managed queue system with no persistent storage',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'How does Supabase differ from Firebase in terms of the data model?',
+    options: [
+      'They are identical, both use proprietary document stores',
+      'Supabase uses standard, portable Postgres you can query with SQL; Firebase uses a proprietary NoSQL model',
+      'Supabase has no database at all',
+      'Firebase is built on Postgres and Supabase is not',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which of these is NOT one of the core services bundled with a Supabase project?',
+    options: [
+      'Auto-generated REST/RPC API and GraphQL API',
+      'Auth for authentication',
+      'A proprietary mobile app store for distributing client apps',
+      'Realtime and Storage',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'Where can you configure and manage the services in a Supabase project?',
+    options: [
+      'Only by editing raw Postgres configuration files by hand',
+      'Through the Supabase Studio dashboard or the Supabase CLI',
+      'There is no way to configure them, they are fixed',
+      'Only through a third-party paid add-on',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="foundations/what-is-supabase" questions={quizWhatIsSupabase} />
+
+<ProgressTracker client:visible id="foundations/what-is-supabase" />
