@@ -1,6 +1,6 @@
 ---
 title: 'การเขียนและ Invoke Function'
-description: 'ฟังก์ชัน Deno.serve แบบพื้นฐาน การเรียกมันจาก supabase-js และการจัดการ secrets สำหรับ local กับ deployed environment'
+description: 'ฟังก์ชัน Deno.serve แบบพื้นฐาน การเรียกใช้จาก supabase-js และการจัดการ secrets สำหรับ local กับ deployed environment'
 sidebar:
   order: 2
 ---
@@ -10,7 +10,7 @@ import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
-## แนวคิดในหนึ่งประโยค
+## ไอเดียในหนึ่งประโยค
 
 Edge Function คือ `Deno.serve` handler ธรรมดาที่รับ HTTP request แล้วคืน response กลับไป เรียกใช้จาก client ด้วย `supabase.functions.invoke()`
 
@@ -31,7 +31,7 @@ Deno.serve(async (req) => {
 
 ## การเรียกใช้จาก client
 
-`supabase-js` มี method `functions.invoke()` แยกออกมาแทนที่จะใช้ `fetch` เปล่า ๆ เพราะมันทำงานที่เป็นประโยชน์ให้อัตโนมัติ
+`supabase-js` มี method `functions.invoke()` แยกออกมาแทนที่จะใช้ `fetch` เปล่า ๆ เพราะทำงานที่เป็นประโยชน์ให้อัตโนมัติ
 
 ```typescript
 const { data, error } = await supabase.functions.invoke('hello-world', {

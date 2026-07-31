@@ -16,9 +16,9 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ทำไม column ของ RLS policy ถึงเป็นเป้าหมาย indexing พิเศษ
 
-Row Level Security policy ไม่ใช่อะไรที่รันแค่ครั้งเดียวต่อ query — Postgres evaluate condition ของมันกับทุก row ที่มีโอกาสถูก return ในทุก query ของทุก user policy อย่าง `auth.uid() = user_id` ดูเหมือนเป็นการเช็คบรรทัดเดียวที่ไม่มีพิษภัย แต่ถ้า `user_id` ไม่มี index Postgres ก็ไม่มีทางกระโดดตรงไปยัง row ที่ match ได้ มันต้องเดินอ่านทั้ง table แล้ว evaluate policy condition ทีละ row
+Row Level Security policy ไม่ใช่อะไรที่รันแค่ครั้งเดียวต่อ query — Postgres evaluate condition ของตัวเองกับทุก row ที่มีโอกาสถูก return ในทุก query ของทุก user policy อย่าง `auth.uid() = user_id` ดูเหมือนเป็นการเช็คบรรทัดเดียวที่ไม่มีพิษภัย แต่ถ้า `user_id` ไม่มี index Postgres ก็ไม่มีทางกระโดดตรงไปยัง row ที่ match ได้ ต้องเดินอ่านทั้ง table แล้ว evaluate policy condition ทีละ row
 
-ส่วนที่อันตรายคือมันจะยังมองไม่เห็นไปอีกนาน table ที่มีแค่ไม่กี่ร้อย row sequential scan กับ index scan จะรู้สึกเร็วเท่ากันทั้งคู่ และ query ก็ "ดูเหมือน" simple เพราะมันคือ `select` บรรทัดเดียวที่ไม่มีความซับซ้อนให้เห็น ต้นทุนนี้จะโผล่มาก็ตอนที่ table โตไปถึงหลักหมื่นหรือหลักแสน row ซึ่งตอนนั้นมันกลายเป็น production incident ไปแล้ว ไม่ใช่แค่ comment ใน code review
+ส่วนที่อันตรายคือปัญหานี้จะยังมองไม่เห็นไปอีกนาน table ที่มีแค่ไม่กี่ร้อย row sequential scan กับ index scan จะรู้สึกเร็วเท่ากันทั้งคู่ และ query ก็ "ดูเหมือน" simple เพราะเป็น `select` บรรทัดเดียวที่ไม่มีความซับซ้อนให้เห็น ต้นทุนนี้จะโผล่มาก็ตอนที่ table โตไปถึงหลักหมื่นหรือหลักแสน row ซึ่งตอนนั้นกลายเป็น production incident ไปแล้ว ไม่ใช่แค่ comment ใน code review
 
 ```sql
 -- A todos table, RLS-protected so users can only see their own rows
@@ -39,22 +39,22 @@ using (auth.uid() = user_id);
 create index idx_todos_user_id on public.todos (user_id);
 ```
 
-ก่อนมี index ทุกครั้งที่ user รัน `select * from todos` Postgres จะต้อง scan ทุก row ใน table แล้วเช็ค `auth.uid() = user_id` กับแต่ละ row หลังมี index Postgres กระโดดตรงไปยัง row ของ user คนนั้นได้เลย ต้นทุนของ query จะเลิกโตตาม size ของทั้ง table แล้วเริ่ม scale ตาม size ของข้อมูล user คนเดียวนั้นแทน ซึ่งเป็นรูปแบบที่ query ที่ถูก RLS ป้องกันเกือบทุกตัวมีอยู่จริง
+ก่อนมี index ทุกครั้งที่ user รัน `select * from todos` Postgres จะต้อง scan ทุก row ใน table แล้วเช็ค `auth.uid() = user_id` กับแต่ละ row หลังมี index Postgres กระโดดตรงไปยัง row ของ user คนนั้นได้เลย ต้นทุนของ query จะเลิกโตตาม size ของทั้ง table แล้วเริ่ม scale ตาม size ของข้อมูล user คนเดียวนั้นแทน ที่เป็นรูปแบบที่ query ที่ถูก RLS ป้องกันเกือบทุกตัวมีอยู่จริง
 
-## อ่าน `explain analyze` ก่อนที่มันจะช้าไปแล้ว
+## อ่าน `explain analyze` ก่อนที่จะช้าไปแล้ว
 
-`explain analyze` คือวิธีตรงที่สุดในการดูว่า Postgres ใช้ index จริงสำหรับ query นั้นหรือเปล่า แทนที่จะเดาจากความรู้สึกว่ามันเร็วบน table เล็ก ๆ ในเครื่อง
+`explain analyze` คือวิธีตรงที่สุดในการดูว่า Postgres ใช้ index จริงสำหรับ query นั้นหรือเปล่า แทนที่จะเดาจากความรู้สึกว่าเร็วบน table เล็ก ๆ ในเครื่อง
 
 ```sql
 explain analyze
 select * from public.todos where user_id = auth.uid();
 ```
 
-บรรทัดบนสุดของ output บอกชื่อ plan ที่ Postgres เลือก `Seq Scan on todos` หมายความว่ามันอ่านทุก row ส่วน `Index Scan using idx_todos_user_id on todos` หมายความว่ามันใช้ index `ANALYZE` ยังรัน query จริงและรายงานเวลาที่ใช้จริงกับจำนวน row จริง ไม่ใช่แค่ estimate ของ Postgres ดังนั้นควรระวังกับ `insert`, `update` หรือ `delete` เพราะรันซ้ำมีผลข้างเคียงจริง ให้เช็คกับ `select` แทน การทำเป็นนิสัยว่าจะรันคำสั่งนี้กับ RLS-protected query ใหม่ทุกตัว — ก่อน ship ไม่ใช่หลังจากมันช้าใน production แล้ว — จะจับ index ที่หายไปได้ตั้งแต่ตอนที่ยังแก้ง่าย ๆ แค่บรรทัดเดียว
+บรรทัดบนสุดของ output บอกชื่อ plan ที่ Postgres เลือก `Seq Scan on todos` หมายความว่าอ่านทุก row ส่วน `Index Scan using idx_todos_user_id on todos` หมายความว่าใช้ index `ANALYZE` ยังรัน query จริงและรายงานเวลาที่ใช้จริงกับจำนวน row จริง ไม่ใช่แค่ estimate ของ Postgres ดังนั้นควรระวังกับ `insert`, `update` หรือ `delete` เพราะรันซ้ำมีผลข้างเคียงจริง ให้เช็คกับ `select` แทน การทำเป็นนิสัยว่าจะรันคำสั่งนี้กับ RLS-protected query ใหม่ทุกตัว — ก่อน ship ไม่ใช่หลังจาก query ช้าใน production แล้ว — จะจับ index ที่หายไปได้ตั้งแต่ตอนที่ยังแก้ง่าย ๆ แค่บรรทัดเดียว
 
 ## สิ่งที่ Supabase Studio โชว์ให้โดยไม่ต้องรัน `explain analyze` เอง
 
-Supabase Studio มี Query Performance และ Advisor tooling ในตัวที่โชว์เรื่องพวกนี้ให้อัตโนมัติ โดยไม่ต้องหยิบ `explain analyze` มาใช้เองสำหรับการเช็คทั่วไป Query Performance ใน dashboard จะ list query ที่ช้าที่สุดและถูกรันบ่อยที่สุดตรงจาก statistics ของ Postgres เอง ส่วน Advisors panel จะ flag index ที่หายไปและปัญหา performance ที่พบบ่อยอื่น ๆ — รวมถึง column ที่ RLS policy อ้างอิงถึงแต่ไม่มี index โดยเฉพาะ มันไม่ได้มาแทนที่ความเข้าใจเรื่อง `explain analyze` แต่มันคือเครื่องมือที่ควรเช็คเป็นอันดับแรกสำหรับมุมมองต่อเนื่องแบบ low-effort ว่า bottleneck จริง ๆ ของ project อยู่ตรงไหน
+Supabase Studio มี Query Performance และ Advisor tooling ในตัวที่โชว์เรื่องพวกนี้ให้อัตโนมัติ โดยไม่ต้องหยิบ `explain analyze` มาใช้เองสำหรับการเช็คทั่วไป Query Performance ใน dashboard จะ list query ที่ช้าที่สุดและถูกรันบ่อยที่สุดตรงจาก statistics ของ Postgres เอง ส่วน Advisors panel จะ flag index ที่หายไปและปัญหา performance ที่พบบ่อยอื่น ๆ — รวมถึง column ที่ RLS policy อ้างอิงถึงแต่ไม่มี index โดยเฉพาะ ไม่ได้มาแทนที่ความเข้าใจเรื่อง `explain analyze` แต่เป็นเครื่องมือที่ควรเช็คเป็นอันดับแรกสำหรับมุมมองต่อเนื่องแบบ low-effort ว่า bottleneck จริง ๆ ของ project อยู่ตรงไหน
 
 <Mermaid title="An unindexed RLS filter forces a sequential scan; an index on the same column turns it into an index scan" code={indexingDiagram} />
 
@@ -84,10 +84,10 @@ export const quizPerformanceIndexing = [
   {
     q: '`explain analyze` บอกอะไรที่การรัน query ปกติไม่บอก',
     options: [
-      'มันบอกจำนวน active user ที่ต่ออยู่ตอนนั้นแบบเป๊ะ ๆ',
-      'มันโชว์ query plan จริงที่ Postgres เลือก เช่น sequential scan หรือ index scan พร้อมเวลาที่ใช้จริงและจำนวน row จริง',
-      'มันสร้าง index ที่หายไปให้อัตโนมัติ',
-      'มันปิด Row Level Security ให้กับ query นั้นตัวเดียว',
+      'บอกจำนวน active user ที่ต่ออยู่ตอนนั้นแบบเป๊ะ ๆ',
+      'โชว์ query plan จริงที่ Postgres เลือก เช่น sequential scan หรือ index scan พร้อมเวลาที่ใช้จริงและจำนวน row จริง',
+      'สร้าง index ที่หายไปให้อัตโนมัติ',
+      'ปิด Row Level Security ให้กับ query นั้นตัวเดียว',
     ],
     answer: 1,
   },
@@ -104,10 +104,10 @@ export const quizPerformanceIndexing = [
   {
     q: 'ในตัวอย่าง `todos` การรัน `create index idx_todos_user_id on public.todos (user_id);` เปลี่ยนอะไรกับ query select ที่ถูก RLS ป้องกัน',
     options: [
-      'มันปิด RLS policy เพื่อให้ query เร็วขึ้นโดยไม่มีการเช็ค security',
-      'มันทำให้ Postgres กระโดดตรงไปยัง row ของ user คนนั้นแทนที่จะ scan ทั้ง table ทำให้ต้นทุน scale ตามข้อมูลของ user คนนั้นแทนที่จะเป็น size ของ table',
-      'มันทำสำเนา table todos ไปเป็น read-only replica ที่เร็วกว่า',
-      'มันไม่มีผลอะไรเลย เพราะ RLS บังคับให้เกิด sequential scan เสมอไม่ว่าจะมี index หรือไม่',
+      'ปิด RLS policy เพื่อให้ query เร็วขึ้นโดยไม่มีการเช็ค security',
+      'ทำให้ Postgres กระโดดตรงไปยัง row ของ user คนนั้นแทนที่จะ scan ทั้ง table ทำให้ต้นทุน scale ตามข้อมูลของ user คนนั้นแทนที่จะเป็น size ของ table',
+      'ทำสำเนา table todos ไปเป็น read-only replica ที่เร็วกว่า',
+      'ไม่มีผลอะไรเลย เพราะ RLS บังคับให้เกิด sequential scan เสมอไม่ว่าจะมี index หรือไม่',
     ],
     answer: 1,
   },

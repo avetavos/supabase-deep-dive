@@ -16,7 +16,7 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## จาก row change ไปถึง callback ฝั่ง client
 
-Postgres เก็บ record ของทุก write ไว้แบบ durable และเรียงลำดับอยู่แล้วใน **write-ahead log (WAL)** — ใช้สำหรับ crash recovery และ replication ภายในตัวมันเอง Supabase Realtime อ่าน WAL ตัวเดียวกันนี้ผ่านฟีเจอร์ **logical replication** ของ Postgres แล้วแปลงทุก change ที่ commit แล้วให้กลายเป็น message ที่ push ผ่าน WebSocket ได้ client subscribe เข้า channel หนึ่ง บอกว่าสนใจ table ไหนและ event type อะไร แล้วจะได้ callback ยิงทุกครั้งที่ row เปลี่ยนตรงกับเงื่อนไข แบบสด ๆ โดยไม่ต้อง poll table เป็นช่วง ๆ เลย
+Postgres เก็บ record ของทุก write ไว้แบบ durable และเรียงลำดับอยู่แล้วใน **write-ahead log (WAL)** — ใช้สำหรับ crash recovery และ replication ภายในตัวเอง Supabase Realtime อ่าน WAL ตัวเดียวกันนี้ผ่านฟีเจอร์ **logical replication** ของ Postgres แล้วแปลงทุก change ที่ commit แล้วให้กลายเป็น message ที่ push ผ่าน WebSocket ได้ client subscribe เข้า channel หนึ่ง บอกว่าสนใจ table ไหนและ event type อะไร แล้วจะได้ callback ยิงทุกครั้งที่ row เปลี่ยนตรงกับเงื่อนไข แบบสด ๆ โดยไม่ต้อง poll table เป็นช่วง ๆ เลย
 
 ข้อเท็จจริงสำคัญที่ต้องจำก่อนเขียนโค้ดเลยคือ **pipeline นี้ปิดอยู่โดย default สำหรับทุก table ที่คุณสร้าง** Realtime ไม่ได้ watch ทั้ง schema ให้อัตโนมัติ — write ของ table หนึ่งจะไปถึง WAL stream ที่ Realtime แตะอยู่ก็ต่อเมื่อ table นั้นถูกเพิ่มเข้า `supabase_realtime` publication แล้วเท่านั้น ตราบใดที่ยังไม่ทำ client จะ subscribe ทั้งวันก็ไม่ได้อะไรกลับมาเลย
 

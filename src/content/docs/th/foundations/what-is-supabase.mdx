@@ -1,6 +1,6 @@
 ---
 title: 'Supabase คืออะไร'
-description: 'Supabase ในฐานะ open-source Backend as a Service ที่สร้างบน Postgres จริง service หลักที่มันรวมมาให้ และมันต่างจาก Firebase กับการสร้าง backend เองยังไง'
+description: 'Supabase ในฐานะ open-source Backend as a Service ที่สร้างบน Postgres จริง service หลักที่รวมมาให้ และต่างจาก Firebase กับการสร้าง backend เองยังไง'
 sidebar:
   order: 2
 ---
@@ -34,7 +34,7 @@ order by created_at desc;
 
 ## service หลักโดยภาพรวม
 
-หนึ่ง Supabase project คือ Postgres database หนึ่งตัว บวก service ที่ห่อรอบมันอีกชั้น แต่ละตัวจะมี module ของตัวเองในคอร์สนี้ ตอนนี้เก็บไว้แค่เป็นแผนที่ orientation ยังไม่ต้องลงลึก
+หนึ่ง Supabase project คือ Postgres database หนึ่งตัว บวก service ห่อรอบอีกชั้น แต่ละตัวจะมี module ของตัวเองในคอร์สนี้ ตอนนี้เก็บไว้แค่เป็นแผนที่ orientation ยังไม่ต้องลงลึก
 
 - **Postgres database** — ที่เก็บข้อมูลจริง SQL ธรรมดา feature relational เต็มรูปแบบ
 - **Auto-generated API** — REST/RPC API ผ่าน **PostgREST** และ GraphQL API ผ่าน **pg_graphql** สร้างขึ้นตรงจาก schema ของคุณ
@@ -80,7 +80,7 @@ export const whatIsSupabaseDiagram = `flowchart TB
 ไม่มีอะไรตรงนี้ที่เป็นเวทมนตร์ที่คุณสร้างเองไม่ได้ — PostgREST, GoTrue และตัวอื่น ๆ ล้วนเป็น open-source project ที่ self-host แยกเองได้ สิ่งที่ Supabase ประหยัดให้จริง ๆ คืองาน integration หนึ่ง project, credential ชุดเดียว, dashboard เดียว และ service ที่รู้วิธีคุยกันเองและคุยกับ Postgres instance เดียวกันอยู่แล้ว คุณยังคงต้องเขียน schema, SQL และ access rule เอง — Supabase แค่เอา plumbing รอบ ๆ ออกไปให้
 
 <Callout title="สรุปหนึ่งบรรทัด">
-Supabase คือ **Postgres บวก service ที่ห่อรอบมันอีกชั้น** — REST/RPC API (PostgREST) กับ GraphQL API (pg_graphql), **Auth**, **Storage**, **Realtime** และ **Edge Functions** — จัดการทั้งหมดผ่าน **Studio** หรือ **CLI** และต่างจาก Firebase ตรงที่ data model ข้างล่างยังเป็น Postgres ธรรมดาที่ portable และ query ได้เสมอ
+Supabase คือ **Postgres บวก service ห่อรอบอีกชั้น** — REST/RPC API (PostgREST) กับ GraphQL API (pg_graphql), **Auth**, **Storage**, **Realtime** และ **Edge Functions** — จัดการทั้งหมดผ่าน **Studio** หรือ **CLI** และต่างจาก Firebase ตรงที่ data model ข้างล่างยังเป็น Postgres ธรรมดาที่ portable และ query ได้เสมอ
 </Callout>
 
 export const quizWhatIsSupabase = [
@@ -88,7 +88,7 @@ export const quizWhatIsSupabase = [
     q: 'Supabase สร้างขึ้นบนอะไรเป็นแกนหลัก',
     options: [
       'proprietary NoSQL document database',
-      'Postgres database จริงที่ไม่ได้ถูกดัดแปลง พร้อม service ห่อรอบมัน',
+      'Postgres database จริงที่ไม่ได้ถูกดัดแปลง พร้อม service ห่อรอบอีกชั้น',
       'query language ที่สร้างเองแบบไม่มี relational model',
       'ระบบ queue ที่จัดการให้ ไม่มี persistent storage',
     ],

@@ -42,7 +42,7 @@ const { data: signedUrlData } = await supabase.storage
   .createSignedUrl('user123/photo.png', 60);
 ```
 
-`getPublicUrl` แค่สร้าง URL string ขึ้นมาเฉย ๆ ไม่ได้เช็คอะไรเลย ดังนั้นเรียกกับ object ใน private bucket ก็ยังได้ URL กลับมา แต่ URL นั้นจะถูก reject อยู่ดี `createSignedUrl` คือตัวที่ต้องใช้จริงสำหรับ private content มันสร้าง URL ที่ valid ตามจำนวนวินาทีที่คุณส่งเข้าไป (`60` ในตัวอย่างข้างบน) โดยฝัง signed token ที่ให้ access ชั่วคราวกับ object ตัวนั้นตัวเดียว
+`getPublicUrl` แค่สร้าง URL string ขึ้นมาเฉย ๆ ไม่ได้เช็คอะไรเลย ดังนั้นเรียกกับ object ใน private bucket ก็ยังได้ URL กลับมา แต่ URL นั้นจะถูก reject อยู่ดี `createSignedUrl` คือตัวที่ต้องใช้จริงสำหรับ private content โดยจะสร้าง URL ที่ valid ตามจำนวนวินาทีที่คุณส่งเข้าไป (`60` ในตัวอย่างข้างบน) โดยฝัง signed token ที่ให้ access ชั่วคราวกับ object ตัวนั้นตัวเดียว
 
 ## สิ่งที่บังคับ access จริง ๆ คือ Row Level Security
 

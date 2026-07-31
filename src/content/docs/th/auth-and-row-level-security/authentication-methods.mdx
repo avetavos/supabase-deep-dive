@@ -10,7 +10,7 @@ import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
-## แนวคิดในหนึ่งประโยค
+## ไอเดียในหนึ่งประโยค
 
 Supabase Auth สร้างขึ้นบน **GoTrue** server แบบ open-source และรองรับวิธีพิสูจน์ตัวตนของ user หลายแบบ — password, magic link, phone OTP หรือ OAuth — และทุกวิธีจบลงที่จุดเดียวกันคือ row ที่ถูกสร้างหรือ match ใน table `auth.users` ที่มีมาให้
 
@@ -45,7 +45,7 @@ const { error: oauthError } = await supabase.auth.signInWithOAuth({
 
 ## user จริง ๆ อยู่ที่ไหน: `auth.users`
 
-ไม่ว่าจะ sign-up หรือ sign-in ด้วยวิธีไหนก็ตาม ผลลัพธ์คือ row ใน `auth.users` ถูกสร้างหรือถูกใช้ยืนยันตัวตน table นี้อยู่ใน schema แยกต่างหากชื่อ `auth` ไม่ใช่ `public` — มันถูกจัดการโดย Supabase Auth เองและเก็บแค่สิ่งที่ Auth ต้องใช้ (email, phone, password ที่ hash แล้ว, ข้อมูล provider และอื่น ๆ) ไม่ได้ออกแบบมาให้เพิ่ม column ของแอปเราเข้าไปตรง ๆ
+ไม่ว่าจะ sign-up หรือ sign-in ด้วยวิธีไหนก็ตาม ผลลัพธ์คือ row ใน `auth.users` ถูกสร้างหรือถูกใช้ยืนยันตัวตน table นี้อยู่ใน schema แยกต่างหากชื่อ `auth` ไม่ใช่ `public` — Supabase Auth จัดการ table นี้เองและเก็บแค่สิ่งที่ Auth ต้องใช้ (email, phone, password ที่ hash แล้ว, ข้อมูล provider และอื่น ๆ) ไม่ได้ออกแบบมาให้เพิ่ม column ของแอปเราเข้าไปตรง ๆ
 
 pattern ที่พบบ่อยคือ table `public.profiles` ที่ primary key อ้างอิงกลับไปที่ `auth.users(id)` เก็บข้อมูลเฉพาะของแอปที่ Auth เองไม่เก็บให้ — username, avatar URL, subscription tier หรืออะไรก็ตามที่โปรดักต์ต้องการ
 
@@ -75,7 +75,7 @@ export const authMethodsDiagram = `flowchart LR
   gotrue --> table[("auth.users row created/matched")]`;
 
 <Callout title="สรุปหนึ่งบรรทัด">
-Supabase Auth (**GoTrue**) รองรับ sign-in แบบ **password**, **magic link**, **phone OTP** และ **OAuth** มาให้เลย ไม่ว่า user จะเลือกวิธีไหน ผลลัพธ์เหมือนกันคือ row ที่ถูกสร้างหรือ match ใน **`auth.users`** — schema `auth` แยกต่างหากที่คุณต่อยอดด้วยการอ้างอิงจาก table **`public.profiles`** ของตัวเอง แทนที่จะไปแก้ไขมันตรง ๆ
+Supabase Auth (**GoTrue**) รองรับ sign-in แบบ **password**, **magic link**, **phone OTP** และ **OAuth** มาให้เลย ไม่ว่า user จะเลือกวิธีไหน ผลลัพธ์เหมือนกันคือ row ที่ถูกสร้างหรือ match ใน **`auth.users`** — schema `auth` แยกต่างหากที่คุณต่อยอดด้วยการอ้างอิงจาก table **`public.profiles`** ของตัวเอง แทนที่จะไปแก้ `auth.users` ตรง ๆ
 </Callout>
 
 export const quizAuthenticationMethods = [

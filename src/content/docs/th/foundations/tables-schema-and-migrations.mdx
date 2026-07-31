@@ -16,7 +16,7 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## สร้าง table ด้วย SQL ธรรมดา
 
-ไม่มี abstraction พิเศษของ Supabase สำหรับนิยาม table เลย ไม่ว่าคุณจะคลิกผ่าน Table Editor ของ Studio หรือพิมพ์ SQL ตรง ๆ ใน SQL Editor ผลลัพธ์คือ table Postgres ธรรมดา pattern ที่พบบ่อยมากคือ table `profiles` ที่ `id` ของมันอ้างอิงไปยัง table `auth.users` ที่ Supabase มีให้ในตัว (module Auth จะพูดถึง `auth.users` แบบลงลึก)
+ไม่มี abstraction พิเศษของ Supabase สำหรับนิยาม table เลย ไม่ว่าคุณจะคลิกผ่าน Table Editor ของ Studio หรือพิมพ์ SQL ตรง ๆ ใน SQL Editor ผลลัพธ์คือ table Postgres ธรรมดา pattern ที่พบบ่อยมากคือ table `profiles` ที่ `id` ของตัวเองอ้างอิงไปยัง table `auth.users` ที่ Supabase มีให้ในตัว (module Auth จะพูดถึง `auth.users` แบบลงลึก)
 
 ```sql
 create table public.profiles (
@@ -26,11 +26,11 @@ create table public.profiles (
 );
 ```
 
-`auth.users` คือ table ที่ service Auth ของ Supabase จัดการให้คุณ การเชื่อม `profiles.id` เข้ากับมันด้วย foreign key คือวิธีมาตรฐานในการผูกข้อมูลของแอปคุณเอง — username, avatar, preference — เข้ากับ user ที่ authenticate แล้ว
+`auth.users` คือ table ที่ service Auth ของ Supabase จัดการให้คุณ การเชื่อม `profiles.id` เข้ากับ `auth.users` ด้วย foreign key คือวิธีมาตรฐานในการผูกข้อมูลของแอปคุณเอง — username, avatar, preference — เข้ากับ user ที่ authenticate แล้ว
 
 ## Migration ผ่าน CLI
 
-schema change ที่ทำผ่าน Studio GUI เป็นของจริงและมีผลทันที แต่ตัวมันเอง **ไม่ได้** ถูกเก็บไว้เป็น code ที่ไหนเลย — ไม่มีใคร review มัน และมันจะไม่โผล่ไปที่ environment อื่นเองอัตโนมัติ migration แก้ปัญหานี้
+schema change ที่ทำผ่าน Studio GUI เป็นของจริงและมีผลทันที แต่ตัวเอง **ไม่ได้** ถูกเก็บไว้เป็น code ที่ไหนเลย — ไม่มีใครได้ review และจะไม่โผล่ไปที่ environment อื่นเองอัตโนมัติ migration แก้ปัญหานี้
 
 ```bash
 # Create a new, timestamped SQL migration file under supabase/migrations/
@@ -43,7 +43,7 @@ supabase db push
 supabase db diff --schema public
 ```
 
-`supabase migration new <name>` สร้างไฟล์ `.sql` เปล่า ๆ ที่มี timestamp กำกับ — คุณเขียนคำสั่ง `create table` (หรือ `alter table`) ลงไปเอง หรือ generate มันด้วย `supabase db diff` หลังจากแก้ผ่าน Studio GUI แล้ว `supabase db push` จะ apply ทุก migration ที่ยังไม่เคยรันเข้ากับ hosted project ที่ link ไว้
+`supabase migration new <name>` สร้างไฟล์ `.sql` เปล่า ๆ ที่มี timestamp กำกับ — คุณเขียนคำสั่ง `create table` (หรือ `alter table`) ลงไปเอง หรือ generate ด้วย `supabase db diff` หลังจากแก้ผ่าน Studio GUI แล้ว `supabase db push` จะ apply ทุก migration ที่ยังไม่เคยรันเข้ากับ hosted project ที่ link ไว้
 
 ```sql
 -- supabase/migrations/20250101000000_create_profiles_table.sql
@@ -54,9 +54,9 @@ create table public.profiles (
 );
 ```
 
-## ทำไมเรื่องนี้ถึงสำคัญ มันคือ IaC ที่ใช้กับ schema ของคุณ
+## ทำไมเรื่องนี้ถึงสำคัญ นี่คือ IaC สำหรับ schema ของคุณ
 
-นี่คือไอเดียเดียวกับ "infrastructure as code เทียบกับ ClickOps" จากฝั่ง infrastructure tooling แค่เอามาใช้กับ database ของคุณ การแก้ไขด้วยการคลิกใน Studio GUI ใช้งานได้จริง แต่มันมองไม่เห็นตอน code review, มองไม่เห็นใน `git log` และต้อง reproduce มือเพื่อให้ไปถึง environment ที่สอง migration file ทำให้ change เดียวกันนี้ **review ได้, ทำซ้ำได้ และ deploy ได้** — `supabase db push` apply มันเข้า staging, production หรือ local stack ของเพื่อนร่วมทีมได้เหมือนกันทุกที่
+นี่คือไอเดียเดียวกับ "infrastructure as code เทียบกับ ClickOps" จากฝั่ง infrastructure tooling แค่เอามาใช้กับ database ของคุณ การแก้ไขด้วยการคลิกใน Studio GUI ใช้งานได้จริง แต่มองไม่เห็นตอน code review, มองไม่เห็นใน `git log` และต้อง reproduce มือเพื่อให้ไปถึง environment ที่สอง migration file ทำให้ change เดียวกันนี้ **review ได้, ทำซ้ำได้ และ deploy ได้** — `supabase db push` apply เข้า staging, production หรือ local stack ของเพื่อนร่วมทีมได้เหมือนกันทุกที่
 
 <Mermaid title="GUI edit และ migration file ไหลเข้า Postgres schema เดียวกัน" code={migrationsDiagram} />
 
@@ -69,7 +69,7 @@ export const migrationsDiagram = `flowchart LR
   local["Local migration written by hand"] --> file`;
 
 <Callout title="สรุปหนึ่งบรรทัด">
-table ใน Supabase ถูกสร้างด้วย **SQL ธรรมดาจริง ๆ** — `create table` ไม่มี abstraction พิเศษ — ไม่ว่าจะผ่าน Studio GUI หรือเขียนเอง และ pattern ที่พบบ่อยคือ table `profiles` ที่ `id` อ้างอิงไปยัง `auth.users` `supabase migration new` กับ `supabase db diff` แปลง schema change ให้เป็นไฟล์ `.sql` ใน version control และ `supabase db push` apply มันเข้า hosted project ที่ link ไว้ ทำให้แม้แต่ change ที่ทำผ่าน GUI ก็ยังจบลงที่ **review ได้, ทำซ้ำได้ และ deploy ได้** แทนที่จะเป็น ClickOps ที่มองไม่เห็น
+table ใน Supabase ถูกสร้างด้วย **SQL ธรรมดาจริง ๆ** — `create table` ไม่มี abstraction พิเศษ — ไม่ว่าจะผ่าน Studio GUI หรือเขียนเอง และ pattern ที่พบบ่อยคือ table `profiles` ที่ `id` อ้างอิงไปยัง `auth.users` `supabase migration new` กับ `supabase db diff` แปลง schema change ให้เป็นไฟล์ `.sql` ใน version control และ `supabase db push` apply เข้า hosted project ที่ link ไว้ ทำให้แม้แต่ change ที่ทำผ่าน GUI ก็ยังจบลงที่ **review ได้, ทำซ้ำได้ และ deploy ได้** แทนที่จะเป็น ClickOps ที่มองไม่เห็น
 </Callout>
 
 export const quizTablesMigrations = [

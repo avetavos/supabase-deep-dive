@@ -10,7 +10,7 @@ import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
-## แนวคิดในหนึ่งประโยค
+## ไอเดียในหนึ่งประโยค
 
 RLS ในโลกจริงส่วนใหญ่คือการผสม pattern ไม่กี่แบบเข้าด้วยกัน — owner-only, public-read-owner-write, role-based — และ bug ของ RLS ในโลกจริงส่วนใหญ่ก็มาจากการลืม policy ของ operation ใด operation หนึ่ง หรือลืม index column ที่ policy ใช้กรอง
 
@@ -74,7 +74,7 @@ condition ของ policy รันกับทุก row ที่ Postgres �
 create index on public.posts (user_id);
 ```
 
-อีกจุดที่ควรรู้ไว้คือการห่อ `auth.uid()` ด้วย `select` ภายใน policy condition จะทำให้ Postgres ประเมินมันแค่ครั้งเดียวต่อ query แทนที่จะประเมินทุก row ซึ่งมีผลชัดเจนเมื่อ table มี row เยอะขึ้น
+อีกจุดที่ควรรู้ไว้คือการห่อ `auth.uid()` ด้วย `select` ภายใน policy condition จะทำให้ Postgres ประเมินแค่ครั้งเดียวต่อ query แทนที่จะประเมินทุก row ซึ่งมีผลชัดเจนเมื่อ table มี row เยอะขึ้น
 
 ```sql
 create policy "Owners can update their posts"
@@ -85,7 +85,7 @@ using ((select auth.uid()) = user_id);
 
 ## Test policy ก่อน ship
 
-อย่าคิดเอาเองว่า policy ทำงานถูกต้อง ให้ test ในฐานะ user ที่มันตั้งใจจะจำกัดสิทธิ์ table editor ของ Supabase Studio มี feature impersonation ไว้สำหรับเรื่องนี้โดยเฉพาะ หรือจะทำแบบเดียวกันตรง ๆ ใน SQL session ก็ได้ด้วยการสลับ role แล้วตั้ง claim ของ JWT ให้เหมือน request จริง
+อย่าคิดเอาเองว่า policy ทำงานถูกต้อง ให้ test ในฐานะ user ที่ตั้งใจจะจำกัดสิทธิ์ table editor ของ Supabase Studio มี feature impersonation ไว้สำหรับเรื่องนี้โดยเฉพาะ หรือจะทำแบบเดียวกันตรง ๆ ใน SQL session ก็ได้ด้วยการสลับ role แล้วตั้ง claim ของ JWT ให้เหมือน request จริง
 
 ```sql
 set role authenticated;
@@ -108,7 +108,7 @@ export const rlsPitfallsDiagram = `flowchart TB
   end`;
 
 <Callout title="สรุปหนึ่งบรรทัด">
-RLS ในโลกจริงประกอบจาก pattern ไม่กี่แบบ — **owner-only**, **public-read-owner-write** (ที่ต้องใช้ policy สองอันแยกกัน หนึ่งสำหรับ select อีกหนึ่งสำหรับ operation ฝั่งเขียน) และ **role-based access** ผ่าน table `user_roles` ที่ join เข้ามา หรือผ่าน custom JWT claim แต่ความผิดพลาดสองแบบเดิมคือต้นเหตุของ bug ส่วนใหญ่ — ลืม policy ของ **operation ใด operation หนึ่ง** ทั้งที่ operation อื่นยังทำงานปกติ (อ่านได้ แต่เขียนแล้ว fail แบบเงียบ ๆ) และการอ้างอิง **column ที่ไม่มี index** ใน policy condition ซึ่งทำให้ query ที่ดูไม่มีพิษภัยกลายเป็น sequential scan เมื่อข้อมูลเยอะขึ้น ให้ test policy ด้วยการ impersonate เป็น user ที่มันจะจำกัดสิทธิ์เสมอก่อน ship
+RLS ในโลกจริงประกอบจาก pattern ไม่กี่แบบ — **owner-only**, **public-read-owner-write** (ที่ต้องใช้ policy สองอันแยกกัน หนึ่งสำหรับ select อีกหนึ่งสำหรับ operation ฝั่งเขียน) และ **role-based access** ผ่าน table `user_roles` ที่ join เข้ามา หรือผ่าน custom JWT claim แต่ความผิดพลาดสองแบบเดิมคือต้นเหตุของ bug ส่วนใหญ่ — ลืม policy ของ **operation ใด operation หนึ่ง** ทั้งที่ operation อื่นยังทำงานปกติ (อ่านได้ แต่เขียนแล้ว fail แบบเงียบ ๆ) และการอ้างอิง **column ที่ไม่มี index** ใน policy condition ซึ่งทำให้ query ที่ดูไม่มีพิษภัยกลายเป็น sequential scan เมื่อข้อมูลเยอะขึ้น ให้ test policy ด้วยการ impersonate เป็น user ที่จะจำกัดสิทธิ์เสมอก่อน ship
 </Callout>
 
 export const quizRlsPatterns = [
@@ -138,14 +138,14 @@ export const quizRlsPatterns = [
       'RLS policy ไม่เกี่ยวกับ index เลย',
       'condition ของ policy ถูกประเมินต่อทุก row ที่ query พิจารณา ถ้าไม่มี index Postgres อาจต้องทำ full sequential scan',
       'column ที่ไม่มี index จะทำให้ policy ถูกข้ามไปทั้งหมด',
-      'มันกระทบแค่ operation insert เท่านั้น ไม่กระทบ select',
+      'กระทบแค่ operation insert เท่านั้น ไม่กระทบ select',
     ],
     answer: 1,
   },
   {
     q: 'วิธีที่ใช้งานได้จริงในการตรวจสอบว่า RLS policy ทำงานตามที่ตั้งใจก่อน ship คืออะไร',
     options: [
-      'อ่าน SQL แล้วสมมติว่ามันถูกต้อง',
+      'อ่าน SQL แล้วสมมติว่าถูกต้อง',
       'impersonate เป็น target user ผ่าน Studio หรือ set role/request.jwt.claims ใน SQL session แล้วรัน query ในฐานะ user คนนั้น',
       'ปิด RLS ชั่วคราวเพื่อดูผลลัพธ์',
       'ไม่มีทาง test RLS ได้ก่อนขึ้น production',

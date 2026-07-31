@@ -28,7 +28,7 @@ const supabase = createClient(
 );
 ```
 
-ข้อนี้ควรพูดซ้ำให้ชัดเพราะสลับกันผิดง่ายมาก client ฝั่ง browser หรือ mobile ต้อง initialize ด้วย **`anon` key** เสมอ `anon` key ถูกออกแบบมาให้เป็น public อยู่แล้ว มันติดไปกับ JavaScript bundle ที่ใครก็อ่านได้ และนั่นไม่ใช่ปัญหา สิ่งที่กันไม่ให้คนแปลกหน้าอ่านหรือเขียน row ที่ไม่ควรแตะได้คือ **row level security (RLS)** บน table ของคุณ ไม่ใช่ความลับของ key ตัวนี้ ส่วน **`service_role` key** เป็นคนละเรื่องเลย มัน bypass RLS ทั้งหมด ซึ่งทำให้มันทรงพลังมากและเป็นเหตุผลว่าทำไมห้ามให้มันไปโผล่ในโค้ดฝั่ง client เด็ดขาด มันควรอยู่แค่ใน server environment ที่เชื่อถือได้ (เช่น Edge Function หรือ backend process) ที่ไม่มีทางไปถึง browser
+ข้อนี้ควรพูดซ้ำให้ชัดเพราะสลับกันผิดง่ายมาก client ฝั่ง browser หรือ mobile ต้อง initialize ด้วย **`anon` key** เสมอ `anon` key ถูกออกแบบมาให้เป็น public อยู่แล้ว key นี้ติดไปกับ JavaScript bundle ที่ใครก็อ่านได้ และนั่นไม่ใช่ปัญหา สิ่งที่กันไม่ให้คนแปลกหน้าอ่านหรือเขียน row ที่ไม่ควรแตะได้คือ **row level security (RLS)** บน table ของคุณ ไม่ใช่ความลับของ key ตัวนี้ ส่วน **`service_role` key** เป็นคนละเรื่องเลย key ตัวนี้ bypass RLS ทั้งหมด ซึ่งทรงพลังมากและเป็นเหตุผลว่าทำไมห้ามให้ไปโผล่ในโค้ดฝั่ง client เด็ดขาด ควรอยู่แค่ใน server environment ที่เชื่อถือได้ (เช่น Edge Function หรือ backend process) ที่ไม่มีทางไปถึง browser
 
 ## Generated type เปลี่ยน `.from()` ให้กลายเป็น typed API
 
@@ -38,7 +38,7 @@ Supabase CLI อ่าน schema จริงของคุณแล้ว gene
 supabase gen types typescript --project-id abcdefghijklmnopqrst > database.types.ts
 ```
 
-คำสั่งนี้ inspect ทุก table, column และ constraint ในโปรเจกต์ แล้ว generate type ที่มี shape `Row`, `Insert` และ `Update` ให้แต่ละ table `Database['public']['Tables']['movies']['Row']` คือ column ที่ `select` จะคืนกลับมาเป๊ะ ๆ `Insert` คือหน้าตาของ row ใหม่ที่ valid และ `Update` คือหน้าตาของ partial patch เอา type นี้ไปเป็น generic ให้ `createClient` ก็จะผูก query builder ทั้งหมดเข้ากับมันทันที
+คำสั่งนี้ inspect ทุก table, column และ constraint ในโปรเจกต์ แล้ว generate type ที่มี shape `Row`, `Insert` และ `Update` ให้แต่ละ table `Database['public']['Tables']['movies']['Row']` คือ column ที่ `select` จะคืนกลับมาเป๊ะ ๆ `Insert` คือหน้าตาของ row ใหม่ที่ valid และ `Update` คือหน้าตาของ partial patch เอา type นี้ไปเป็น generic ให้ `createClient` ก็จะผูก query builder ทั้งหมดเข้ากับ type นั้นทันที
 
 ```typescript
 import { createClient } from '@supabase/supabase-js';
@@ -83,7 +83,7 @@ export const jsClientDiagram = `flowchart LR
   client --> query["Typed .from() queries with autocomplete"]`;
 
 <Callout title="สรุปหนึ่งบรรทัด">
-สร้าง client ด้วย **`createClient`** และใช้ public **`anon` key** เสมอในโค้ดฝั่ง browser หรือ mobile — **RLS** ไม่ใช่ความลับของ key คือสิ่งที่ปกป้องข้อมูลจริง ในขณะที่ **`service_role` key** bypass RLS และต้องอยู่ฝั่ง server เท่านั้น รัน **`supabase gen types typescript --project-id <ref> > database.types.ts`** แล้วเอา `Database` type ที่ได้ไปเป็น generic ให้ `createClient<Database>()` เพื่อได้ compile-time checking และ autocomplete บนทุก `.from()` call สร้าง client แค่ **ครั้งเดียว** แล้ว reuse instance เดียวกันทุกที่ เพราะมันเก็บ session state และจัดการ network connection ที่แชร์กันอยู่
+สร้าง client ด้วย **`createClient`** และใช้ public **`anon` key** เสมอในโค้ดฝั่ง browser หรือ mobile — **RLS** ไม่ใช่ความลับของ key คือสิ่งที่ปกป้องข้อมูลจริง ส่วน **`service_role` key** bypass RLS และต้องอยู่ฝั่ง server เท่านั้น รัน **`supabase gen types typescript --project-id <ref> > database.types.ts`** แล้วเอา `Database` type ที่ได้ไปเป็น generic ให้ `createClient<Database>()` เพื่อได้ compile-time checking และ autocomplete บนทุก `.from()` call สร้าง client แค่ **ครั้งเดียว** แล้ว reuse instance เดียวกันทุกที่ เพราะเก็บ session state และจัดการ network connection ที่แชร์กันอยู่
 </Callout>
 
 export const quizJsClient = [
@@ -100,10 +100,10 @@ export const quizJsClient = [
   {
     q: 'ทำไม service_role key ห้ามไปโผล่ในโค้ดฝั่ง client เด็ดขาด',
     options: [
-      'มันช้ากว่า anon key',
-      'มัน bypass row level security ทั้งหมด ถ้าหลุดออกไปใครก็อ่านหรือเขียน row ไหนก็ได้',
-      'มันใช้ได้แค่จาก Supabase CLI เท่านั้น',
-      'มันหมดอายุภายในไม่กี่นาทีแล้วจะทำให้แอปพัง',
+      'ช้ากว่า anon key',
+      'bypass row level security ทั้งหมด ถ้าหลุดออกไปใครก็อ่านหรือเขียน row ไหนก็ได้',
+      'ใช้ได้แค่จาก Supabase CLI เท่านั้น',
+      'หมดอายุภายในไม่กี่นาทีแล้วจะทำให้แอปพัง',
     ],
     answer: 1,
   },
@@ -121,7 +121,7 @@ export const quizJsClient = [
     q: 'ทำไม supabase-js client มักถูกสร้างครั้งเดียวแล้วใช้แบบ singleton',
     options: [
       'เพราะ createClient เรียกได้แค่ครั้งเดียวตลอดอายุ process',
-      'มันเก็บ session state ไว้ใน memory และจัดการ network connection ที่แชร์กัน สร้างใหม่ทุก request หรือ component จะเปลืองและอาจทำให้ auth state ไม่ sync กัน',
+      'เก็บ session state ไว้ใน memory และจัดการ network connection ที่แชร์กัน สร้างใหม่ทุก request หรือ component จะเปลืองและอาจทำให้ auth state ไม่ sync กัน',
       'เพราะ TypeScript บังคับให้มี client แค่ตัวเดียวต่อไฟล์',
       'การ reuse ไม่มีประโยชน์จริง เป็นแค่ความชอบส่วนตัวเรื่อง style',
     ],

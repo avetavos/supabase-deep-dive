@@ -12,7 +12,7 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
 
-**Broadcast** กับ **Presence** คือ layer pub/sub และ tracking การ online ทั่วไปที่วางอยู่บน Realtime channel และต่างจาก Postgres Changes ตรงที่มัน**เปิดอยู่โดย default** ไม่ต้องตั้งค่า table หรือ replication ใด ๆ เลย
+**Broadcast** กับ **Presence** คือ layer pub/sub และ tracking การ online ทั่วไปที่วางอยู่บน Realtime channel และต่างจาก Postgres Changes ตรงที่**เปิดอยู่โดย default** ไม่ต้องตั้งค่า table หรือ replication ใด ๆ เลย
 
 ## Broadcast: ส่ง message อะไรก็ได้เข้า channel
 
@@ -63,7 +63,7 @@ event `sync` จะยิงทุกครั้งที่ presence set เ�
 
 ## ทั้งสองอย่างไม่แตะ database เลย
 
-นี่คือความต่างที่ควรจำไว้ต่อจากบทก่อน Postgres Changes ทำงานได้ก็ต่อเมื่อคุณรัน `alter publication supabase_realtime add table ...` ให้ table นั้นก่อน เพราะโดยพื้นฐานมันคือการ stream ออกมาจาก replication log ของ Postgres เอง **Broadcast กับ Presence ไม่เกี่ยวกับเรื่องนั้นเลย** — มันคือ layer messaging และ state-sync ที่อยู่ในตัว Realtime server ล้วน ๆ เปิดใช้งานได้ทันทีที่ต่อ channel โดยไม่มีอะไรต้องตั้งค่าในฝั่ง database เลย
+นี่คือความต่างที่ควรจำไว้ต่อจากบทก่อน Postgres Changes ทำงานได้ก็ต่อเมื่อคุณรัน `alter publication supabase_realtime add table ...` ให้ table นั้นก่อน เพราะโดยพื้นฐานแล้วนี่คือการ stream ออกมาจาก replication log ของ Postgres เอง **Broadcast กับ Presence ไม่เกี่ยวกับเรื่องนั้นเลย** — ทั้งคู่เป็น layer messaging และ state-sync ที่อยู่ในตัว Realtime server ล้วน ๆ เปิดใช้งานได้ทันทีที่ต่อ channel โดยไม่มีอะไรต้องตั้งค่าในฝั่ง database เลย
 
 <Mermaid title="Broadcast ส่งตรงระหว่าง client; Presence sync state ที่แชร์กัน — ทั้งคู่ไม่แตะ Postgres" code={broadcastPresenceDiagram} />
 

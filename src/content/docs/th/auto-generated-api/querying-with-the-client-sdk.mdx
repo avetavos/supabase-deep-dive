@@ -16,7 +16,7 @@ query builder ของ `supabase-js` เป็น TypeScript wrapper แบบ 
 
 ## Query builder สะท้อน REST API
 
-ทุกอย่างที่เห็นเป็น raw query string ในบทก่อนหน้ามี method ที่ตรงกันบน query builder เลือก table ด้วย `.from()` เลือก column ด้วย `.select()` filter ด้วย `.eq()` (และตัวพี่น้องของมัน) แล้วเรียงลำดับด้วย `.order()`
+ทุกอย่างที่เห็นเป็น raw query string ในบทก่อนหน้ามี method ที่ตรงกันบน query builder เลือก table ด้วย `.from()` เลือก column ด้วย `.select()` filter ด้วย `.eq()` (และตัวพี่น้องของตัวเอง) แล้วเรียงลำดับด้วย `.order()`
 
 ```typescript
 const { data, error } = await supabase
@@ -38,7 +38,7 @@ await supabase.from('movies').delete().eq('id', 1);
 
 ## เช็ค data กับ error เองเสมอ
 
-query ของ `supabase-js` ไม่เคย throw เมื่อ request ล้มเหลว — มันจะ resolve เป็น object รูปแบบ `{ data, error }` เสมอ ถ้า request สำเร็จ `error` จะเป็น `null` และ `data` จะมี row อยู่ข้างใน ถ้าล้มเหลว `data` จะเป็น `null` และ `error` จะถูกเติมค่ามาแทน เพราะไม่มี exception ให้ catch คุณต้องเช็ค `error` เองทุกครั้ง ไม่งั้น request ที่ล้มเหลวจะดูเหมือนผลลัพธ์ว่างเปล่าไปเฉย ๆ
+query ของ `supabase-js` ไม่เคย throw เมื่อ request ล้มเหลว — จะ resolve เป็น object รูปแบบ `{ data, error }` เสมอ ถ้า request สำเร็จ `error` จะเป็น `null` และ `data` จะมี row อยู่ข้างใน ถ้าล้มเหลว `data` จะเป็น `null` และ `error` จะถูกเติมค่ามาแทน เพราะไม่มี exception ให้ catch คุณต้องเช็ค `error` เองทุกครั้ง ไม่งั้น request ที่ล้มเหลวจะดูเหมือนผลลัพธ์ว่างเปล่าไปเฉย ๆ
 
 `error` เป็น `PostgrestError` ที่มี 4 field ที่ควรรู้จัก
 
@@ -98,17 +98,17 @@ export const sdkQueryDiagram = `flowchart LR
   http --> result["Result: data and error"]`;
 
 <Callout title="สรุปหนึ่งบรรทัด">
-query builder ของ `supabase-js` — `.from()`, `.select()`, `.eq()`, `.order()`, `.insert()`, `.update()`, `.delete()` — เป็น typed wrapper ที่สร้าง request เดียวกับที่ PostgREST รับเป็น raw query string อยู่แล้ว และมัน resolve เป็น **`{ data, error }`** เสมอแทนที่จะ throw ดังนั้นต้องเช็ค `error` เอง (เป็น `PostgrestError` ที่มี **message**, **code**, **details** และ **hint**) ทุกครั้ง ส่วน related table ก็ embed ได้แบบเดียวกับ REST API โดยระบุชื่อ table ไว้ข้างใน `select()`
+query builder ของ `supabase-js` — `.from()`, `.select()`, `.eq()`, `.order()`, `.insert()`, `.update()`, `.delete()` — เป็น typed wrapper ที่สร้าง request เดียวกับที่ PostgREST รับเป็น raw query string อยู่แล้ว และ resolve เป็น **`{ data, error }`** เสมอแทนที่จะ throw ดังนั้นต้องเช็ค `error` เอง (เป็น `PostgrestError` ที่มี **message**, **code**, **details** และ **hint**) ทุกครั้ง ส่วน related table ก็ embed ได้แบบเดียวกับ REST API โดยระบุชื่อ table ไว้ข้างใน `select()`
 </Callout>
 
 export const quizSdkQuery = [
   {
     q: 'ผลลัพธ์จาก query ของ supabase-js มีรูปแบบอะไรเสมอ',
     options: [
-      'มัน throw exception เมื่อเกิด error เหมือน async function ทั่วไป',
-      'มัน resolve เป็น object รูปแบบ { data, error } ที่ต้องเช็คเอง',
-      'มันคืนแค่ row ดิบ ส่วน error จะถูก log ลง console ให้เองอัตโนมัติ',
-      'มันคืนแค่ boolean บอกว่าสำเร็จหรือล้มเหลวเท่านั้น',
+      'throw exception เมื่อเกิด error เหมือน async function ทั่วไป',
+      'resolve เป็น object รูปแบบ { data, error } ที่ต้องเช็คเอง',
+      'คืนแค่ row ดิบ ส่วน error จะถูก log ลง console ให้เองอัตโนมัติ',
+      'คืนแค่ boolean บอกว่าสำเร็จหรือล้มเหลวเท่านั้น',
     ],
     answer: 1,
   },

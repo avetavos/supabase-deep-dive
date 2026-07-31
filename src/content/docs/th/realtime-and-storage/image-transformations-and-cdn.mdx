@@ -45,9 +45,9 @@ const medium = supabase.storage.from('avatars').getPublicUrl('user123/photo.png'
 
 ## ทำไม CDN cache ถึงสำคัญตรงนี้
 
-request แรกของไฟล์หนึ่งบวก transform parameter ชุดหนึ่งต้องทำงานจริง Storage decode ต้นฉบับ, resize แล้วคืนผลลัพธ์กลับมา ถ้าทำแบบนี้ทุก request จะช้ามาก แต่มันไม่ช้าเพราะ output ที่ transform แล้วถูก cache ไว้ที่ **CDN edge** โดย key ด้วยไฟล์บวก transform parameter ที่ใช้เป๊ะ ๆ request ถัดไปที่ขอ `width`/`height`/`resize` ชุดเดิมบน object เดิมจะถูก serve ตรงจาก edge cache โดยไม่ต้อง reprocess รูปซ้ำอีก แต่ถ้าเปลี่ยน parameter ตัวไหนก็ตาม จะกลายเป็น cache key ใหม่ทันที variant ใหม่จะถูกสร้างแล้ว cache ตอน request แรกของมันเอง
+request แรกของไฟล์หนึ่งบวก transform parameter ชุดหนึ่งต้องทำงานจริง Storage decode ต้นฉบับ, resize แล้วคืนผลลัพธ์กลับมา ถ้าทำแบบนี้ทุก request จะช้ามาก แต่ไม่ช้าเพราะ output ที่ transform แล้วถูก cache ไว้ที่ **CDN edge** โดย key ด้วยไฟล์บวก transform parameter ที่ใช้เป๊ะ ๆ request ถัดไปที่ขอ `width`/`height`/`resize` ชุดเดิมบน object เดิมจะถูก serve ตรงจาก edge cache โดยไม่ต้อง reprocess รูปซ้ำอีก แต่ถ้าเปลี่ยน parameter ตัวไหนก็ตาม จะกลายเป็น cache key ใหม่ทันที variant ใหม่จะถูกสร้างแล้ว cache ตอน request แรกของตัวเอง
 
-มีข้อเท็จจริงที่ควรรู้ไว้ ใน Supabase แบบ hosted image transformation เป็นฟีเจอร์ที่จำกัดไว้กับ plan ที่เสียเงินเท่านั้น ไม่ได้มีให้ใช้ทุก plan ดังนั้นควรเช็ค plan ของตัวเองก่อนพึ่งพามันใน production
+มีข้อเท็จจริงที่ควรรู้ไว้ ใน Supabase แบบ hosted image transformation เป็นฟีเจอร์ที่จำกัดไว้กับ plan ที่เสียเงินเท่านั้น ไม่ได้มีให้ใช้ทุก plan ดังนั้นควรเช็ค plan ของตัวเองก่อนนำไปใช้จริงบน production
 
 ## trade-off เทียบกับการ pre-generate ขนาดเอง
 

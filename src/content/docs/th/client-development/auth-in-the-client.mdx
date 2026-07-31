@@ -12,7 +12,7 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
 
-`supabase.auth` ให้ `signUp`, `signInWithPassword` และ `signOut` มาขับเคลื่อน session ให้ `onAuthStateChange` มา sync UI ของแอปกับ session นั้นให้อัตโนมัติ และมีกฎที่ต้องจำไว้ตลอด — การเช็ก session ในโค้ดฝั่ง client เป็นแค่ UX convenience ในขณะที่ row level security บน database คือ security boundary จริง
+`supabase.auth` ให้ `signUp`, `signInWithPassword` และ `signOut` มาขับเคลื่อน session ให้ `onAuthStateChange` มา sync UI ของแอปกับ session นั้นให้อัตโนมัติ และมีกฎที่ต้องจำไว้ตลอด — การเช็ก session ในโค้ดฝั่ง client เป็นแค่ UX convenience ส่วน row level security บน database คือ security boundary จริง
 
 ## flow sign-up, sign-in, sign-out แบบสมบูรณ์
 
@@ -77,7 +77,7 @@ if (!session) {
 }
 ```
 
-สิ่งนี้มีประโยชน์จริง มันช่วยไม่ให้ protected content แวบขึ้นมาให้คนที่ sign out อยู่เห็น และไม่ต้องยิง request ที่รู้อยู่แล้วว่าจะ fail แต่ห้ามเข้าใจผิดว่านี่คือกลไก security จริง โค้ด JavaScript ฝั่ง client ถูก inspect, แก้ไข หรือข้ามไปเลยได้เสมอโดยคนที่ตั้งใจจะทำ ไม่มีอะไรห้ามใครสักคนยิงตรงไปที่ Supabase project ด้วย token ของตัวเอง ข้าม UI ของคุณไปทั้งหมด สิ่งที่เป็น boundary จริงว่า request หนึ่งจะอ่านหรือเขียน row ไหนได้บ้างคือ **row level security (RLS)** ที่ Postgres บังคับใช้เองฝั่ง server ไม่ว่า client จะเช็กหรือ render อะไรก็ตาม
+สิ่งนี้มีประโยชน์จริง เพราะช่วยไม่ให้ protected content แวบขึ้นมาให้คนที่ sign out อยู่เห็น และไม่ต้องยิง request ที่รู้อยู่แล้วว่าจะ fail แต่ห้ามเข้าใจผิดว่านี่คือกลไก security จริง โค้ด JavaScript ฝั่ง client ถูก inspect, แก้ไข หรือข้ามไปเลยได้เสมอโดยคนที่ตั้งใจจะทำ ไม่มีอะไรห้ามใครสักคนยิงตรงไปที่ Supabase project ด้วย token ของตัวเอง ข้าม UI ของคุณไปทั้งหมด สิ่งที่เป็น boundary จริงว่า request หนึ่งจะอ่านหรือเขียน row ไหนได้บ้างคือ **row level security (RLS)** ที่ Postgres บังคับใช้เองฝั่ง server ไม่ว่า client จะเช็กหรือ render อะไรก็ตาม
 
 <Mermaid title="A session drives the UI, but RLS is still the real gate" code={authClientDiagram} />
 
@@ -108,7 +108,7 @@ export const quizAuthClient = [
       'เพราะ getSession() ถูก deprecate ใน supabase-js แล้ว',
       'เพราะโค้ดฝั่ง client ถูก inspect หรือ bypass ได้โดยคนที่ตั้งใจ จึงเป็น security boundary จริงไม่ได้',
       'เพราะ session ไม่มีวันหมดอายุ เลยไม่จำเป็นต้องเช็ก',
-      'เพราะมันใช้ได้แค่กับ OAuth sign-in ไม่ใช่ password',
+      'เพราะใช้ได้แค่กับ OAuth sign-in ไม่ใช่ password',
     ],
     answer: 1,
   },
@@ -125,10 +125,10 @@ export const quizAuthClient = [
   {
     q: 'call อย่าง supabase.auth.signOut() resolve ออกมาเป็นรูปแบบไหน',
     options: [
-      'มัน throw exception ตอน fail แทนที่จะ return ค่า',
+      'throw exception ตอน fail แทนที่จะ return ค่า',
       'object รูปแบบ { data, error } (หรือ { error } สำหรับ signOut) ที่ต้องเช็กเอง',
       'boolean ธรรมดา true หรือ false',
-      'ไม่มีอะไรเลย มัน resolve เป็น undefined เสมอ',
+      'ไม่มีอะไรเลย resolve เป็น undefined เสมอ',
     ],
     answer: 1,
   },

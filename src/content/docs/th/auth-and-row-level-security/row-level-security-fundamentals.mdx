@@ -10,19 +10,19 @@ import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
-## แนวคิดในหนึ่งประโยค
+## ไอเดียในหนึ่งประโยค
 
 **Row Level Security (RLS)** คือ feature ของ Postgres เองที่ผูก policy เข้ากับ table เพื่อให้ Postgres คัดกรอง row ที่ role หนึ่ง ๆ อ่านหรือเขียนได้ในทุก query โดยอัตโนมัติ — ไม่ใช่สิ่งที่โค้ดฝั่งแอปต้องมานั่งจำไปเติมเป็น `where` clause เอง
 
-## RLS ไม่เปิดจนกว่าคุณจะเปิดมันเอง
+## RLS ปิดอยู่จนกว่าคุณจะเปิดเอง
 
-table ใหม่ใน Postgres จะมี RLS **ปิดอยู่** เสมอ ไม่มีการกรองอะไรทั้งนั้น role ไหนก็ตามที่มี `grant` บน table นั้นเห็นและแก้ทุก row ได้หมด คุณต้องเปิดมันเองแบบ explicit
+table ใหม่ใน Postgres จะมี RLS **ปิดอยู่** เสมอ ไม่มีการกรองอะไรทั้งนั้น role ไหนก็ตามที่มี `grant` บน table นั้นเห็นและแก้ทุก row ได้หมด คุณต้องเปิด RLS เองแบบ explicit
 
 ```sql
 alter table public.todos enable row level security;
 ```
 
-จุดที่คนเกือบทุกคนพลาดตอนเจอครั้งแรกคือตรงนี้ พอเปิด RLS บน table ที่ **ยังไม่มี policy เลยสักอัน** table นั้นจะกลายเป็น **เข้าไม่ได้เลย** สำหรับ role `anon` และ `authenticated` — ไม่ใช่ "เปิดกว้างโดย default" แต่คือ deny-by-default ถ้ารัน `alter table ... enable row level security` แค่บรรทัดเดียวข้างบน แล้ว query `todos` ผ่าน API จะได้ผลลัพธ์ว่างเปล่า (หรือ permission error) มันดูเหมือนอะไรบางอย่างพัง แต่จริง ๆ ไม่มีอะไรพังเลย RLS ที่ไม่มี policy หมายความว่าไม่มี role ไหนเห็นหรือแตะ row ได้จนกว่าคุณจะเพิ่ม policy ที่อนุญาตไว้ ทุก table ที่เปิด RLS ต้องมี policy อย่างน้อยหนึ่งอันต่อ operation ที่คุณต้องการให้ทำได้จริง
+จุดที่คนเกือบทุกคนพลาดตอนเจอครั้งแรกคือตรงนี้ พอเปิด RLS บน table ที่ **ยังไม่มี policy เลยสักอัน** table นั้นจะกลายเป็น **เข้าไม่ได้เลย** สำหรับ role `anon` และ `authenticated` — ไม่ใช่ "เปิดกว้างโดย default" แต่คือ deny-by-default ถ้ารัน `alter table ... enable row level security` แค่บรรทัดเดียวข้างบน แล้ว query `todos` ผ่าน API จะได้ผลลัพธ์ว่างเปล่า (หรือ permission error) ดูเหมือนมีอะไรพัง แต่จริง ๆ ไม่มีอะไรพังเลย RLS ที่ไม่มี policy หมายความว่าไม่มี role ไหนเห็นหรือแตะ row ได้จนกว่าคุณจะเพิ่ม policy ที่อนุญาตไว้ ทุก table ที่เปิด RLS ต้องมี policy อย่างน้อยหนึ่งอันต่อ operation ที่คุณต้องการให้ทำได้จริง
 
 ## กายวิภาคของ policy: using vs with check
 
@@ -44,7 +44,7 @@ with check (auth.uid() = user_id);
 
 ## auth.uid(): ตัวประกอบหลักที่ใช้บ่อยที่สุด
 
-`auth.uid()` คือ function ของ Postgres ที่ Supabase เตรียมไว้ให้ ดึง user ID ที่ authenticated แล้วของ request ปัจจุบันมาจาก JWT ที่พูดถึงในบทก่อนหน้าตรง ๆ มันคือ expression ที่พบบ่อยที่สุดใน RLS policy ของโลกจริง เพราะ "row นี้เป็นของ user คนปัจจุบันหรือเปล่า" คือกฎการเข้าถึงที่แอปต้องใช้บ่อยที่สุด
+`auth.uid()` คือ function ของ Postgres ที่ Supabase เตรียมไว้ให้ ดึง user ID ที่ authenticated แล้วของ request ปัจจุบันมาจาก JWT ที่พูดถึงในบทก่อนหน้าตรง ๆ นี่คือ expression ที่พบบ่อยที่สุดใน RLS policy ของโลกจริง เพราะ "row นี้เป็นของ user คนปัจจุบันหรือเปล่า" คือกฎการเข้าถึงที่แอปต้องใช้บ่อยที่สุด
 
 <Mermaid title="A query is filtered per row by the matching policy" code={rlsFundamentalsDiagram} />
 
@@ -56,7 +56,7 @@ export const rlsFundamentalsDiagram = `flowchart LR
   check --> result`;
 
 <Callout title="สรุปหนึ่งบรรทัด">
-**Row Level Security ไม่เปิดมาให้ตั้งแต่ต้น** — คุณต้องรัน `alter table your_table enable row level security;` เอง และพอเปิดแล้วแต่ **ไม่มี policy เลย** table จะถูกล็อกจนเข้าไม่ได้เลยสำหรับ `anon`/`authenticated` จนกว่าคุณจะเพิ่ม policy (deny-by-default ไม่ใช่ open-by-default) clause **`using`** ของ policy กรอง row ที่มีอยู่แล้วสำหรับ select/update/delete ส่วน **`with check`** ตรวจว่า row ใหม่หรือ row ที่แก้แล้วมีหน้าตายังไงถึงเขียนได้สำหรับ insert/update และ **`auth.uid()`** — ที่ดึง user ID ตรงจาก JWT ของ request — คือตัวประกอบหลักที่ policy ในโลกจริงเกือบทุกอันเขียนขึ้นรอบมัน
+**Row Level Security ไม่เปิดมาให้ตั้งแต่ต้น** — คุณต้องรัน `alter table your_table enable row level security;` เอง และพอเปิดแล้วแต่ **ไม่มี policy เลย** table จะถูกล็อกจนเข้าไม่ได้เลยสำหรับ `anon`/`authenticated` จนกว่าคุณจะเพิ่ม policy (deny-by-default ไม่ใช่ open-by-default) clause **`using`** ของ policy กรอง row ที่มีอยู่แล้วสำหรับ select/update/delete ส่วน **`with check`** ตรวจว่า row ใหม่หรือ row ที่แก้แล้วมีหน้าตายังไงถึงเขียนได้สำหรับ insert/update และ **`auth.uid()`** — ที่ดึง user ID ตรงจาก JWT ของ request — เป็นตัวประกอบหลักของ policy ในโลกจริงเกือบทุกอัน
 </Callout>
 
 export const quizRlsFundamentals = [

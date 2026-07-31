@@ -16,7 +16,7 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ทุก request พก role มาด้วย
 
-auto-generated API ของ Supabase authenticate ทุก request หรือไม่ก็ปฏิบัติกับมันแบบ anonymous อย่างชัดเจน ไม่ว่าจะเป็นแบบไหน request จะไปถึง Postgres ในฐานะหนึ่งในสาม role นี้
+auto-generated API ของ Supabase authenticate ทุก request หรือไม่ก็ปฏิบัติกับ request นั้นแบบ anonymous อย่างชัดเจน ไม่ว่าจะเป็นแบบไหน request จะไปถึง Postgres ในฐานะหนึ่งในสาม role นี้
 
 - **`anon`** — request ที่ไม่ได้ authenticate ไม่มี user login อยู่
 - **`authenticated`** — request จาก user ที่ login แล้ว พก JWT claim มาด้วย รวมถึง `auth.uid()` สำหรับระบุว่าเป็น user คนไหน
@@ -31,9 +31,9 @@ to authenticated
 using (auth.uid() = id);
 ```
 
-## PostgREST แปล HTTP เป็น SQL มันไม่ enforce อะไรเอง
+## PostgREST แปล HTTP เป็น SQL ไม่ enforce อะไรเอง
 
-**PostgREST** คือ service ที่แปล HTTP request แบบ `GET /rest/v1/profiles?select=*` ให้กลายเป็น SQL query จริง แล้วรัน query นั้น **ในฐานะ role ที่ request นั้นพกมา** จุดนี้สำคัญกว่าที่มันดูเผิน ๆ PostgREST ไม่ได้ implement authorization system แยกของตัวเองเลย มันพึ่งพา access control ของ Postgres เองทั้งหมด — permission แบบ `grant`/`revoke` ธรรมดา และ policy **Row Level Security** — เพื่อตัดสินว่า role นั้นทำอะไรได้จริงบ้าง access control อยู่ที่ database ไม่ใช่ที่ API layer ที่อยู่ด้านหน้า
+**PostgREST** คือ service ที่แปล HTTP request แบบ `GET /rest/v1/profiles?select=*` ให้กลายเป็น SQL query จริง แล้วรัน query นั้น **ในฐานะ role ที่ request นั้นพกมา** จุดนี้สำคัญกว่าที่ดูเผิน ๆ PostgREST ไม่ได้ implement authorization system แยกของตัวเองเลย แต่พึ่งพา access control ของ Postgres ทั้งหมด — permission แบบ `grant`/`revoke` ธรรมดา และ policy **Row Level Security** — เพื่อตัดสินว่า role นั้นทำอะไรได้จริงบ้าง access control อยู่ที่ database ไม่ใช่ที่ API layer ที่อยู่ด้านหน้า
 
 ```typescript
 // This client call becomes an HTTP request to PostgREST, executed as

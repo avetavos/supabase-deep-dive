@@ -10,7 +10,7 @@ import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
-## แนวคิดในหนึ่งประโยค
+## ไอเดียในหนึ่งประโยค
 
 **Database Webhook** ทำให้ row ที่เปลี่ยนแปลงใน Postgres เรียก Edge Function ได้อัตโนมัติ ส่วน `EdgeRuntime.waitUntil` ทำให้ function นั้นตอบกลับทันทีในขณะที่งานที่ช้ากว่ายังทำต่อในเบื้องหลัง
 
@@ -35,11 +35,11 @@ execute function supabase_functions.http_request(
 );
 ```
 
-ในทางปฏิบัติคุณตั้งค่านี้ผ่าน Dashboard ในส่วน Database Webhooks แทนที่จะเขียน trigger เอง แต่การรู้ว่ามันคือ "trigger บวก `pg_net`" ช่วยอธิบายว่าทำไมมันถึง asynchronous และทำไมมันชี้ไปที่ URL ของ Edge Function ได้เหมือน HTTP client ทั่วไป
+ในทางปฏิบัติคุณตั้งค่านี้ผ่าน Dashboard ในส่วน Database Webhooks แทนที่จะเขียน trigger เอง แต่การรู้ว่าเป็น "trigger บวก `pg_net`" ช่วยอธิบายว่าทำไม webhook ถึง asynchronous และทำไมถึงชี้ไปที่ URL ของ Edge Function ได้เหมือน HTTP client ทั่วไป
 
 ## ตอบกลับเร็วในขณะที่งานยังทำต่อ EdgeRuntime.waitUntil
 
-งานบางอย่างที่ trigger แบบนี้ไม่ควรทำให้ response ช้าลง เช่น ส่ง confirmation email เขียน analytics log หรือเรียก third-party API ที่ใช้เวลาสักไม่กี่วินาที การให้ผู้เรียกเดิม (ซึ่งมักเป็นกลไก webhook ของฐานข้อมูลเอง) รอสิ่งเหล่านั้นทั้งหมดเป็นเรื่องเสียเวลาเปล่า `EdgeRuntime.waitUntil(promise)` แก้ปัญหานี้ มันทำเครื่องหมาย promise ว่าเป็น background task ที่ยังรันต่อได้แม้ function จะส่ง response ไปแล้ว
+งานบางอย่างที่ trigger แบบนี้ไม่ควรทำให้ response ช้าลง เช่น ส่ง confirmation email เขียน analytics log หรือเรียก third-party API ที่ใช้เวลาสักไม่กี่วินาที การให้ผู้เรียกเดิม (ซึ่งมักเป็นกลไก webhook ของฐานข้อมูลเอง) รอสิ่งเหล่านั้นทั้งหมดเป็นเรื่องเสียเวลาเปล่า `EdgeRuntime.waitUntil(promise)` แก้ปัญหานี้ ทำเครื่องหมาย promise ว่าเป็น background task ที่ยังรันต่อได้แม้ function จะส่ง response ไปแล้ว
 
 ```typescript
 Deno.serve(async (req) => {
@@ -56,7 +56,7 @@ async function sendConfirmationEmail(payload: unknown) {
 }
 ```
 
-จุดสำคัญคือไม่มี `await` อยู่หน้า `sendConfirmationEmail(payload)` ถ้า await มันไป response จะต้องรอจนกว่า email จะส่งเสร็จ การส่ง promise ที่ยังไม่ resolve เข้า `waitUntil` คือการบอก Deno runtime ให้เก็บ instance ของ function ไว้จนกว่า promise นั้นจะจบ โดยไม่ทำให้ HTTP response ต้องรอ
+จุดสำคัญคือไม่มี `await` อยู่หน้า `sendConfirmationEmail(payload)` ถ้า await ตรงนั้น response จะต้องรอจนกว่า email จะส่งเสร็จ การส่ง promise ที่ยังไม่ resolve เข้า `waitUntil` คือการบอก Deno runtime ให้เก็บ instance ของ function ไว้จนกว่า promise นั้นจะจบ โดยไม่ทำให้ HTTP response ต้องรอ
 
 ## รวมสองอย่างเข้าด้วยกัน flow ยืนยันคำสั่งซื้อ
 

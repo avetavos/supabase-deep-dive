@@ -14,15 +14,15 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 Supabase project เริ่มต้นจาก Postgres instance แบบ hosted พร้อม API key สองตัวที่ระดับความน่าเชื่อถือต่างกันมาก และ Supabase CLI คือสิ่งที่ทำให้คุณ link folder บนเครื่องเข้ากับ project นั้น แล้วรันทั้ง stack บนเครื่องตัวเองด้วย Docker ได้
 
-## สร้าง project และ key สองตัวของมัน
+## สร้าง project และ key สองตัวของตัวเอง
 
-คุณสร้าง hosted project ใหม่ได้จาก dashboard ของ Supabase หรือ shortcut `database.new` เบื้องหลังมันจะ provision Postgres instance ของคุณเอง, API URL และ API key สองตัว
+คุณสร้าง hosted project ใหม่ได้จาก dashboard ของ Supabase หรือ shortcut `database.new` เบื้องหลัง Supabase จะ provision Postgres instance ของคุณเอง, API URL และ API key สองตัว
 
 - **`anon` key** — public ใช้ใน client-side code ได้ปลอดภัย (browser bundle, mobile app) request ที่ใช้ key นี้ต้องผ่าน Row Level Security
 - **`service_role` key** — secret, full-access, **bypass Row Level Security ทั้งหมด** ใช้เฉพาะกับ server-side code ที่เชื่อถือได้เท่านั้น
 
 <Callout title="ห้าม expose service_role key ใน client-side code เด็ดขาด">
-`service_role` key ข้าม RLS policy ทุกอันในทุก table ถ้ามันหลุดไปอยู่ใน browser bundle, mobile app หรือ code ที่ user เปิดดูได้ ใครก็ตามที่มี key นี้อ่านและเขียน database ทั้งหมดของคุณได้เลย เก็บมันไว้ใน environment variable ฝั่ง server เท่านั้น ห้ามอยู่ใน code ที่ ship ไปหา client เด็ดขาด นี่คือกฎที่คอร์สนี้จะย้ำอีกหลายครั้ง
+`service_role` key ข้าม RLS policy ทุกอันในทุก table ถ้า key นี้หลุดไปอยู่ใน browser bundle, mobile app หรือ code ที่ user เปิดดูได้ ใครก็ตามที่มี key นี้อ่านและเขียน database ทั้งหมดของคุณได้เลย เก็บไว้ใน environment variable ฝั่ง server เท่านั้น ห้ามอยู่ใน code ที่ ship ไปหา client เด็ดขาด นี่คือกฎที่คอร์สนี้จะย้ำอีกหลายครั้ง
 </Callout>
 
 ```typescript
@@ -59,7 +59,7 @@ supabase link --project-ref <project-ref>
 supabase start
 ```
 
-คำสั่งนี้จะสตาร์ท **Supabase stack ทั้งชุดบนเครื่องตัวเองผ่าน Docker** — Postgres, Studio, Auth, Storage, Realtime และอื่น ๆ รันเป็น container บนเครื่องคุณทั้งหมด นั่นแปลว่าคุณ develop และ test schema, RLS policy และ client code ได้แบบ offline เต็มรูปแบบ โดยไม่มีความเสี่ยงต่อ hosted project เลย ก่อนที่จะรัน `supabase db push` ใส่มันจริง ๆ
+คำสั่งนี้จะสตาร์ท **Supabase stack ทั้งชุดบนเครื่องตัวเองผ่าน Docker** — Postgres, Studio, Auth, Storage, Realtime และอื่น ๆ รันเป็น container บนเครื่องคุณทั้งหมด นั่นแปลว่าคุณ develop และ test schema, RLS policy และ client code ได้แบบ offline เต็มรูปแบบ โดยไม่มีความเสี่ยงต่อ hosted project เลย ก่อนจะรัน `supabase db push` ขึ้นของจริง
 
 <Mermaid title="Local Docker-based stack ที่ link เข้ากับ hosted project" code={cliSetupDiagram} />
 
@@ -95,10 +95,10 @@ export const quizCliSetup = [
   {
     q: 'ทำไม service_role key ห้ามหลุดไปถึง client-side code',
     options: [
-      'มันหมดอายุหลังใช้ครั้งเดียว',
-      'มันใช้ได้แค่กับ GraphQL ไม่ใช่ REST',
-      'มัน bypass Row Level Security ดังนั้นใครก็ตามที่มี key นี้อ่านเขียน database ทั้งหมดได้',
-      'มันช้ากว่า anon key',
+      'หมดอายุหลังใช้ครั้งเดียว',
+      'ใช้ได้แค่กับ GraphQL ไม่ใช่ REST',
+      'bypass Row Level Security ดังนั้นใครก็ตามที่มี key นี้อ่านเขียน database ทั้งหมดได้',
+      'ช้ากว่า anon key',
     ],
     answer: 2,
   },

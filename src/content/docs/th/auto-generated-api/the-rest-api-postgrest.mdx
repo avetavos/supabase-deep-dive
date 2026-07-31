@@ -16,7 +16,7 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## จาก table สู่ endpoint
 
-เมื่อคุณสร้าง table `public.movies` คุณไม่ต้องเขียน controller, route หรือ serializer ให้มันเลย PostgREST เชื่อมต่อกับ database ของคุณ introspect schema (table, column, type, foreign key) แล้ว generate REST endpoint ที่ตรงกันตอน request มาถึง table นี้จะเรียกใช้ได้ที่
+เมื่อคุณสร้าง table `public.movies` คุณไม่ต้องเขียน controller, route หรือ serializer ให้เลย PostgREST เชื่อมต่อกับ database ของคุณ introspect schema (table, column, type, foreign key) แล้ว generate REST endpoint ที่ตรงกันตอน request มาถึง table นี้จะเรียกใช้ได้ที่
 
 ```bash
 GET /rest/v1/movies
@@ -112,8 +112,8 @@ export const quizPostgrestApi = [
     q: 'PostgREST รู้ได้อย่างไรว่า embed resource ที่เกี่ยวข้องอย่าง director เข้าไปใน response ของ movie ได้',
     options: [
       'ต้องเขียน custom resolver function ให้ทุกความสัมพันธ์',
-      'มันอ่าน foreign-key constraint จริงที่ประกาศไว้ใน schema',
-      'มันเดาจากชื่อ column ที่ตรงกัน',
+      'อ่าน foreign-key constraint จริงที่ประกาศไว้ใน schema',
+      'เดาจากชื่อ column ที่ตรงกัน',
       'การ embed ทำได้แค่ผ่าน GraphQL เท่านั้น ใช้กับ REST ไม่ได้',
     ],
     answer: 1,

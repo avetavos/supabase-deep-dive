@@ -12,11 +12,11 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
 
-table หรือ function ต้องผ่าน **สองด่านแยกกัน** ก่อนที่ request จะทั้งปลอดภัยและสำเร็จ **Data API exposure** ตัดสินว่ามันเข้าถึงผ่าน API ได้เลยไหม ส่วน **Row Level Security** ตัดสินว่า request ที่เข้าถึงได้แล้วเห็นหรือแก้ row ไหนได้บ้าง
+table หรือ function ต้องผ่าน **สองด่านแยกกัน** ก่อนที่ request จะทั้งปลอดภัยและสำเร็จ **Data API exposure** ตัดสินว่าเข้าถึงผ่าน API ได้เลยไหม ส่วน **Row Level Security** ตัดสินว่า request ที่เข้าถึงได้แล้วเห็นหรือแก้ row ไหนได้บ้าง
 
 ## ด่านที่ 1 — Data API exposure
 
-tutorial เก่า ๆ ของ Supabase หลายอันเล่าแค่เรื่อง RLS เหมือนมันคือทั้งหมด แต่ไม่ใช่ ก่อนที่ RLS จะถูกประเมินด้วยซ้ำ Postgres ต้อง grant สิทธิ์ให้ role ที่ request เข้ามา — `anon`, `authenticated` หรือ `service_role` — ให้แตะต้อง table หรือ function นั้นได้ก่อน ในโปรเจกต์ Supabase ปัจจุบัน ขั้นตอนนี้ไม่ได้เกิดขึ้นอัตโนมัติ คุณต้อง expose table และ function ที่ต้องการไว้ในหน้า **Integrations → Data API** ของ dashboard หรือเปิด **Default privileges for new entities** เพื่อให้ object ใหม่ที่สร้างใน schema `public` ได้สิทธิ์เข้าถึงไปเรื่อย ๆ
+tutorial เก่า ๆ ของ Supabase หลายอันเล่าแค่เรื่อง RLS เหมือนว่า RLS คือทั้งหมด แต่ไม่ใช่ ก่อนที่ RLS จะถูกประเมินด้วยซ้ำ Postgres ต้อง grant สิทธิ์ให้ role ที่ request เข้ามา — `anon`, `authenticated` หรือ `service_role` — ให้แตะต้อง table หรือ function นั้นได้ก่อน ในโปรเจกต์ Supabase ปัจจุบัน ขั้นตอนนี้ไม่ได้เกิดขึ้นอัตโนมัติ คุณต้อง expose table และ function ที่ต้องการไว้ในหน้า **Integrations → Data API** ของ dashboard หรือเปิด **Default privileges for new entities** เพื่อให้ object ใหม่ที่สร้างใน schema `public` ได้สิทธิ์เข้าถึงไปเรื่อย ๆ
 
 เบื้องหลังคือคำสั่ง `grant` ธรรมดาของ Postgres
 
@@ -34,12 +34,12 @@ grant execute on function public.your_function to authenticated, service_role;
 
 ## ด่านที่ 2 — Row Level Security
 
-เมื่อ table ผ่านด่าน exposure แล้ว **Row Level Security** (RLS) จะเข้ามาทำงานต่อและตอบคำถามที่แคบลง สำหรับ request ที่เข้ามาในนาม `anon`, `authenticated` หรือ user ที่ authenticated ตัวใดตัวหนึ่ง มันเห็นหรือแก้ **row** ไหนได้บ้าง RLS policy เป็นหัวข้อของ module ถัดไปทั้งหมด ดังนั้นสิ่งที่ต้องจำจากบทนี้คือแค่เส้นแบ่งระหว่างสองชั้นนี้
+เมื่อ table ผ่านด่าน exposure แล้ว **Row Level Security** (RLS) จะเข้ามาทำงานต่อและตอบคำถามที่แคบลง สำหรับ request ที่เข้ามาในนาม `anon`, `authenticated` หรือ user ที่ authenticated ตัวใดตัวหนึ่ง request นั้นเห็นหรือแก้ **row** ไหนได้บ้าง RLS policy เป็นหัวข้อของ module ถัดไปทั้งหมด ดังนั้นสิ่งที่ต้องจำจากบทนี้คือแค่เส้นแบ่งระหว่างสองชั้นนี้
 
 - **Data API exposure** — ระดับ table/function object นี้เข้าถึงผ่าน API ได้เลยไหม
 - **Row Level Security** — ระดับ row ในเมื่อเข้าถึงได้แล้ว request นี้เห็น row ไหนบ้าง
 
-ทั้งสองต้อง config ให้ถูกทั้งคู่ มี exposure แต่ไม่มี RLS หมายความว่า table ที่เข้าถึงได้ทางเทคนิคจะคืนทุก row ให้ใครก็ตามที่ได้สิทธิ์เข้าถึง มี RLS แต่ไม่มี exposure หมายความว่า policy ที่ scope ไว้ถูกต้องแล้วจะไม่มี request ไหนไปถึงมันได้เลย เพราะ table ไม่เคยถูก expose ตั้งแต่แรก
+ทั้งสองต้อง config ให้ถูกทั้งคู่ มี exposure แต่ไม่มี RLS หมายความว่า table ที่เข้าถึงได้ทางเทคนิคจะคืนทุก row ให้ใครก็ตามที่ได้สิทธิ์เข้าถึง มี RLS แต่ไม่มี exposure หมายความว่า policy ที่ scope ไว้ถูกต้องแล้วจะไม่มี request ไหนไปถึงได้เลย เพราะ table ไม่เคยถูก expose ตั้งแต่แรก
 
 ```sql
 -- Layer 2 lives on the table once it clears layer 1
@@ -54,7 +54,7 @@ using (auth.uid() = user_id);
 
 ## `service_role` ข้าม RLS ไปเลยทั้งหมด
 
-Postgres จะข้าม row level security ให้ role ใดก็ตามที่มี attribute `BYPASSRLS` และ `service_role` มี attribute นี้ request ที่ authenticate ด้วย `service_role` key ยังต้องผ่านด่าน 1 อยู่ (ต้องมี grant รองรับ แม้ปกติ `service_role` จะได้สิทธิ์กว้างอยู่แล้ว) แต่พอผ่านแล้ว RLS policy จะไม่ถูกใช้กับมันเลย มันเห็นและแก้ได้ทุก row นี่คือเหตุผลที่ `service_role` key ต้องไม่หลุดไปอยู่ใน browser หรือ mobile client เด็ดขาด สอดคล้องกับคำเตือนจาก module Foundations key นี้มีไว้สำหรับโค้ดฝั่ง server ที่เชื่อถือได้เท่านั้น ที่คุณต้อง enforce กฎการเข้าถึงเองแทนที่จะพึ่ง RLS
+Postgres จะข้าม row level security ให้ role ใดก็ตามที่มี attribute `BYPASSRLS` และ `service_role` มี attribute นี้ request ที่ authenticate ด้วย `service_role` key ยังต้องผ่านด่าน 1 อยู่ (ต้องมี grant รองรับ แม้ปกติ `service_role` จะได้สิทธิ์กว้างอยู่แล้ว) แต่พอผ่านแล้ว RLS policy จะไม่ถูกใช้กับ `service_role` เลย role นี้เห็นและแก้ได้ทุก row นี่คือเหตุผลที่ `service_role` key ต้องไม่หลุดไปอยู่ใน browser หรือ mobile client เด็ดขาด สอดคล้องกับคำเตือนจาก module Foundations key นี้มีไว้สำหรับโค้ดฝั่ง server ที่เชื่อถือได้เท่านั้น ที่คุณต้อง enforce กฎการเข้าถึงเองแทนที่จะพึ่ง RLS
 
 <Mermaid title="Request ที่ผ่านด่าน exposure แล้วต่อด้วย RLS" code={securityLayersDiagram} />
 
@@ -68,7 +68,7 @@ export const securityLayersDiagram = `flowchart TB
   gate2 -- "policy matches" --> scoped["Only matching rows visible/modifiable"]`;
 
 <Callout title="สรุปหนึ่งบรรทัด">
-security ของ Data API ใน Supabase มี **สองชั้น** ไม่ใช่ชั้นเดียว **Data API exposure** — ผ่านหน้า dashboard **Integrations → Data API** "Default privileges for new entities" หรือคำสั่ง `grant` ธรรมดาของ Postgres ให้ `anon`/`authenticated`/`service_role` — เป็นด่านระดับ table/function ที่ตัดสินว่า object นั้นเข้าถึงผ่าน API ได้ **เลยไหม** และเมื่อ request ผ่านด่านนั้นแล้วเท่านั้น **Row Level Security** ถึงจะตัดสินว่ามันเห็นหรือแก้ **row** ไหนได้บ้าง `service_role` มี attribute `BYPASSRLS` และข้าม RLS ไปทั้งหมด นี่คือเหตุผลที่ key ตัวนี้ต้องอยู่ฝั่ง server เท่านั้น
+security ของ Data API ใน Supabase มี **สองชั้น** ไม่ใช่ชั้นเดียว **Data API exposure** — ผ่านหน้า dashboard **Integrations → Data API** "Default privileges for new entities" หรือคำสั่ง `grant` ธรรมดาของ Postgres ให้ `anon`/`authenticated`/`service_role` — เป็นด่านระดับ table/function ที่ตัดสินว่า object นั้นเข้าถึงผ่าน API ได้ **เลยไหม** และเมื่อ request ผ่านด่านนั้นแล้วเท่านั้น **Row Level Security** ถึงจะตัดสินว่าเห็นหรือแก้ **row** ไหนได้บ้าง `service_role` มี attribute `BYPASSRLS` และข้าม RLS ไปทั้งหมด นี่คือเหตุผลที่ key ตัวนี้ต้องอยู่ฝั่ง server เท่านั้น
 </Callout>
 
 export const quizSecuringApi = [

@@ -1,6 +1,6 @@
 ---
 title: 'Branching และ Migrations Workflow'
-description: 'Supabase branching สร้าง preview copy ของ database ที่ผูกกับ Git branch แยกต่างหากยังไง และ migration ไหลผ่านมันไปสู่ production ยังไง'
+description: 'Supabase branching สร้าง preview copy ของ database ที่ผูกกับ Git branch แยกต่างหากยังไง และ migration ไหลจาก branch ไปสู่ production ยังไง'
 sidebar:
   order: 2
 ---
@@ -12,11 +12,11 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
 
-Supabase branch คือ preview copy เต็มรูปแบบของ project คุณที่ผูกกับ Git branch หรือ pull request — มี Postgres schema แยกเป็นของตัวเอง และถ้าต้องการก็มี seed data เป็นของตัวเองด้วย — เพื่อให้คุณ test schema change แบบแยกส่วนก่อนที่มันจะไปแตะ production จริง เหมือนกับที่ preview deployment แยกส่วน app code ของคุณนั่นแหละ
+Supabase branch คือ preview copy เต็มรูปแบบของ project คุณที่ผูกกับ Git branch หรือ pull request — มี Postgres schema แยกเป็นของตัวเอง และถ้าต้องการก็มี seed data เป็นของตัวเองด้วย — เพื่อให้คุณ test schema change แบบแยกส่วนก่อนที่จะไปแตะ production จริง เหมือนกับที่ preview deployment แยกส่วน app code ของคุณนั่นแหละ
 
 ## Supabase branch คืออะไรกันแน่
 
-ถ้าไม่มี branching การ "test schema change" ก็มักจะหมายถึงการรันมันเข้ากับ staging database ที่ใช้ร่วมกัน หรือแย่กว่านั้นคือรันตรงเข้า production เลย Supabase branch แทนที่จะทำแบบนั้น มันจะ provision Postgres instance ที่แยกจริง ๆ ตลอดอายุของ Git branch หรือ pull request นั้น — มี schema เป็นของตัวเอง, Data API เป็นของตัวเอง, Auth กับ Storage เป็นของตัวเอง และถ้าคุณขอ ก็จะได้ clone ของข้อมูล production ด้วย
+ถ้าไม่มี branching การ "test schema change" ก็มักจะหมายถึงการรัน change นั้นเข้ากับ staging database ที่ใช้ร่วมกัน หรือแย่กว่านั้นคือรันตรงเข้า production เลย Supabase branch แทนที่จะทำแบบนั้น จะ provision Postgres instance ที่แยกจริง ๆ ตลอดอายุของ Git branch หรือ pull request นั้น — มี schema เป็นของตัวเอง, Data API เป็นของตัวเอง, Auth กับ Storage เป็นของตัวเอง และถ้าคุณขอ ก็จะได้ clone ของข้อมูล production ด้วย
 
 ```bash
 # Create a persistent preview branch (stays around across pushes, not tied to a single PR)
@@ -29,11 +29,11 @@ supabase --experimental branches create feature-add-comments --with-data
 supabase --experimental branches list
 ```
 
-นี่ไม่ใช่ feature flag ที่เปิด-ปิดอยู่ข้างใน database เดียวที่ใช้ร่วมกัน — มันคือ database ที่แยกออกมาจริง ๆ ซึ่งนั่นคือเหตุผลว่าทำไมมันปลอดภัยที่จะรัน migration แบบทำลายข้อมูล, seed test data แปลก ๆ หรือลอง `alter table` ที่เสี่ยง ๆ เข้ากับมันโดยไม่มีความเสี่ยงต่อ production เลย
+นี่ไม่ใช่ feature flag ที่เปิด-ปิดอยู่ข้างใน database เดียวที่ใช้ร่วมกัน — นี่คือ database ที่แยกออกมาจริง ๆ ซึ่งเป็นเหตุผลว่าทำไมถึงปลอดภัยที่จะรัน migration แบบทำลายข้อมูล, seed test data แปลก ๆ หรือลอง `alter table` ที่เสี่ยง ๆ ได้ โดยไม่กระทบ production เลย
 
 ## Migration คือรูปแบบไฟล์ที่ผูก branch เข้ากับ production
 
-branch จะยังมีประโยชน์อยู่ก็ต่อเมื่อ schema change ที่ test บนมันสามารถเอาไป replay ซ้ำที่อื่นได้อย่างน่าเชื่อถือ นั่นคือหน้าที่ของ migration — ไฟล์ SQL ธรรมดา ที่ถูก commit เข้า version control และ apply ตามลำดับ
+branch จะยังมีประโยชน์อยู่ก็ต่อเมื่อ schema change ที่ test บน branch นั้นเอาไป replay ซ้ำที่อื่นได้อย่างน่าเชื่อถือ นั่นคือหน้าที่ของ migration — ไฟล์ SQL ธรรมดา ที่ถูก commit เข้า version control และ apply ตามลำดับ
 
 ```bash
 # Create a new, timestamped SQL migration file under supabase/migrations/
@@ -46,11 +46,11 @@ supabase db push
 supabase db diff --schema public
 ```
 
-`supabase migration new` ให้ไฟล์ `.sql` เปล่า ๆ ที่มี timestamp กำกับ ให้คุณเขียนคำสั่ง `create table` (หรือ `alter table`) ลงไปเอง `supabase db diff` ครอบคลุมกรณีตรงข้าม คือมีคนแก้ผ่าน Studio GUI แล้วคุณอยากจับ change นั้นเป็น migration file ที่เป็นทางการ แทนที่จะปล่อยให้มันอยู่แค่ใน database ไม่ว่าจะทางไหน `supabase db push` จะ apply ทุก migration ที่ยังไม่เคยรันเข้ากับ project หรือ branch ที่มันชี้ไป — คำสั่งเดียวกัน ไม่ว่าเป้าหมายจะเป็น preview branch หรือ production
+`supabase migration new` ให้ไฟล์ `.sql` เปล่า ๆ ที่มี timestamp กำกับ ให้คุณเขียนคำสั่ง `create table` (หรือ `alter table`) ลงไปเอง `supabase db diff` ครอบคลุมกรณีตรงข้าม คือมีคนแก้ผ่าน Studio GUI แล้วคุณอยากจับ change นั้นเป็น migration file ที่เป็นทางการ แทนที่จะปล่อยให้ค้างอยู่แค่ใน database ไม่ว่าจะทางไหน `supabase db push` จะ apply ทุก migration ที่ยังไม่เคยรันเข้ากับ project หรือ branch ที่ชี้ไป — คำสั่งเดียวกัน ไม่ว่าเป้าหมายจะเป็น preview branch หรือ production
 
 ## Deploy migration ผ่าน CI ไม่ใช่มือคน
 
-คุณค่าของ branching แทบจะหายไปถ้าหลังจาก test migration บน branch แล้ว มีคนเปิด SQL editor แล้ววางมันเข้า production เอง จุดนี้แหละที่ typo, ไฟล์ที่ลืมรัน และ migration ที่ผิดลำดับมักจะแอบเข้ามา ทางแก้คือทำให้ `supabase db push` เป็นส่วนหนึ่งของ CI pipeline เดียวกับที่ deploy application code ของคุณ เพื่อให้ schema change ถูก ship อัตโนมัติและตามลำดับทุกครั้งที่ pull request ถูก merge
+คุณค่าของ branching แทบจะหายไปถ้าหลังจาก test migration บน branch แล้ว มีคนเปิด SQL editor แล้ววาง SQL เข้า production เอง จุดนี้แหละที่ typo, ไฟล์ที่ลืมรัน และ migration ที่ผิดลำดับมักจะแอบเข้ามา ทางแก้คือทำให้ `supabase db push` เป็นส่วนหนึ่งของ CI pipeline เดียวกับที่ deploy application code ของคุณ เพื่อให้ schema change ถูก ship อัตโนมัติและตามลำดับทุกครั้งที่ pull request ถูก merge
 
 ```bash
 # A representative CI step — runs after tests pass, before or alongside the app deploy
@@ -58,7 +58,7 @@ supabase link --project-ref "$SUPABASE_PROJECT_REF"
 supabase db push
 ```
 
-เมื่อตั้งค่าแบบนี้แล้ว migration file ที่ merge เข้า main branch จะถูก apply เข้า production แบบเดียวกันทุกครั้ง โดย automated process ตัวเดียวกับที่ test มันกับ preview branch มาแล้ว — ไม่มีคนมารัน SQL แบบ ad hoc เข้า database ที่รันจริงอยู่ และไม่มี environment ไหนแอบ drift ออกจากสิ่งที่อยู่ใน version control
+เมื่อตั้งค่าแบบนี้แล้ว migration file ที่ merge เข้า main branch จะถูก apply เข้า production แบบเดียวกันทุกครั้ง โดย automated process ตัวเดียวกับที่ test บน preview branch มาแล้ว — ไม่มีคนมารัน SQL แบบ ad hoc เข้า database ที่รันจริงอยู่ และไม่มี environment ไหนแอบ drift ออกจากสิ่งที่อยู่ใน version control
 
 <Mermaid title="A Git branch flows through an isolated Supabase preview branch, then merges to production" code={branchingDiagram} />
 
@@ -95,12 +95,12 @@ export const quizBranchingMigrations = [
     answer: 1,
   },
   {
-    q: 'ทำไมการรัน `supabase db push` ผ่าน CI ถึงสำคัญกว่าการรันมันเองด้วยมือเข้า production',
+    q: 'ทำไมการรัน `supabase db push` ผ่าน CI ถึงสำคัญกว่าการรันเองด้วยมือเข้า production',
     options: [
       'ไม่สำคัญ เพราะทั้งสองวิธีปลอดภัยเท่ากัน',
-      'การรันผ่าน CI จะ apply migration อัตโนมัติตามลำดับ เป็นส่วนหนึ่งของ pipeline เดียวกับที่ test มันบน branch มาแล้ว หลีกเลี่ยง ad hoc SQL และไฟล์ที่ลืมรันหรือผิดลำดับ',
+      'การรันผ่าน CI จะ apply migration อัตโนมัติตามลำดับ เป็นส่วนหนึ่งของ pipeline เดียวกับที่ test บน branch มาแล้ว หลีกเลี่ยง ad hoc SQL และไฟล์ที่ลืมรันหรือผิดลำดับ',
       'CI จำเป็นเพราะ `supabase db push` รันจากเครื่อง local ไม่ได้เลย',
-      'มันสำคัญเฉพาะ project ที่ไม่ได้ใช้ branching เท่านั้น',
+      'สำคัญเฉพาะ project ที่ไม่ได้ใช้ branching เท่านั้น',
     ],
     answer: 1,
   },
