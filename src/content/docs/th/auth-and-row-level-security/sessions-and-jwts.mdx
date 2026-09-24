@@ -41,6 +41,10 @@ const { data: { session } } = await supabase.auth.getSession();
 const { data: { user }, error } = await supabase.auth.getUser();
 ```
 
+<Callout title="อัปเดตปี 2025: asymmetric signing key กับ getClaims()">
+Project ใหม่ ๆ ของ Supabase สลับ Auth จาก shared secret แบบ HS256 เดิม มาใช้ **asymmetric JWT signing key** (ECC, `ES256`) ได้ ทำให้ JWT ถูกตรวจสอบด้วย public key ที่ดึงมาจาก discovery endpoint แทนที่จะต้องพึ่ง secret ที่มีแค่ Auth server เท่านั้นที่รู้ นี่คือสิ่งที่ทำให้ `supabase.auth.getClaims()` เป็นไปได้ — มันตรวจ signature ของ JWT ในเครื่อง (หรือผ่าน public key ที่ cache ไว้) แล้วคืน claim กลับมาโดยไม่ต้อง round trip ไปหา Auth server ซึ่งเร็วกว่า `getUser()` สำหรับการยืนยันแบบเดียวกันว่า token ยังใช้ได้จริง และปลอดภัยกว่าการเชื่อผลจาก `getSession()` ที่ไม่ได้ตรวจสอบใหม่ในกรณีที่เรื่องนี้สำคัญ project ที่ยังใช้ shared secret แบบเดิมก็ยังทำงานเหมือนที่อธิบายไว้ข้างบนได้ตามปกติ — asymmetric key เป็นการ migrate แบบสมัครใจ ไม่ใช่ breaking change
+</Callout>
+
 ## ให้ทุกอย่างซิงก์กัน: onAuthStateChange
 
 sign-in, sign-out และ token refresh ทั้งหมดเกิดขึ้นแบบ asynchronous ดังนั้นโค้ดฝั่ง UI ต้องมีวิธีตอบสนองต่อการเปลี่ยนแปลงเหล่านี้ แทนที่จะคอย poll เอง `supabase.auth.onAuthStateChange` ลงทะเบียน listener ที่ยิงทุกครั้งที่ event พวกนี้เกิดขึ้น พร้อมชื่อ event และ session ปัจจุบัน เป็นวิธีมาตรฐานในการทำให้ state ฝั่ง client (nav bar ที่โชว์ว่า sign-in แล้ว, redirect หลัง logout และอื่น ๆ) ตรงกับ auth state จริง

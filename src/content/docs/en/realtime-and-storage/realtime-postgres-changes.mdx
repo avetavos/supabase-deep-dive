@@ -55,6 +55,10 @@ alter table public.messages replica identity full;
 
 With `replica identity full` in place, `payload.old` on an `UPDATE` or `DELETE` event contains every column of the row as it existed before the change, not just its primary key.
 
+<Callout title="At scale: Broadcast instead of Postgres Changes">
+Postgres Changes authorizes every event against every subscriber individually, so its throughput scales with the number of subscribers watching the same change, not with how fast rows are written — Supabase's own guidance is to switch to Broadcast instead (a trigger calls the `realtime.broadcast_changes()` function on every row change, and clients subscribe to that channel the same way the next lesson's Broadcast covers) once you expect more than a few thousand concurrent subscribers on the same change. For typical app traffic Postgres Changes as described above is the right default; treat this as the scaling escape hatch, not something to reach for on day one.
+</Callout>
+
 <Mermaid title="A row change only reaches a client if the table is in the publication" code={postgresChangesDiagram} />
 
 export const postgresChangesDiagram = `flowchart LR

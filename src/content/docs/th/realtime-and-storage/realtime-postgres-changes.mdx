@@ -55,6 +55,10 @@ alter table public.messages replica identity full;
 
 พอตั้ง `replica identity full` แล้ว `payload.old` ใน event `UPDATE` หรือ `DELETE` จะมีทุก column ของ row ตามสภาพก่อนเปลี่ยน ไม่ใช่แค่ primary key อีกต่อไป
 
+<Callout title="เมื่อ scale ใหญ่ขึ้น: ใช้ Broadcast แทน Postgres Changes">
+Postgres Changes ต้องตรวจสิทธิ์ (authorize) ทุก event แยกกับ subscriber ทุกตัว ดังนั้น throughput จะ scale ตามจำนวน subscriber ที่ดู change เดียวกัน ไม่ใช่ตามความเร็วในการเขียน row — คำแนะนำจาก Supabase เองคือให้เปลี่ยนไปใช้ Broadcast แทน (ใช้ trigger เรียกฟังก์ชัน `realtime.broadcast_changes()` ทุกครั้งที่ row เปลี่ยน แล้ว client subscribe channel นั้นแบบเดียวกับที่บท Broadcast ถัดไปจะอธิบาย) เมื่อคาดว่าจะมี concurrent subscriber มากกว่าหลักพันบนการเปลี่ยนแปลงเดียวกัน สำหรับ traffic ทั่วไปของแอป Postgres Changes ตามที่อธิบายไว้ข้างบนยังคือตัวเลือก default ที่ถูกต้อง ให้มองเรื่องนี้เป็นทางออกตอน scale ใหญ่ ไม่ใช่สิ่งที่ต้องรีบใช้ตั้งแต่วันแรก
+</Callout>
+
 <Mermaid title="row change จะถึง client ได้ก็ต่อเมื่อ table อยู่ใน publication" code={postgresChangesDiagram} />
 
 export const postgresChangesDiagram = `flowchart LR

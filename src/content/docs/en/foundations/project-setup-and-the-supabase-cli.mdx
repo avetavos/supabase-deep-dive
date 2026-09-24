@@ -25,6 +25,10 @@ You create a new hosted project from the Supabase dashboard, or the shortcut `da
 The `service_role` key skips every RLS policy on every table. If it ends up in a browser bundle, a mobile app, or any code a user can inspect, anyone can read and write your entire database. Keep it in server-only environment variables, never in code that ships to a client. This is a rule the rest of this course keeps coming back to.
 </Callout>
 
+<Callout title="Naming update: publishable and secret keys">
+Since late 2025, new Supabase projects are issued a **publishable key** (`sb_publishable_...`) and a **secret key** (`sb_secret_...`) instead of the legacy `anon` and `service_role` JWTs — they play exactly the same roles (publishable is safe for clients, secret bypasses RLS and stays server-side), just as shorter, non-JWT strings that can be rotated without downtime. Existing `anon`/`service_role` keys keep working, and this course still calls them `anon` and `service_role` throughout since that is what the underlying Postgres roles are named, but if your project's dashboard shows `sb_publishable_...`/`sb_secret_...` instead, that is the same distinction under a new name.
+</Callout>
+
 ```typescript
 // Server-side only — e.g. an API route, a cron job, an Edge Function.
 // process.env.SUPABASE_SERVICE_ROLE_KEY must never be bundled into client code.

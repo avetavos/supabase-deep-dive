@@ -56,7 +56,7 @@ Auth, Storage, and Realtime are separate services (separate processes), but none
 
 export const architectureDiagram = `flowchart LR
   client["Client request (anon / authenticated / service_role)"] --> postgrest["PostgREST"]
-  postgrest -->|"executes SQL as that role"| pg[("Postgres\n(grants + RLS enforced here)")]
+  postgrest -->|"executes SQL as that role"| pg[("Postgres<br/>(grants + RLS enforced here)")]
   auth["Auth (GoTrue)"] --> pg
   storage["Storage"] --> pg
   realtime["Realtime (reads WAL)"] --> pg`;

@@ -41,6 +41,10 @@ const { data: { session } } = await supabase.auth.getSession();
 const { data: { user }, error } = await supabase.auth.getUser();
 ```
 
+<Callout title="2025 update: asymmetric signing keys and getClaims()">
+Newer Supabase projects can switch Auth from the legacy shared HS256 secret to **asymmetric JWT signing keys** (ECC, `ES256`), so a JWT is verified against a public key fetched from a discovery endpoint instead of a secret only the Auth server holds. This makes `supabase.auth.getClaims()` possible: it verifies the JWT's signature locally (or via a cached public key) and returns its claims without a network round trip to the Auth server — faster than `getUser()` for that same "is this token genuinely valid" guarantee, and safer than trusting `getSession()`'s unverified local read when the check matters. Projects on the legacy shared-secret setup keep working exactly as described above; asymmetric keys are an opt-in migration, not a breaking change.
+</Callout>
+
 ## Staying in sync: onAuthStateChange
 
 Sign-in, sign-out, and token refresh all happen asynchronously, so UI code needs a way to react to them rather than polling. `supabase.auth.onAuthStateChange` registers a listener that fires on every one of those events with the event name and the current session, which is the standard way to keep client-side UI state (a signed-in nav bar, a redirect after logout, and so on) in sync with the actual auth state.

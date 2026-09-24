@@ -55,6 +55,10 @@ supabase functions deploy hello-world
 
 `supabase functions new` สร้างไฟล์และโฟลเดอร์ boilerplate ให้ `supabase functions serve` เปิด Deno runtime ในเครื่องเพื่อให้ทดสอบได้โดยไม่ต้อง deploy `supabase functions deploy` อัปโหลด function ให้ infrastructure ฝั่ง edge ของ Supabase รันใกล้จุดที่ request มาที่สุด
 
+<Callout title="scaffold แบบใหม่: withSupabase() แต่ข้างในยังเป็น Deno.serve เหมือนเดิม">
+template ปัจจุบันของ `supabase functions new` จะ scaffold เป็น `export default { fetch: withSupabase({ auth: ['publishable', 'secret'] }, handler) }` แทนที่จะเป็น `Deno.serve(...)` เปล่า ๆ — เป็น helper ที่ช่วยตรวจ publishable/secret key ของผู้เรียกให้อัตโนมัติ และมี `ctx` แบบ typed ให้ใช้ (รวมถึง `ctx.supabaseAdmin`) ข้างในยังเป็น Deno เหมือนเดิม และ handler แบบ `Deno.serve((req) => ...)` เปล่า ๆ อย่างในบทนี้ก็ยังทำงานได้ตามปกติ คอร์สนี้เลือกใช้ `Deno.serve` ต่อไปเพราะทำให้เห็นกลไก request/response ตรง ๆ ก่อนจะไปห่อด้วย helper ทีหลัง
+</Callout>
+
 <Mermaid title="Edge Function เป็นอีกเส้นทางหนึ่งควบคู่กับ REST/RPC API และการเข้าถึงฐานข้อมูลโดยตรง" code={edgeFunctionsOverviewDiagram} />
 
 export const edgeFunctionsOverviewDiagram = `flowchart LR

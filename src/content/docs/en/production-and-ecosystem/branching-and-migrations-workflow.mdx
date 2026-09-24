@@ -20,13 +20,13 @@ Without branching, "testing a schema change" usually means running it against a 
 
 ```bash
 # Create a persistent preview branch (stays around across pushes, not tied to a single PR)
-supabase --experimental branches create --persistent
+supabase branches create --persistent
 
 # Create a preview branch for a pull request, cloning production data into it
-supabase --experimental branches create feature-add-comments --with-data
+supabase branches create feature-add-comments --with-data
 
 # List every preview branch on the linked project
-supabase --experimental branches list
+supabase branches list
 ```
 
 This is not a feature flag toggled inside a single shared database — it is a fully separate database, which is exactly why it is safe to run destructive migrations, seed odd test data, or try a risky `alter table` against it without any risk to production.

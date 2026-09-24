@@ -65,6 +65,8 @@ event `sync` จะยิงทุกครั้งที่ presence set เ�
 
 นี่คือความต่างที่ควรจำไว้ต่อจากบทก่อน Postgres Changes ทำงานได้ก็ต่อเมื่อคุณรัน `alter publication supabase_realtime add table ...` ให้ table นั้นก่อน เพราะโดยพื้นฐานแล้วนี่คือการ stream ออกมาจาก replication log ของ Postgres เอง **Broadcast กับ Presence ไม่เกี่ยวกับเรื่องนั้นเลย** — ทั้งคู่เป็น layer messaging และ state-sync ที่อยู่ในตัว Realtime server ล้วน ๆ เปิดใช้งานได้ทันทีที่ต่อ channel โดยไม่มีอะไรต้องตั้งค่าในฝั่ง database เลย
 
+channel หนึ่งตั้งเป็น **private** ได้เช่นกัน ซึ่งจะจำกัดให้เฉพาะ client ที่ authenticated แล้วเท่านั้น และตรวจสิทธิ์ผ่าน Row Level Security policy บน table `realtime.messages` — กลไกเดียวกับ `using`/`with check` จากโมดูล RLS แค่เอามาใช้กับ "ใครมีสิทธิ์ join channel ได้" แทนที่จะเป็น row ใน table ของคุณเอง
+
 <Mermaid title="Broadcast ส่งตรงระหว่าง client; Presence sync state ที่แชร์กัน — ทั้งคู่ไม่แตะ Postgres" code={broadcastPresenceDiagram} />
 
 export const broadcastPresenceDiagram = `flowchart LR

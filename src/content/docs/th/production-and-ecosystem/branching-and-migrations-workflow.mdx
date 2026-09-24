@@ -20,13 +20,13 @@ Supabase branch คือ preview copy เต็มรูปแบบของ p
 
 ```bash
 # Create a persistent preview branch (stays around across pushes, not tied to a single PR)
-supabase --experimental branches create --persistent
+supabase branches create --persistent
 
 # Create a preview branch for a pull request, cloning production data into it
-supabase --experimental branches create feature-add-comments --with-data
+supabase branches create feature-add-comments --with-data
 
 # List every preview branch on the linked project
-supabase --experimental branches list
+supabase branches list
 ```
 
 นี่ไม่ใช่ feature flag ที่เปิด-ปิดอยู่ข้างใน database เดียวที่ใช้ร่วมกัน — นี่คือ database ที่แยกออกมาจริง ๆ ซึ่งเป็นเหตุผลว่าทำไมถึงปลอดภัยที่จะรัน migration แบบทำลายข้อมูล, seed test data แปลก ๆ หรือลอง `alter table` ที่เสี่ยง ๆ ได้ โดยไม่กระทบ production เลย

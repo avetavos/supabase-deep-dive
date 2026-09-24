@@ -11,6 +11,8 @@ import Callout from '../../../../components/Callout.astro';
 
 ตัวอย่าง client ทุกอันในคอร์สนี้ใช้ **TypeScript** ด้วย **`supabase-js`** (client อย่างเป็นทางการของ JavaScript/TypeScript) ที่เป็นตัวเลือก default ที่ใช้กันแพร่หลายที่สุดใน ecosystem ของ Supabase มีสองเรื่องที่ tutorial เก่าหลายที่มักสอนผิดหรือข้ามไป เพราะ default ของ Supabase เปลี่ยนไป — **Row Level Security** ต้องเปิดเองต่อ table ไม่มีทางเปิดมาให้โดย default และแม้เปิด RLS แล้ว table จะเข้าถึงผ่าน auto-generated API ได้ก็ต่อเมื่อถูก expose ผ่าน **Data API** อย่างชัดเจน (คนละ layer กับ RLS ที่ทำงานระดับ row) คอร์สนี้สอนทั้งสอง layer อย่างถูกต้องและแยกจากกันชัดเจน
 
+ตรวจสอบกับ local Supabase CLI stack แล้ว: **Supabase CLI 2.117.0**, **Postgres 17** (`supabase/postgres:17.6.1`), **PostgREST** ผ่าน Data API, **`@supabase/supabase-js` v2** และ **Deno 2** Edge Runtime — รัน `supabase --version` กับ `npm view @supabase/supabase-js version` เองอีกครั้งเพื่อดูเวอร์ชันปัจจุบัน ณ ตอนที่คุณอ่านอยู่
+
 ## สิ่งที่คอร์สนี้ครอบคลุม
 
 | Module | คุณจะได้เรียน |

@@ -25,6 +25,10 @@ Supabase project เริ่มต้นจาก Postgres instance แบบ h
 `service_role` key ข้าม RLS policy ทุกอันในทุก table ถ้า key นี้หลุดไปอยู่ใน browser bundle, mobile app หรือ code ที่ user เปิดดูได้ ใครก็ตามที่มี key นี้อ่านและเขียน database ทั้งหมดของคุณได้เลย เก็บไว้ใน environment variable ฝั่ง server เท่านั้น ห้ามอยู่ใน code ที่ ship ไปหา client เด็ดขาด นี่คือกฎที่คอร์สนี้จะย้ำอีกหลายครั้ง
 </Callout>
 
+<Callout title="ชื่อเรียกใหม่: publishable key กับ secret key">
+ตั้งแต่ปลายปี 2025 project ใหม่ของ Supabase จะได้ **publishable key** (`sb_publishable_...`) และ **secret key** (`sb_secret_...`) แทนที่ `anon` กับ `service_role` แบบ JWT เดิม — บทบาทเหมือนเดิมทุกอย่าง (publishable ใช้ฝั่ง client ได้ปลอดภัย, secret bypass RLS และต้องอยู่ฝั่ง server เท่านั้น) เพียงแต่เป็น string สั้นลง ไม่ใช่ JWT และ rotate ได้โดยไม่ต้อง downtime key `anon`/`service_role` เดิมยังใช้งานได้ต่อไป และคอร์สนี้ยังคงเรียกว่า `anon` กับ `service_role` ตลอดทั้งเล่ม เพราะนั่นคือชื่อ Postgres role จริง ๆ ที่ key ทั้งสองแบบผูกอยู่ด้วย — ถ้า dashboard ของ project คุณโชว์เป็น `sb_publishable_...`/`sb_secret_...` แทน ก็คือแนวคิดเดียวกันแค่เปลี่ยนชื่อ
+</Callout>
+
 ```typescript
 // Server-side only — e.g. an API route, a cron job, an Edge Function.
 // process.env.SUPABASE_SERVICE_ROLE_KEY must never be bundled into client code.

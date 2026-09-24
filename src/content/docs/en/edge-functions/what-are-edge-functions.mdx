@@ -55,6 +55,10 @@ supabase functions deploy hello-world
 
 `supabase functions new` creates the boilerplate file and folder. `supabase functions serve` starts a local Deno runtime so you can iterate without deploying. `supabase functions deploy` uploads the function so Supabase's edge infrastructure runs it close to wherever the request comes from.
 
+<Callout title="Newer scaffold: withSupabase(), same Deno.serve underneath">
+The current `supabase functions new` template scaffolds `export default { fetch: withSupabase({ auth: ['publishable', 'secret'] }, handler) }` instead of a bare `Deno.serve(...)` — a convenience helper that validates the caller's publishable/secret key for you and exposes a typed `ctx` (including `ctx.supabaseAdmin`). It is still Deno underneath, and a plain `Deno.serve((req) => ...)` handler like the one in this lesson keeps working exactly as shown; this course sticks with `Deno.serve` because it makes the request/response mechanics explicit before layering a helper on top.
+</Callout>
+
 <Mermaid title="An Edge Function as a third path alongside the REST/RPC API and direct database access" code={edgeFunctionsOverviewDiagram} />
 
 export const edgeFunctionsOverviewDiagram = `flowchart LR
