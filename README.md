@@ -84,10 +84,19 @@ fragment and is silently skipped (counted, not run).
 
 - `tools/verify-snippets.mjs` starts the probe's stack once
   (`supabase start --workdir tools/probe`) and reuses it on every
-  subsequent run (checked via `supabase status`'s exit code) — it is left
-  **running** when the script exits, on purpose: Phase 3/4 lesson-writing
-  agents reuse it. **Do not run `--stop` on it** as a side effect of
-  anything other than a deliberate, explicit teardown.
+  subsequent run (checked via `supabase status`'s exit code) — normally
+  left **running** when the script exits, on purpose: Phase 3/4
+  lesson-writing agents reuse it. **Do not run `--stop` on it** as a side
+  effect of anything other than a deliberate, explicit teardown.
+  **Current exception:** the stack was stopped (`supabase stop --no-backup`)
+  at the end of this wave 0 session, at the coordinator's explicit
+  request — the host was running 4 concurrent `kind` clusters from sibling
+  agents (load avg 27, 0% idle, <500MB free) and `docker exec` into this
+  stack's own db container was hanging for 10+ minutes at a stretch. The
+  next agent to touch this harness should run
+  `node tools/verify-snippets.mjs` (or any mode) once the host is quiet —
+  it starts the stack fresh automatically; no manual `supabase start`
+  needed.
 - Ports are bumped **+1000** from the textbook defaults (API `55321`, DB
   `55322`, shadow DB `55320`, pooler `55329`, Studio `55323`,
   Mailpit/Inbucket `55324`, Analytics `55327`) — a different, unrelated
@@ -149,12 +158,20 @@ TOTAL:                        1 / 0 / 0 — 40 — 0
 and it passes for real against the live stack.)
 
 `node tools/verify-snippets.mjs --all-sql` (every sql fence, path comment
-or not, run per-lesson): see the harness's own printed
-"`--all-sql` per-lesson results" section for exact current pass/fail
-counts — expect most non-`foundations` sql fences to **fail**, honestly:
-today's sql fragments are illustrative snippets that assume tables/columns
-defined in prose or in a different lesson, not a real ordered migration
-sequence yet (that's Phase 3/4's job).
+or not, run per-lesson): **pending** — not yet run against this corpus.
+The host this wave ran on had 4 concurrent `kind` clusters from sibling
+agents (load avg 27, 0% idle, <500MB free), which made `docker exec` into
+the local stack's own db container hang for 10+ minutes at a stretch; the
+stack was stopped (see "Local stack" above) rather than keep contending
+for host CPU. The mechanism itself is already proven correct — `--check`'s
+identical sql-execution code path passed `--self-test` and ran the one
+real fence in `foundations/tables-schema-and-migrations.mdx` cleanly
+before the host saturated. Whoever runs `--all-sql` next (the coordinator,
+once the host is quiet) should expect most non-`foundations` sql fences to
+**fail**, honestly: today's sql fragments are illustrative snippets that
+assume tables/columns defined in prose or in a different lesson, not a
+real ordered migration sequence yet (that's Phase 3/4's job) — replace
+this paragraph with the real per-lesson counts once that run completes.
 
 ### Known gaps
 
