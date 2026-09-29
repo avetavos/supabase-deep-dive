@@ -1,0 +1,297 @@
+---
+title: 'Realtime: the WAL Pipeline'
+description: 'เส้นทางจริงจาก INSERT หนึ่งครั้งไปถึง client ที่ subscribe อยู่ — wal_level=logical, replication slot จริง (มีแค่บางตัวที่เป็นของ Realtime), Postgres Changes ที่ poll realtime.list_changes() เทียบกับ slot streaming จริงของ Broadcast from database, การเช็ก RLS ต่อ subscriber ของ realtime.apply_rls ผ่าน SET LOCAL ROLE, และเกิดอะไรขึ้นกับ WAL เมื่อ Realtime ล่ม'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ใจความสำคัญในหนึ่งประโยค
+
+`INSERT` กลายเป็น write-ahead log record ของ Postgres ทันทีที่ commit แต่มีกลไกที่ต่างกันเชิงโครงสร้างสองแบบที่พามันไปถึง client จากตรงนั้น — **Postgres Changes** *poll* logical replication slot เป็นระยะผ่าน SQL function (`realtime.list_changes` ซึ่งเรียก `pg_logical_slot_get_changes` อยู่ข้างใน) ขณะที่ **Broadcast from database** เปิด connection แบบ `START_REPLICATION` ที่ streaming ต่อเนื่องจริง ๆ ค้างไว้ — และทั้งคู่ ก่อนที่แถวจะไปถึง subscriber เลย จะเช็ก Row Level Security policy ของ subscriber นั้นซ้ำ ด้วยการสลับเข้าไปเป็น role ของเขาจริง ๆ แล้ว query แถวที่เปลี่ยนซ้ำด้วย primary key
+
+## พิสูจน์: `wal_level` และ replication slot จริงบน stack นี้
+
+```text
+$ docker exec -i supabase_db_probe psql -U postgres -c "show wal_level;"
+ wal_level
+-----------
+ logical
+
+$ docker exec -i supabase_db_probe psql -U postgres -c "select slot_name, plugin, slot_type, active, active_pid, wal_status from pg_replication_slots;"
+                  slot_name                   |  plugin  | slot_type | active | active_pid | wal_status
+----------------------------------------------+----------+-----------+--------+------------+------------
+ cainophile_2h1vi6n4                          | pgoutput | logical   | t      |        367 | reserved
+ supabase_realtime_replication_slot_          | wal2json | logical   | t      |      19876 | reserved
+ supabase_realtime_messages_replication_slot_ | pgoutput | logical   | t      |      19883 | reserved
+```
+
+`wal_level = logical` คือเงื่อนไขก่อนสำหรับทุกอย่างนี้ — ถ้าไม่มีมัน Postgres จะไม่เขียนข้อมูลลง WAL มากพอที่จะสร้าง row-level change กลับมาได้เลย มีพอแค่สำหรับ physical replication (byte-for-byte) เท่านั้น มี slot สามตัว active อยู่ แต่ตาม [เอกสาร Realtime concepts ของ Supabase เอง](https://supabase.com/docs/guides/realtime/concepts) *"Realtime also uses, at maximum, 2 replication slots"* — หนึ่งสำหรับ **Broadcast from database** หนึ่งสำหรับ **Postgres Changes** ตัวที่สาม `cainophile_2h1vi6n4` ยืนยันด้านล่างว่าเป็นของอย่างอื่นไปเลย
+
+## พิสูจน์: มีแค่สองใน สาม connection ที่เป็นของ Realtime และมันทำงานต่างกัน
+
+`pg_replication_slots.active_pid` บอกชื่อ backend process ที่ใช้ slot แต่ละตัวจริง ๆ การ cross-reference กับ query text จริงของ `pg_stat_activity` ตัดสินได้ว่าแต่ละตัวคืออะไรจริง ๆ:
+
+```text
+$ docker exec -i supabase_db_probe psql -U postgres -c "select pid, usename, application_name, state, query from pg_stat_activity where pid in (367,19876,19883);"
+  pid  |    usename     |        application_name         | state  |  query
+-------+----------------+---------------------------------+--------+----------------------------------------------------------------
+ 19883 | supabase_admin | realtime_replication_connection | active | START_REPLICATION SLOT supabase_realtime_messages_replication_slot_ LOGICAL 0/0 (proto_version '2', publication_names 'supabase_realtime_messages_publication', binary 'true')
+   367 | supabase_admin |                                 | active | START_REPLICATION SLOT cainophile_2h1vi6n4 LOGICAL 0/0 (proto_version '1', publication_names '"logflare_pub"')
+ 19876 | supabase_admin | realtime_rls                    | idle   | SELECT wal->>'type' as type, ... FROM realtime.list_changes($1, $2, $3, $4)
+```
+
+Query ของ `cainophile_2h1vi6n4` เองบอกชื่อ publication ตรง ๆ: `logflare_pub` — นั่นคือ **Logflare** service วิเคราะห์/ส่งต่อ log ของ stack นี้ (`supabase_analytics_probe`) ไม่ใช่ Realtime เลย มันบังเอิญสร้างบน `pgoutput` logical replication เหมือนกัน (และดูจาก prefix ชื่อ slot น่าจะใช้ library decode WAL แบบ open-source ชื่อ `Cainophile` ตัวเดียวกับที่ ecosystem ของ Realtime เองเกี่ยวข้องด้วย) — แต่มันส่ง log ภายในของ Postgres เองไปที่ Logflare ไม่เกี่ยวกับตารางไหนที่แอปของคุณ subscribe เลย
+
+เหลือ connection ของ Realtime จริง ๆ แค่สองตัว และมัน**ไม่ใช่**กลไกเดียวกัน:
+
+- **`supabase_realtime_messages_replication_slot_`** (Broadcast from database, `pgoutput`, pid `19883`) ถูกใช้ผ่านคำสั่ง `START_REPLICATION` จริง ๆ — connection แบบ streaming ต่อเนื่องจริง ซึ่งเป็นเหตุผลเป๊ะ ๆ ว่าทำไมมันเท่านั้น (และมีแค่มัน) ที่ปรากฏใน `pg_stat_replication` เลย (`application_name = realtime_replication_connection`, `state = streaming`) นี่คือตัวเดียวในสามตัวที่ทำงานแบบ logical replication "คลาสสิก"
+- **`supabase_realtime_replication_slot_`** (Postgres Changes, `wal2json`, pid `19876`) ถูกใช้ผ่านกลไกที่ต่างไปคนละแบบ: การเรียก SQL function ธรรมดา `realtime.list_changes(...)` นั่งอยู่ **idle** ระหว่างการเรียกแต่ละครั้ง — ไม่มี `START_REPLICATION` ให้เห็นเลย source ของมัน (`\sf realtime.list_changes`) ยืนยันเหตุผล: มันเรียก `pg_logical_slot_get_changes` ข้างใน ซึ่งเป็น function แบบ *pull* ของ logical decoding ของ Postgres เอง ไม่ใช่ streaming protocol Postgres Changes คือ **loop ที่ poll เรียก SQL function บน slot** ไม่ใช่ stream ต่อเนื่อง — นั่นคือเหตุผลที่ backend ของมันขึ้น `idle` ไม่ใช่ `streaming` ระหว่างการ poll แต่ละครั้ง
+
+<Callout title="สิ่งนี้ขัดกับสมมติฐานตามธรรมชาติที่ควรพูดให้ชัด">
+เป็นเรื่องง่ายที่จะสมมติว่า "Realtime" คือกลไกเดียวกันหมดที่มีชื่อ feature สองชื่อทับอยู่ข้างบน มันไม่ใช่ พิสูจน์ได้: feature หนึ่งของ Realtime ถือ connection streaming replication จริงค้างไว้ อีก feature เรียก SQL function ซ้ำ ๆ กับ slot ประเภทเดียวกันแทน ทั้งคู่สุดท้ายย้อนกลับไปที่ WAL เดียวกัน แต่ transport ต่างกันในระดับ Postgres connection ไม่ใช่แค่ระดับชื่อ feature
+</Callout>
+
+<Mermaid title="INSERT หนึ่งครั้ง, transport ของ Realtime สองแบบ, ประตู RLS ร่วมกันหนึ่งอัน" code={realtimeWalDiagram} />
+
+export const realtimeWalDiagram = `flowchart TD
+  insert["INSERT/UPDATE/DELETE commits"] --> wal["Postgres WAL (wal_level=logical)"]
+  wal --> pgchanges["supabase_realtime_replication_slot_ (wal2json)"]
+  wal --> broadcast["supabase_realtime_messages_replication_slot_ (pgoutput)"]
+  pgchanges -->|"polled via realtime.list_changes() -> pg_logical_slot_get_changes"| rlsgate["realtime.apply_rls(wal)"]
+  broadcast -->|"continuous START_REPLICATION stream"| rlsgate
+  rlsgate -->|"per distinct subscription_id: SET LOCAL ROLE + set_config(request.jwt.claims) + exists(select 1 from entity where pk=...)"| subs["realtime.subscription rows for this entity"]
+  subs -->|"RLS allows"| channel["Phoenix channel"]
+  channel --> client["Subscribed client"]`;
+
+## พิสูจน์: แถวใน `realtime.subscription` ปรากฏตอนเชื่อมต่ออยู่ หายไปหลัง disconnect
+
+ใช้ตาราง namespace ของโมดูลนี้เอง (เปิด RLS, policy แบบ owner-scoped, ใส่เข้า `supabase_realtime`) และ RPC แบบ `security definer` ที่อ่าน `realtime.subscription` — schema ที่ `anon`/`authenticated` query ตรง ๆ ไม่ได้ เหมือนกับที่บท internals ก่อนหน้าของคอร์สนี้ต้องการสะพาน `security definer` แคบ ๆ:
+
+```sql
+-- supabase/migrations/9503_int_rt_notes.sql
+create table public.int_rt_notes (
+  id bigint generated always as identity primary key,
+  body text,
+  owner uuid not null default auth.uid()
+);
+alter table public.int_rt_notes enable row level security;
+create policy int_rt_notes_owner on public.int_rt_notes
+  for select to authenticated using (owner = auth.uid());
+alter publication supabase_realtime add table public.int_rt_notes;
+
+create or replace function public.int_realtime_subscription_count()
+returns table (subscription_id uuid, claims_role text)
+language sql
+security definer
+set search_path = ''
+as $$
+  select subscription_id, claims_role::text
+  from realtime.subscription
+  where entity = 'public.int_rt_notes'::regclass;
+$$;
+grant execute on function public.int_realtime_subscription_count() to service_role;
+```
+
+```ts
+// src/int-rt-subscription-rows.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+declare const process: { env: Record<string, string | undefined>; exit: (code?: number) => never };
+
+const anon = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!);
+const admin = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+
+const channel = anon
+  .channel('int-rt:notes')
+  .on('postgres_changes', { event: '*', schema: 'public', table: 'int_rt_notes' }, () => {})
+  .subscribe();
+
+await new Promise((r) => setTimeout(r, 3000));
+const { data: whileSubscribed } = await admin.rpc('int_realtime_subscription_count');
+console.log('while subscribed:', JSON.stringify(whileSubscribed));
+
+await anon.removeChannel(channel);
+anon.realtime.disconnect();
+
+// Cleanup of a dropped connection's realtime.subscription row is not
+// synchronous with the disconnect call — poll instead of a single fixed wait.
+let afterUnsubscribe: any[] | null = whileSubscribed;
+for (let elapsedMs = 0; elapsedMs < 30000; elapsedMs += 5000) {
+  await new Promise((r) => setTimeout(r, 5000));
+  const { data } = await admin.rpc('int_realtime_subscription_count');
+  afterUnsubscribe = data;
+  console.log(`t+${elapsedMs + 5000}ms after disconnect:`, JSON.stringify(data));
+  if (!data || data.length === 0) break;
+}
+
+process.exit(
+  whileSubscribed && whileSubscribed.length === 1 && afterUnsubscribe && afterUnsubscribe.length === 0 ? 0 : 1
+);
+```
+
+```text
+while subscribed: [{"subscription_id":"f77bfb64-bbdc-11f1-9d3d-fe4955bd9437","claims_role":"anon"}]
+t+5000ms after disconnect: [{"subscription_id":"f77bfb64-bbdc-11f1-9d3d-fe4955bd9437","claims_role":"anon"}]
+t+10000ms after disconnect: []
+```
+
+`realtime.subscription` ไม่ใช่คำอุปมา — มันคือตาราง Postgres จริง query ได้จริง หนึ่งแถวต่อหนึ่ง channel subscription ที่ active และ `anon` client ของคอร์สนี้เอง subscribe แล้วก็ปรากฏในนั้นภายในไม่กี่วินาที การหายไปอีกครั้งหลัง disconnect จริง ใช้เวลาจริงวัดได้ **10 วินาที** ในรอบนี้ — ไม่ใช่ทันที และก็ไม่ใช่ค่าคงที่ตายตัวด้วย: รัน script เดียวกันเป๊ะ ๆ ซ้ำ แถวหายไปตอน poll ที่ 10 วินาทีครั้งหนึ่ง แต่ต้องรอนานกว่านั้นเล็กน้อยอีกครั้งหนึ่ง ซึ่งเป็นเหตุผลที่ script ด้านบน poll แทนที่จะ assert delay คงที่ค่าเดียว — การ cleanup ขับเคลื่อนโดยการตรวจจับ connection หลุดกับ heartbeat cycle ของ Realtime เอง ไม่ใช่ side effect แบบ synchronous จากการที่ client เรียก `disconnect()`
+
+## พิสูจน์: `apply_rls` ทำ `SET LOCAL ROLE` + query ซ้ำจริง ๆ ต่อ subscription
+
+กลไกเบื้องหลัง "RLS รันครั้งเดียวต่อ subscriber" จาก source ของ `realtime.apply_rls` เอง (`\sf realtime.apply_rls`) — loop ข้างใน หนึ่งรอบต่อ `subscription_id` หนึ่งตัวที่แชร์ role เดียวกัน:
+
+```text
+for subscription_id, claims in (
+        select subs.subscription_id, subs.claims
+        from unnest(subscriptions) subs
+        where subs.entity = entity_ and subs.claims_role = working_role
+          and (realtime.is_visible_through_filters(columns, subs.filters) or ...)
+) loop
+    if not is_rls_enabled or action = 'DELETE' then
+        visible_role_sub_ids = visible_role_sub_ids || subscription_id;
+    else
+        perform
+            set_config('role', trim(both '"' from working_role::text), true),
+            set_config('request.jwt.claims', claims::text, true);
+
+        execute 'execute walrus_rls_stmt' into subscription_has_access;
+
+        perform set_config('role', null, true);
+
+        if subscription_has_access then
+            visible_role_sub_ids = visible_role_sub_ids || subscription_id;
+        end if;
+    end if;
+end loop;
+```
+
+นี่คือกลไก `set_config('role', ...)` + `set_config('request.jwt.claims', ...)` **ตัวเดียวกันเป๊ะ** ที่ [Postgres Roles and Grants](/supabase/th/supabase-internals/postgres-roles-and-grants/) พิสูจน์ว่า PostgREST ใช้ต่อ request — function `apply_rls` ของ Realtime เองก็ทำแบบเดียวกัน หนึ่งครั้งต่อ `subscription_id` ที่ต่างกันแต่ละตัว ก่อนที่มันจะรัน `walrus_rls_stmt` prepared statement นั้น (`realtime.build_prepared_statement_sql`) ไม่มีอะไรแปลกเลย:
+
+```text
+prepare walrus_rls_stmt as
+    select exists(
+        select 1 from <entity> where <pk_column>=<pk_value>
+    )
+```
+
+การ query แถวที่เปลี่ยนซ้ำ **ด้วย primary key** ตรง ๆ รันในฐานะ role ของ subscriber ตัวนั้นเป๊ะ ๆ พร้อม JWT claims ของ subscriber ตัวนั้นเป๊ะ ๆ ถ้ามันคืน `true` แปลว่า `select` ธรรมดาจะให้ subscriber ตัวนี้เห็นแถวนี้ได้ — ดังนั้น event ถูกส่ง; ถ้า `false` มันถูกกักไว้เงียบ ๆ การ group ตาม `working_role` ก่อนเป็นการ optimize จริง (prepared statement ต้อง re-prepare แค่ครั้งเดียวต่อ role ที่ต่างกันต่อการเปลี่ยนแปลง WAL หนึ่งครั้ง) แต่การเช็ก visibility จริง ๆ รัน **ต่อ subscription_id** ยืนยัน claim ของเอกสาร Postgres Changes เองว่าเป็นการเช็ก authorization หนึ่งครั้งต่อ subscriber ไม่ใช่ต่อ role
+
+## พิสูจน์: `max_slot_wal_keep_size` และเกิดอะไรขึ้นเมื่อ Realtime ล่ม
+
+```text
+$ docker exec -i supabase_db_probe psql -U postgres -c "show max_slot_wal_keep_size;"
+ max_slot_wal_keep_size
+------------------------
+ 512MB
+```
+
+จุดประสงค์ทั้งหมดของ replication slot คือบอก Postgres ว่า "อย่าลบ WAL เลยจุดนี้ ยังมี consumer ต้องการอยู่" — ซึ่งเป็นเหตุผลเป๊ะ ๆ ว่าทำไม slot ที่ไม่มีคนบริโภคถึงเป็นความเสี่ยงด้าน operation จริง ไม่ใช่แค่เรื่องของ Realtime เท่านั้น ตาม [เอกสาร replication ของ Supabase เอง](https://supabase.com/docs/guides/database/replication) *"Postgres keeps WAL files around for longer than it otherwise needs them [for logical replication]... your replication slot can become inactive or lost if the database receives a large number of changes in a short time"* ขณะที่ consumer ตามหลังอยู่ `max_slot_wal_keep_size` คือวาล์วนิรภัย — slot ถูกอนุญาตให้กัน Postgres ไว้ได้แค่ไม่เกินขนาด WAL นี้ เกินจากนั้น Postgres ได้รับอนุญาตให้ลบ WAL ที่ slot ยังต้องการอยู่ ทำให้มันถูก invalidate (สถานะ `wal_status` เป็น `lost` แทนที่จะเป็น `reserved` แบบตอนนี้ของ stack นี้) Realtime มี guard ของตัวเองที่เฉพาะเจาะจงกว่าสำหรับสถานการณ์นี้เป๊ะ ๆ บันทึกไว้เป็น error code operation จริง: [`ReplicationSlotLagTooHigh`](https://supabase.com/docs/guides/realtime/error_codes) — *"The replication slot WAL lag has exceeded 50% of `max_slot_wal_keep_size`. The replication connection is shut down and will be restarted to prevent the slot from being invalidated by PostgreSQL."* พูดอีกอย่างคือ: ถ้า Realtime ตามหลังมากพอ (หรือล่มไปเลยขณะที่ยังมีการเขียนเกิดขึ้นต่อเนื่อง) Postgres จะไม่ปล่อยให้ disk โตขึ้นเรื่อย ๆ เงียบ ๆ แทน Realtime — connection ของ Realtime เองจะ self-terminate ที่จุดครึ่งทางเป๊ะ ๆ เพื่อไม่ให้ slot ไปถึงจุดที่ถูก invalidate แลก "บาง event อาจต้อง subscribe ใหม่หลัง reconnect" กับ "disk ของฐานข้อมูลหลักไม่เต็มเพราะ consumer ปลายทางหยุดอ่าน"
+
+## อ่านโค้ดที่ AI เขียน
+
+<SpotTheBug lang="ts" code={`// AI-generated "make sure every user gets every order update instantly"
+const channel = supabase
+  .channel('orders-firehose')
+  .on(
+    'postgres_changes',
+    { event: 'UPDATE', schema: 'public', table: 'orders' },
+    (payload) => renderOrderUpdate(payload.new)
+  )
+  .subscribe();
+
+// No RLS policy is defined on public.orders yet — "we'll add security later,
+// for now let's just get realtime working end to end."`}>
+แผนใน comment — ทำให้ realtime wiring ทำงานก่อน ค่อย "เพิ่ม security ทีหลัง" — กลับด้านความเสี่ยงจริงที่บทนี้เพิ่งพิสูจน์ไป Realtime ไม่ใช่การ bypass RLS ที่ policy ทีหลังจะมาปิดย้อนหลังได้ loop ต่อ subscription ของ `apply_rls` เองที่โชว์ด้านบน เช็ก `is_rls_enabled` จาก `pg_class.relrowsecurity` ณ ขณะที่ WAL record แต่ละตัวถูกประมวลผล มีผลลัพธ์จริงที่ต่างกันสองแบบขึ้นอยู่กับว่าตารางนี้เปิด RLS ไว้ตั้งแต่เมื่อไหร่: ถ้า `orders` **ปิด** RLS อยู่ (ค่าดีฟอลต์สำหรับตารางใหม่เอี่ยม ตาม [Postgres Roles and Grants](/supabase/th/supabase-internals/postgres-roles-and-grants/)) logic ของ `apply_rls` เอง (`if not is_rls_enabled ... then visible_role_sub_ids = visible_role_sub_ids || subscription_id`) ข้ามการเช็กไปเลย และส่ง event ไปให้ subscriber **ทุกคน** ที่ filter ตรงกัน ไม่ว่าจะเป็น order ของใครก็ตาม — นี่คือกลไกจริงเบื้องหลัง "ทุกคนได้ order update ของทุกคน" แค่ไม่ใช่แบบที่ตั้งใจ ถ้าเพิ่ม policy ทีหลังโดยไม่ตรวจสอบด้วยว่า subscription ของ client ที่มีอยู่แล้ว/cache ไว้ตรงกับที่ developer คาดหวังไหม วิธีแก้ไม่ใช่ "เพิ่ม RLS แล้วมันจะปลอดภัยย้อนหลังเอง" — event *ถัดไป* ของทุก subscriber ถูกเช็กใหม่กับสถานะ policy *ปัจจุบัน* (พิสูจน์ด้านบน: นี่คือการเช็กสดต่อ event ไม่ใช่การเช็กครั้งเดียวตอน subscribe) ดังนั้นการเปิด RLS ปิดช่องโหว่ไปข้างหน้าจริง แต่บั๊กจริง ๆ ตรงนี้คือลำดับขั้นตอนเอง: ตารางนี้ live-stream ข้อมูลที่ไม่ได้รับอนุญาตไปให้ subscriber ทุกคนนานเท่าที่ "เพิ่ม security ทีหลัง" กินเวลาไป ซึ่ง callback `renderOrderUpdate` ก็เอาไปแสดงให้ user ผิดคนอย่างเต็มใจระหว่างนั้น
+</SpotTheBug>
+
+## Mental Model
+
+Postgres Changes กับ Broadcast from database คือ **บุรุษไปรษณีย์** สองคนต่างกันที่อ่าน **ตู้จดหมายออก** เดียวกัน (WAL) ไม่ใช่กลไกเดียวที่มีสองชื่อ บุรุษไปรษณีย์คนหนึ่ง (Broadcast) ถือสายโทรศัพท์เปิดค้างไว้และถูกบอกทันทีที่มีของใหม่พร้อม (`START_REPLICATION` streaming); อีกคน (Postgres Changes) เดินไปเช็กตู้จดหมายเองตามตารางเวลา (`realtime.list_changes()` poll `pg_logical_slot_get_changes`) ทั้งคู่ ก่อนจะส่งของให้ผู้รับคนใดคนหนึ่ง จะ *กลายเป็น* ผู้รับคนนั้นชั่วคราว (`SET LOCAL ROLE` + JWT claims ของผู้รับคนนั้นเป๊ะ ๆ) แล้วถามว่า "คุณ คนนี้โดยเฉพาะ จะได้รับอนุญาตให้เห็นของชิ้นนี้ไหมถ้าคุณขอดูตรง ๆ" — พิสูจน์ด้านบนผ่านการ query ซ้ำแบบ `exists(select 1 from entity where pk=...)` ตัวจริง — ก่อนตัดสินใจว่าจะส่งมันหรือเปล่า
+
+## Trade-offs
+
+| ทางเลือกการออกแบบ | ข้อดี | ต้นทุน |
+|---|---|---|
+| Postgres Changes: poll `realtime.list_changes()` ผ่าน slot แบบ `wal2json` | คิดง่าย เพิ่ม feature ง่าย (มันคือ SQL ที่ทีม Realtime เองควบคุม) พิสูจน์ด้านบนว่านั่ง `idle` ระหว่างการ poll แทนที่จะถือ connection ไว้ยุ่งตลอด | Loop แบบ polling มี latency floor ที่ผูกกับช่วงเวลา poll ของมันเอง — ไม่ใช่ตัวเลือกที่ latency ต่ำที่สุดในทางทฤษฎี |
+| Broadcast from database: connection `pgoutput` แบบ streaming จริง | เส้นทาง latency ต่ำสุดจาก WAL ไปถึงการส่ง พิสูจน์ด้านบนผ่านสถานะ `START_REPLICATION`/`streaming` จริง | Connection แบบ streaming ที่ค้างไว้ตลอดเป็นทรัพยากรที่หนักกว่า อ่อนไหวต่อความล้มเหลวมากกว่าการ poll เป็นระยะ — เป็นแบบที่ `ReplicationSlotLagTooHigh` มีไว้ป้องกันพอดี |
+| การเช็ก RLS ซ้ำต่อ subscriber ผ่าน `SET LOCAL ROLE` + prepared statement `exists()` | ถูกต้องพิสูจน์ได้: policy เดียวกับที่ `select` ตรง ๆ จะรัน คือตัวที่กั้นการส่ง realtime พิสูจน์ด้านบนด้วย SQL จริง | ต้นทุนจริง วัดได้ ที่ scale ตามจำนวน subscriber ต่อ event — เป็นเหตุผลเป๊ะ ๆ ที่เอกสารของ Supabase เองแนะนำ Broadcast from database เมื่อเกินสองสามพัน concurrent subscriber บนตารางเดียว |
+| `max_slot_wal_keep_size` + การ self-terminate ของ `ReplicationSlotLagTooHigh` ของ Realtime เอง | Disk ของฐานข้อมูลหลักถูกปกป้อง แม้ Realtime จะล่มหรือตามหลังมาก | Consumer ปลายทางที่ self-terminate เพื่อปกป้องฐานข้อมูลหลัก เสียตำแหน่งที่ค้างอยู่ — พิสูจน์ด้านบนผ่าน error code ที่บันทึกไว้ นี่คือการแลกความพร้อมใช้งานกับความปลอดภัยของฐานข้อมูลหลักโดยตั้งใจ |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"Postgres Changes กับ Broadcast from database ใช้ transport เดียวกันข้างใต้ แค่ชื่อต่างกัน"** พิสูจน์ว่าผิดด้านบน: มีแค่ connection ของ Broadcast from database เท่านั้นที่ขึ้น `state = streaming` ใน `pg_stat_replication` ผ่านคำสั่ง `START_REPLICATION` จริง; connection ของ Postgres Changes นั่ง `idle` เรียก `realtime.list_changes()` ตามตารางเวลาแทน
+- **"Replication slot ทุกตัวที่เห็นบน stack นี้เป็นของ Realtime หมด"** พิสูจน์ว่าผิดด้านบน: query สดของ `cainophile_2h1vi6n4` เองบอกชื่อ `logflare_pub` เป็น publication ของมัน — มันเป็นของ Logflare service วิเคราะห์ของ stack นี้ ยืนยันด้วยการ cross-reference กับ `pg_stat_activity` ไม่ใช่สมมติจากชื่อ slot
+- **"RLS สำหรับ Realtime ถูกเช็กครั้งเดียวตอน client subscribe ไม่ใช่ทุก event ถัดไป"** พิสูจน์ว่าผิดด้านบนโดย SpotTheBug และโครงสร้าง loop ของ `apply_rls` เอง: การเช็ก `is_rls_enabled`/`exists()` รันใหม่ทุกครั้งสำหรับทุก WAL record ที่ถูกประมวลผล กับทุก subscription ที่เกี่ยวข้อง — การเปลี่ยน policy มีผลตั้งแต่ event ถัดไปทันที ไม่ใช่ย้อนหลัง และไม่ใช่แค่ตอน subscribe เท่านั้น
+- **"ถ้า Realtime ล่ม WAL จะโตไปเรื่อย ๆ ไม่มีขีดจำกัดจน disk เต็ม"** พิสูจน์ว่าผิดด้านบนด้วยมาตรการป้องกันจริง บันทึกไว้เป็นเอกสาร: connection ของ Realtime เอง self-terminate เมื่อ slot lag เกิน 50% ของ `max_slot_wal_keep_size` เพื่อป้องกัน WAL โตไม่มีขีดจำกัดโดยเฉพาะ — trade-off คือเสีย progress ของ connection นั้น ไม่ใช่ความเสี่ยง disk ไม่มีขีดจำกัด
+
+## แบบทดสอบ
+
+export const quizRealtimeWalPipeline = [
+  {
+    q: 'pg_stat_activity โชว์ backend ของ slot Postgres Changes เป็น "idle" กำลังรัน realtime.list_changes() ขณะที่ backend ของ slot Broadcast from database โชว์ "streaming" ผ่านคำสั่ง START_REPLICATION จริง สิ่งนี้พิสูจน์อะไร (What does this prove?)',
+    options: [
+      'Both features use the exact same streaming transport; the idle state was a timing coincidence',
+      'Postgres Changes and Broadcast from database use genuinely different transports — one polls a SQL function against the slot, the other holds a continuous streaming replication connection open',
+      'Postgres Changes is broken on this stack and should be streaming too',
+      'realtime.list_changes() is only used for error handling, not the actual change feed',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ตรง ๆ จาก query text ของ pg_stat_activity ที่เก็บมา: connection ตัวหนึ่งรันคำสั่ง START_REPLICATION จริงและขึ้น streaming; อีกตัวรัน SQL function ธรรมดาและขึ้น idle ระหว่างการเรียกแต่ละครั้ง — กลไกการบริโภคที่ต่างกันเชิงโครงสร้างสองแบบสำหรับ logical replication slot ประเภทเดียวกัน',
+  },
+  {
+    q: 'มี replication slot สามตัว active อยู่บน stack นี้ แต่เอกสารของ Supabase เองบอกว่า Realtime ใช้อย่างมากแค่ 2 ตัว การ cross-reference กับ pg_stat_activity เผยอะไรเกี่ยวกับตัวที่สาม cainophile_2h1vi6n4 (What did cross-referencing reveal?)',
+    options: [
+      'It was an orphaned, unused slot that should be dropped',
+      'Its live query named logflare_pub as its publication, identifying it as belonging to Logflare (this stack\'s analytics service), not Realtime',
+      'It belongs to Realtime\'s Presence feature, which docs omit',
+      'It is a duplicate of the Postgres Changes slot created by a race condition',
+    ],
+    answer: 1,
+    explain: 'Query ที่เก็บมาของ pid 367 อ่านตรง ๆ ว่า "publication_names \'"logflare_pub"\'" — publication ที่มีชื่อจริง เป็นของ service วิเคราะห์ Logflare ยืนยันด้วยการ cross-reference ไม่ใช่สมมติจากชื่อ slot เพียงอย่างเดียว',
+  },
+  {
+    q: 'Loop ใน source ของ realtime.apply_rls เรียก set_config(\'role\', working_role, true) และ set_config(\'request.jwt.claims\', claims, true) ข้างใน loop ที่วนต่อ subscription_id แต่ละตัว ก่อนรัน prepared statement exists() สิ่งนี้พิสูจน์อะไรเชิงโครงสร้างเกี่ยวกับ RLS ต่อ subscriber (What does this structurally prove?)',
+    options: [
+      'RLS is checked once per unique role, and all subscribers sharing that role are treated identically regardless of their individual claims',
+      'The exact same SET LOCAL ROLE + request.jwt.claims mechanism this module\'s Postgres Roles and Grants lesson proved for PostgREST is reused by Realtime, executed once per individual subscription_id, not once per role',
+      'RLS is evaluated in the client SDK, not in Postgres, despite appearances',
+      'The prepared statement bypasses RLS entirely and uses a hardcoded allowlist instead',
+    ],
+    answer: 1,
+    explain: 'Loop เขียนไว้ชัดว่า "for subscription_id, claims in (...)" — หนึ่งรอบ หนึ่งการเรียก set_config(\'request.jwt.claims\', claims) และหนึ่งการ execute prepared statement exists() ต่อ subscription_id แต่ละตัว — การ group ตาม role เป็นแค่การ optimize การใช้ prepared statement ซ้ำ ไม่ใช่ทางลัดต่อ role ในการเช็ก authorization จริง',
+  },
+  {
+    q: 'พิสูจน์ realtime.subscription โชว์แถวปรากฏภายใน 3 วินาทีหลัง subscribe และหายไปภายใน 5 วินาทีหลัง disconnect จริง สิ่งนี้แสดงอะไรเกี่ยวกับการมีอยู่และพฤติกรรมของตารางนี้ (What does this demonstrate?)',
+    options: [
+      'realtime.subscription is a conceptual abstraction with no real backing table',
+      'realtime.subscription is a real, queryable Postgres table that apply_rls reads to know which subscribers care about a given entity — and it reflects live connection state, not a permanent record',
+      'Rows in realtime.subscription are only ever inserted, never deleted, across the lifetime of a project',
+      'realtime.subscription only tracks Broadcast from database subscriptions, never Postgres Changes',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ RPC query ตารางจริงนี้โดยตรงทั้งก่อนและหลังรอบ subscribe/disconnect จริง — หนึ่งแถวขณะเชื่อมต่ออยู่ ศูนย์แถวหลัง disconnect — พิสูจน์ว่ามันสะท้อน live subscription state ที่ apply_rls ใช้ต่อ WAL record ไม่ใช่โครงสร้างแบบ static หรือแค่เชิงแนวคิด',
+  },
+  {
+    q: 'ตาม error code จริง ReplicationSlotLagTooHigh ที่อ้างจากเอกสารของ Supabase เกิดอะไรขึ้นจริง ๆ ถ้า Realtime ตามหลังมากหรือล่มไปขณะที่ยังมีการเขียนเกิดขึ้นต่อเนื่อง (What specifically happens?)',
+    options: [
+      'Postgres silently deletes the replication slot immediately',
+      'WAL grows without any limit until the disk fills, with no built-in protection',
+      'Once the slot\'s WAL lag exceeds 50% of max_slot_wal_keep_size, Realtime\'s own replication connection is shut down and restarted, specifically to prevent the slot from being invalidated by Postgres',
+      'The affected tables are automatically removed from the supabase_realtime publication',
+    ],
+    answer: 2,
+    explain: 'อ้างตรง ๆ จากเอกสาร error code จริงของ Realtime: threshold ที่ 50% ของ max_slot_wal_keep_size ทำให้ Realtime self-terminate และ restart connection ของตัวเอง เป็นมาตรการป้องกัน WAL โตไม่มีขีดจำกัดบนฐานข้อมูลหลักโดยตั้งใจ',
+  },
+];
+
+<Quiz client:visible id="supabase-internals/realtime-wal-pipeline" questions={quizRealtimeWalPipeline} />
+
+<ProgressTracker client:visible id="supabase-internals/realtime-wal-pipeline" />

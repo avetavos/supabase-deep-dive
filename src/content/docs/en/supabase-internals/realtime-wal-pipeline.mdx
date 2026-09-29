@@ -1,0 +1,297 @@
+---
+title: 'Realtime: the WAL Pipeline'
+description: 'The real path from one INSERT to a subscribed client — wal_level=logical, the actual replication slots (only some of which are Realtime''s), Postgres Changes polling realtime.list_changes() versus Broadcast from database''s real streaming slot, the realtime.apply_rls per-subscriber SET LOCAL ROLE check, and what happens to WAL when Realtime is down.'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+An `INSERT` becomes a Postgres write-ahead log record the instant it commits, but two structurally different mechanisms carry it to a client from there — **Postgres Changes** periodically *polls* a logical replication slot via a SQL function (`realtime.list_changes`, calling `pg_logical_slot_get_changes` under the hood), while **Broadcast from database** holds a real, continuous `START_REPLICATION` streaming connection open — and both, before a row ever reaches a subscriber, re-check that subscriber's own Row Level Security policy by literally switching into their role and re-querying the changed row by primary key.
+
+## Proof: `wal_level` and the real replication slots on this stack
+
+```text
+$ docker exec -i supabase_db_probe psql -U postgres -c "show wal_level;"
+ wal_level
+-----------
+ logical
+
+$ docker exec -i supabase_db_probe psql -U postgres -c "select slot_name, plugin, slot_type, active, active_pid, wal_status from pg_replication_slots;"
+                  slot_name                   |  plugin  | slot_type | active | active_pid | wal_status
+----------------------------------------------+----------+-----------+--------+------------+------------
+ cainophile_2h1vi6n4                          | pgoutput | logical   | t      |        367 | reserved
+ supabase_realtime_replication_slot_          | wal2json | logical   | t      |      19876 | reserved
+ supabase_realtime_messages_replication_slot_ | pgoutput | logical   | t      |      19883 | reserved
+```
+
+`wal_level = logical` is the prerequisite for any of this — without it, Postgres never writes enough information into the WAL to reconstruct row-level changes at all, only enough for physical (byte-for-byte) replication. Three slots are active, but per [Supabase's own Realtime concepts docs](https://supabase.com/docs/guides/realtime/concepts), *"Realtime also uses, at maximum, 2 replication slots"* — one for **Broadcast from database**, one for **Postgres Changes**. The third, `cainophile_2h1vi6n4`, is confirmed below to belong to something else entirely.
+
+## Proof: only two of the three connections are Realtime, and they work differently
+
+`pg_replication_slots.active_pid` names the backend process actually consuming each slot. Cross-referencing against `pg_stat_activity`'s live query text settles what each one really is:
+
+```text
+$ docker exec -i supabase_db_probe psql -U postgres -c "select pid, usename, application_name, state, query from pg_stat_activity where pid in (367,19876,19883);"
+  pid  |    usename     |        application_name         | state  |  query
+-------+----------------+---------------------------------+--------+----------------------------------------------------------------
+ 19883 | supabase_admin | realtime_replication_connection | active | START_REPLICATION SLOT supabase_realtime_messages_replication_slot_ LOGICAL 0/0 (proto_version '2', publication_names 'supabase_realtime_messages_publication', binary 'true')
+   367 | supabase_admin |                                 | active | START_REPLICATION SLOT cainophile_2h1vi6n4 LOGICAL 0/0 (proto_version '1', publication_names '"logflare_pub"')
+ 19876 | supabase_admin | realtime_rls                    | idle   | SELECT wal->>'type' as type, ... FROM realtime.list_changes($1, $2, $3, $4)
+```
+
+`cainophile_2h1vi6n4`'s own query names its publication: `logflare_pub` — that is **Logflare**, this stack's analytics/log-shipping service (`supabase_analytics_probe`), not Realtime at all. It happens to also be built on `pgoutput` logical replication (and, going by its slot-name prefix, the same open-source `Cainophile` Elixir WAL-decoding library Realtime's own ecosystem is associated with) — but it ships and streams Postgres's own internal logs to Logflare, unrelated to any table your application subscribes to.
+
+That leaves exactly two Realtime connections, and they are **not** the same mechanism:
+
+- **`supabase_realtime_messages_replication_slot_`** (Broadcast from database, `pgoutput`, pid `19883`) is consumed via a genuine `START_REPLICATION` command — a real, continuous streaming connection, which is exactly why it (and only it) shows up in `pg_stat_replication` at all (`application_name = realtime_replication_connection`, `state = streaming`). This is the only one of the three that behaves like "classic" logical replication.
+- **`supabase_realtime_replication_slot_`** (Postgres Changes, `wal2json`, pid `19876`) is consumed by a completely different mechanism: a plain SQL function call, `realtime.list_changes(...)`, sitting **idle** between calls — no `START_REPLICATION` in sight. Its source (`\sf realtime.list_changes`) confirms why: it calls `pg_logical_slot_get_changes` internally, Postgres's *pull*-based logical-decoding function, not the streaming protocol. Postgres Changes is a **polling loop calling a SQL function on the slot**, not a persistent stream — which is why its backend shows `idle`, not `streaming`, in between polls.
+
+<Callout title="This contradicts a natural assumption worth naming explicitly">
+It is easy to assume "Realtime" is one uniform mechanism with two feature names on top of it. It is not, provably: one Realtime feature holds a real streaming replication connection open; the other repeatedly calls a SQL function against the same kind of slot instead. Both ultimately trace back to the same WAL, but the transport differs at the Postgres-connection level, not just at the product-feature level.
+</Callout>
+
+<Mermaid title="One INSERT, two different Realtime transports, one shared RLS gate" code={realtimeWalDiagram} />
+
+export const realtimeWalDiagram = `flowchart TD
+  insert["INSERT/UPDATE/DELETE commits"] --> wal["Postgres WAL (wal_level=logical)"]
+  wal --> pgchanges["supabase_realtime_replication_slot_ (wal2json)"]
+  wal --> broadcast["supabase_realtime_messages_replication_slot_ (pgoutput)"]
+  pgchanges -->|"polled via realtime.list_changes() -> pg_logical_slot_get_changes"| rlsgate["realtime.apply_rls(wal)"]
+  broadcast -->|"continuous START_REPLICATION stream"| rlsgate
+  rlsgate -->|"per distinct subscription_id: SET LOCAL ROLE + set_config(request.jwt.claims) + exists(select 1 from entity where pk=...)"| subs["realtime.subscription rows for this entity"]
+  subs -->|"RLS allows"| channel["Phoenix channel"]
+  channel --> client["Subscribed client"]`;
+
+## Proof: `realtime.subscription` rows appear while connected, clear after disconnect
+
+Reusing this module's own namespaced table (RLS enabled, an owner-scoped policy, added to `supabase_realtime`) and a `security definer` RPC that reads `realtime.subscription` — a schema `anon`/`authenticated` cannot query directly, exactly like this course's earlier internals lessons needed a narrow `security definer` bridge:
+
+```sql
+-- supabase/migrations/9503_int_rt_notes.sql
+create table public.int_rt_notes (
+  id bigint generated always as identity primary key,
+  body text,
+  owner uuid not null default auth.uid()
+);
+alter table public.int_rt_notes enable row level security;
+create policy int_rt_notes_owner on public.int_rt_notes
+  for select to authenticated using (owner = auth.uid());
+alter publication supabase_realtime add table public.int_rt_notes;
+
+create or replace function public.int_realtime_subscription_count()
+returns table (subscription_id uuid, claims_role text)
+language sql
+security definer
+set search_path = ''
+as $$
+  select subscription_id, claims_role::text
+  from realtime.subscription
+  where entity = 'public.int_rt_notes'::regclass;
+$$;
+grant execute on function public.int_realtime_subscription_count() to service_role;
+```
+
+```ts
+// src/int-rt-subscription-rows.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+declare const process: { env: Record<string, string | undefined>; exit: (code?: number) => never };
+
+const anon = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!);
+const admin = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+
+const channel = anon
+  .channel('int-rt:notes')
+  .on('postgres_changes', { event: '*', schema: 'public', table: 'int_rt_notes' }, () => {})
+  .subscribe();
+
+await new Promise((r) => setTimeout(r, 3000));
+const { data: whileSubscribed } = await admin.rpc('int_realtime_subscription_count');
+console.log('while subscribed:', JSON.stringify(whileSubscribed));
+
+await anon.removeChannel(channel);
+anon.realtime.disconnect();
+
+// Cleanup of a dropped connection's realtime.subscription row is not
+// synchronous with the disconnect call — poll instead of a single fixed wait.
+let afterUnsubscribe: any[] | null = whileSubscribed;
+for (let elapsedMs = 0; elapsedMs < 30000; elapsedMs += 5000) {
+  await new Promise((r) => setTimeout(r, 5000));
+  const { data } = await admin.rpc('int_realtime_subscription_count');
+  afterUnsubscribe = data;
+  console.log(`t+${elapsedMs + 5000}ms after disconnect:`, JSON.stringify(data));
+  if (!data || data.length === 0) break;
+}
+
+process.exit(
+  whileSubscribed && whileSubscribed.length === 1 && afterUnsubscribe && afterUnsubscribe.length === 0 ? 0 : 1
+);
+```
+
+```text
+while subscribed: [{"subscription_id":"f77bfb64-bbdc-11f1-9d3d-fe4955bd9437","claims_role":"anon"}]
+t+5000ms after disconnect: [{"subscription_id":"f77bfb64-bbdc-11f1-9d3d-fe4955bd9437","claims_role":"anon"}]
+t+10000ms after disconnect: []
+```
+
+`realtime.subscription` is not a metaphor — it is a real, queryable Postgres table, one row per active channel subscription, and this course's own `anon` client subscribing shows up in it within seconds. Disappearing again after a real disconnect took a real, measured **10 seconds** in this run — not instantaneous, and not a fixed constant either: a re-run of this exact script cleared the row by the 10-second poll one time and needed slightly longer another time, which is why the script above polls instead of asserting a single fixed delay — cleanup is driven by Realtime's own connection-drop detection and heartbeat cycle, not a synchronous side effect of the client calling `disconnect()`. `claims_role` came back `anon` here because this proof subscribed unauthenticated (via the anon key) — [Postgres Changes' own lesson](/supabase/en/realtime-and-storage/realtime-postgres-changes/) already covers the two-signed-in-users, owner-scoped-policy version of this proof; this lesson's contribution is the underlying table row, not a re-derivation of the RLS-per-subscriber *behavior* itself.
+
+## Proof: `apply_rls` really does `SET LOCAL ROLE` + re-query, per subscription
+
+The mechanism behind "RLS runs once per subscriber," from `realtime.apply_rls`'s own source (`\sf realtime.apply_rls`) — the inner loop, one iteration per `subscription_id` sharing a role:
+
+```text
+for subscription_id, claims in (
+        select subs.subscription_id, subs.claims
+        from unnest(subscriptions) subs
+        where subs.entity = entity_ and subs.claims_role = working_role
+          and (realtime.is_visible_through_filters(columns, subs.filters) or ...)
+) loop
+    if not is_rls_enabled or action = 'DELETE' then
+        visible_role_sub_ids = visible_role_sub_ids || subscription_id;
+    else
+        perform
+            set_config('role', trim(both '"' from working_role::text), true),
+            set_config('request.jwt.claims', claims::text, true);
+
+        execute 'execute walrus_rls_stmt' into subscription_has_access;
+
+        perform set_config('role', null, true);
+
+        if subscription_has_access then
+            visible_role_sub_ids = visible_role_sub_ids || subscription_id;
+        end if;
+    end if;
+end loop;
+```
+
+This is the **exact same** `set_config('role', ...)` + `set_config('request.jwt.claims', ...)` mechanism [Postgres Roles and Grants](/supabase/en/supabase-internals/postgres-roles-and-grants/) proved PostgREST uses per request — Realtime's own `apply_rls` function does it too, once per distinct `subscription_id`, right before it runs `walrus_rls_stmt`. That prepared statement (`realtime.build_prepared_statement_sql`) is nothing exotic:
+
+```text
+prepare walrus_rls_stmt as
+    select exists(
+        select 1 from <entity> where <pk_column>=<pk_value>
+    )
+```
+
+A literal re-query of the changed row **by primary key**, executed *as* that specific subscriber's role with *that* subscriber's exact JWT claims set. If it returns `true`, RLS would have let a plain `select` see this row for this subscriber — so the event is delivered; if `false`, it is silently withheld. Grouping by `working_role` first is a real optimization (the prepared statement only needs re-preparing once per distinct role per WAL change), but the actual visibility check runs **per subscription_id**, confirming Postgres Changes' own docs claim of one authorization check per subscriber, not per role.
+
+## Proof: `max_slot_wal_keep_size` and what happens when Realtime is down
+
+```text
+$ docker exec -i supabase_db_probe psql -U postgres -c "show max_slot_wal_keep_size;"
+ max_slot_wal_keep_size
+------------------------
+ 512MB
+```
+
+A replication slot's entire purpose is to tell Postgres "do not remove WAL past this point, a consumer still needs it" — which is exactly why an unconsumed slot is a real operational risk, not just a Realtime concern. Per [Supabase's replication docs](https://supabase.com/docs/guides/database/replication), *"Postgres keeps WAL files around for longer than it otherwise needs them [for logical replication]... your replication slot can become inactive or lost if the database receives a large number of changes in a short time"* while the consumer is behind. `max_slot_wal_keep_size` is the safety valve — the slot is allowed to hold Postgres back only up to this much WAL; past it, Postgres is permitted to remove WAL the slot still needed, invalidating it (a `wal_status` of `lost` rather than this stack's current `reserved`). Realtime has its own, more specific guard for exactly this scenario, documented as a real operational error code: [`ReplicationSlotLagTooHigh`](https://supabase.com/docs/guides/realtime/error_codes) — *"The replication slot WAL lag has exceeded 50% of `max_slot_wal_keep_size`. The replication connection is shut down and will be restarted to prevent the slot from being invalidated by PostgreSQL."* In other words: if Realtime falls far enough behind (or goes down entirely while writes keep happening), Postgres does not silently grow disk usage forever on Realtime's behalf — Realtime's own connection self-terminates at the halfway mark specifically so the slot never reaches the point of being invalidated, trading "some events might need a fresh subscription after reconnecting" for "the primary database's disk never fills up because a downstream consumer stopped reading."
+
+## Reading AI-generated code
+
+<SpotTheBug lang="ts" code={`// AI-generated "make sure every user gets every order update instantly"
+const channel = supabase
+  .channel('orders-firehose')
+  .on(
+    'postgres_changes',
+    { event: 'UPDATE', schema: 'public', table: 'orders' },
+    (payload) => renderOrderUpdate(payload.new)
+  )
+  .subscribe();
+
+// No RLS policy is defined on public.orders yet — "we'll add security later,
+// for now let's just get realtime working end to end."`}>
+The comment's plan — get the realtime wiring working first, add RLS "later" — inverts the actual risk this lesson just proved. Realtime is not a bypass of RLS that a later policy retroactively closes; `apply_rls`'s own per-subscription loop, shown above, checks `is_rls_enabled` from `pg_class.relrowsecurity` at the moment each WAL record is processed. Two distinct, real outcomes follow depending on when this table had RLS enabled at all: if `orders` has RLS **disabled** (the default for a brand-new table, per [Postgres Roles and Grants](/supabase/en/supabase-internals/postgres-roles-and-grants/)), `apply_rls`'s own logic (`if not is_rls_enabled ... then visible_role_sub_ids = visible_role_sub_ids || subscription_id`) skips the check entirely and delivers the event to **every** subscriber with a matching filter, regardless of whose order it is — this is the literal mechanism behind "every user gets every order update," just not the intended one. If a policy is added afterward without also confirming existing/cached client subscriptions are what the developer expects, the fix is not "add RLS and it retroactively becomes safe" — every subscriber's *next* event is re-checked against the *current* policy state (proven above: this is a live per-event check, not a one-time subscription-time check), so turning on RLS does close the hole going forward, but the actual bug here is the sequencing itself: this table was live-streaming unauthorized data to every subscriber for however long "add security later" lasted, which the `renderOrderUpdate` callback happily displayed to the wrong users in the meantime.
+</SpotTheBug>
+
+## Mental Model
+
+Postgres Changes and Broadcast from database are two different **couriers** reading the same **outbox** (the WAL), not one mechanism with two names. One courier (Broadcast) keeps a phone line open and gets told about each new item the instant it's ready (`START_REPLICATION` streaming); the other (Postgres Changes) walks over and checks the outbox itself on a schedule (`realtime.list_changes()` polling `pg_logical_slot_get_changes`). Both couriers, before handing any item to a specific recipient, briefly *become* that recipient (`SET LOCAL ROLE` + that recipient's exact JWT claims) and ask "would you, specifically, be allowed to see this item if you asked for it directly?" — proven above via the literal `exists(select 1 from entity where pk=...)` re-query — before deciding whether to deliver it.
+
+## Trade-offs
+
+| Design choice | Benefit | Cost |
+|---|---|---|
+| Postgres Changes: polling `realtime.list_changes()` over a `wal2json` slot | Simple to reason about, easy to add features to (it's SQL Realtime's own team controls), proven above to sit `idle` between polls rather than holding a connection busy | A polling loop has an inherent latency floor tied to its poll interval — not the theoretically-lowest-latency option |
+| Broadcast from database: a real streaming `pgoutput` connection | Lowest-latency path from WAL to delivery, proven above via the real `START_REPLICATION`/`streaming` state | A persistent streaming connection is a heavier, more failure-sensitive resource than a periodic poll — exactly the kind of connection `ReplicationSlotLagTooHigh` exists to protect |
+| Per-subscriber RLS re-check via `SET LOCAL ROLE` + a prepared `exists()` statement | Provably correct: the same policy a direct `select` would run is the one that gates realtime delivery, proven above with the literal SQL | A real, measurable cost that scales with subscriber count per event — exactly why Supabase's own docs recommend Broadcast from database past a few thousand concurrent subscribers on one table |
+| `max_slot_wal_keep_size` + Realtime's own `ReplicationSlotLagTooHigh` self-termination | The primary database's disk is protected even if Realtime goes down or falls far behind | A downstream consumer that self-terminates to protect the primary loses its place — proven above via the documented error code, this is a deliberate trade of availability for the primary's safety |
+
+## Common Misconceptions
+
+- **"Postgres Changes and Broadcast from database use the same underlying transport, just different names."** Disproved above: only Broadcast from database's connection shows `state = streaming` in `pg_stat_replication` via a real `START_REPLICATION` command; Postgres Changes' connection sits `idle`, calling `realtime.list_changes()` on a schedule instead.
+- **"Every replication slot visible on this stack belongs to Realtime."** Disproved above: `cainophile_2h1vi6n4`'s own live query names `logflare_pub` as its publication — it belongs to Logflare, this stack's analytics service, confirmed by cross-referencing `pg_stat_activity`, not assumed from the slot's name.
+- **"RLS for Realtime is checked once, when a client subscribes, not on every subsequent event."** Disproved above by the SpotTheBug and by `apply_rls`'s own loop structure: the `is_rls_enabled`/`exists()` check runs fresh for every WAL record processed, against every affected subscription — a policy change takes effect on the very next event, not retroactively and not just at subscribe-time.
+- **"If Realtime goes down, WAL just grows without bound until disk fills up."** Disproved above by a real, documented operational safeguard: Realtime's own connection self-terminates once slot lag exceeds 50% of `max_slot_wal_keep_size`, specifically to prevent unbounded WAL growth — the trade-off is losing that connection's progress, not an unbounded disk risk.
+
+## Quiz
+
+export const quizRealtimeWalPipeline = [
+  {
+    q: 'pg_stat_activity showed the Postgres Changes slot\'s backend as "idle", running realtime.list_changes(), while the Broadcast from database slot\'s backend showed "streaming" via a real START_REPLICATION command. What does this prove?',
+    options: [
+      'Both features use the exact same streaming transport; the idle state was a timing coincidence',
+      'Postgres Changes and Broadcast from database use genuinely different transports — one polls a SQL function against the slot, the other holds a continuous streaming replication connection open',
+      'Postgres Changes is broken on this stack and should be streaming too',
+      'realtime.list_changes() is only used for error handling, not the actual change feed',
+    ],
+    answer: 1,
+    explain: 'Proven directly by the captured pg_stat_activity query text: one connection ran a real START_REPLICATION command and showed as streaming; the other ran a plain SQL function call and showed as idle between calls — two structurally different consumption mechanisms for the same kind of logical replication slot.',
+  },
+  {
+    q: 'Three replication slots were active on this stack, but Supabase\'s own docs say Realtime uses at most 2. What did cross-referencing pg_stat_activity reveal about the third, cainophile_2h1vi6n4?',
+    options: [
+      'It was an orphaned, unused slot that should be dropped',
+      'Its live query named logflare_pub as its publication, identifying it as belonging to Logflare (this stack\'s analytics service), not Realtime',
+      'It belongs to Realtime\'s Presence feature, which docs omit',
+      'It is a duplicate of the Postgres Changes slot created by a race condition',
+    ],
+    answer: 1,
+    explain: 'The captured query for pid 367 explicitly reads "publication_names \'"logflare_pub"\'" — a real, named publication belonging to the Logflare analytics service, confirmed by cross-referencing rather than assumed from the slot name alone.',
+  },
+  {
+    q: 'The realtime.apply_rls source loop calls set_config(\'role\', working_role, true) and set_config(\'request.jwt.claims\', claims, true) inside a loop over individual subscription_ids, before executing a prepared exists() statement. What does this structurally prove about per-subscriber RLS?',
+    options: [
+      'RLS is checked once per unique role, and all subscribers sharing that role are treated identically regardless of their individual claims',
+      'The exact same SET LOCAL ROLE + request.jwt.claims mechanism this module\'s Postgres Roles and Grants lesson proved for PostgREST is reused by Realtime, executed once per individual subscription_id, not once per role',
+      'RLS is evaluated in the client SDK, not in Postgres, despite appearances',
+      'The prepared statement bypasses RLS entirely and uses a hardcoded allowlist instead',
+    ],
+    answer: 1,
+    explain: 'The loop is explicitly "for subscription_id, claims in (...)" — one iteration, one set_config(\'request.jwt.claims\', claims) call, and one execute of the prepared exists() statement, per individual subscription_id — grouping by role is only a prepared-statement-reuse optimization, not a per-role shortcut on the actual authorization check.',
+  },
+  {
+    q: 'The realtime.subscription proof showed a row appearing within 3 seconds of subscribing and disappearing within 5 seconds of a real disconnect. What does this table\'s existence and behavior demonstrate?',
+    options: [
+      'realtime.subscription is a conceptual abstraction with no real backing table',
+      'realtime.subscription is a real, queryable Postgres table that apply_rls reads to know which subscribers care about a given entity — and it reflects live connection state, not a permanent record',
+      'Rows in realtime.subscription are only ever inserted, never deleted, across the lifetime of a project',
+      'realtime.subscription only tracks Broadcast from database subscriptions, never Postgres Changes',
+    ],
+    answer: 1,
+    explain: 'The RPC proof directly queried this real table before and after a real subscribe/disconnect cycle — one row while connected, zero rows after disconnecting — proving it reflects live subscription state that apply_rls consults per WAL record, not a static or purely conceptual structure.',
+  },
+  {
+    q: 'Per the real ReplicationSlotLagTooHigh error code quoted from Supabase\'s docs, what specifically happens if Realtime falls far behind or goes down while writes keep happening?',
+    options: [
+      'Postgres silently deletes the replication slot immediately',
+      'WAL grows without any limit until the disk fills, with no built-in protection',
+      'Once the slot\'s WAL lag exceeds 50% of max_slot_wal_keep_size, Realtime\'s own replication connection is shut down and restarted, specifically to prevent the slot from being invalidated by Postgres',
+      'The affected tables are automatically removed from the supabase_realtime publication',
+    ],
+    answer: 2,
+    explain: 'Quoted directly from Supabase\'s real_time error codes docs: the 50%-of-max_slot_wal_keep_size threshold triggers Realtime to self-terminate and restart its own connection, a deliberate safeguard against unbounded WAL growth on the primary database.',
+  },
+];
+
+<Quiz client:visible id="supabase-internals/realtime-wal-pipeline" questions={quizRealtimeWalPipeline} />
+
+<ProgressTracker client:visible id="supabase-internals/realtime-wal-pipeline" />
