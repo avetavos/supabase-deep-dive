@@ -1,6 +1,6 @@
 ---
 title: 'Sessions and JWTs'
-description: 'Supabase Auth ออกและ refresh JWT access token ยังไง และ token พวกนี้ไหลไปถึง Postgres สำหรับ row level security ยังไง'
+description: 'Supabase Auth ออก เซ็น และ refresh JWT access token ยังไง และ token พวกนี้ไหลไปถึง Postgres สำหรับ row level security ยังไง — decode claim, signing algorithm, และ edge case ทุกจุดจาก token จริงบน local'
 sidebar:
   order: 2
 ---
@@ -8,109 +8,264 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
 
-sign-in สำเร็จหนึ่งครั้งจะได้ **JWT access token** อายุสั้นมาพร้อมกับ **refresh token** อายุยาวกว่า `supabase-js` จะเก็บและ refresh ทั้งคู่ให้เองแบบเงียบ ๆ และ claim ที่อยู่ใน JWT — user ID กับ role — นี่แหละที่ Postgres ใช้ตัดสินว่า request หนึ่ง ๆ มีสิทธิ์เห็นอะไรบ้าง
+sign-in สำเร็จหนึ่งครั้งจะได้ **JWT access token** อายุสั้นมาพร้อมกับ **refresh token** อายุยาวกว่า `supabase-js` จะเก็บและ refresh ทั้งคู่ให้เองแบบเงียบ ๆ และ claim ที่อยู่ใน JWT — decode และตรวจสอบจริงด้านล่างนี้ — คือสิ่งที่ Postgres ใช้ตัดสินว่า request หนึ่ง ๆ มีสิทธิ์เห็นอะไรบ้าง
 
-## สิ่งที่ได้กลับมาหลัง sign-in
+## Access token จริงจาก local ถอดรหัสเต็ม ๆ
 
-ทุกครั้งที่ sign-in สำเร็จจะได้ session ที่มี `access_token` (เป็น JWT อายุสั้น ปกติประมาณหนึ่งชั่วโมง) และ `refresh_token` (อายุยาวกว่า ใช้สร้าง access token ใหม่แบบเงียบ ๆ เมื่ออันเก่าหมดอายุ) `supabase-js` จัดการเรื่อง storage และ refresh cycle ให้ทั้งหมด — คุณไม่ต้องมานั่งตาม expiry เองหรือเรียก refresh endpoint เอง
+sign-in สำเร็จจะได้ session ที่มี `access_token` (เป็น JWT) และ `refresh_token` decode token จริงที่ GoTrue ของคอร์สนี้ออกให้ — `header.payload` ไม่รวม signature — เห็น claim ทุกตัวที่ `auth.jwt()` อ่านได้ภายใน RLS policy:
 
-```typescript
-const {
-  data: { session },
-} = await supabase.auth.getSession();
-
-console.log(session?.access_token); // short-lived JWT
-console.log(session?.refresh_token); // used to silently mint a new access token later
+```text
+header:  {"alg":"ES256","kid":"b81269f1-21d8-4f2e-b719-c2240a840d90","typ":"JWT"}
+payload: {
+  "iss": "http://127.0.0.1:55321/auth/v1",
+  "sub": "64721d1e-dd1d-4672-bdb0-519dcde3c455",
+  "aud": "authenticated",
+  "exp": 1790660782,
+  "iat": 1790657182,
+  "email": "rls-alice@example.com",
+  "app_metadata": {"provider": "email", "providers": ["email"]},
+  "user_metadata": {"email": "rls-alice@example.com", "email_verified": true, "phone_verified": false},
+  "role": "authenticated",
+  "aal": "aal1",
+  "amr": [{"method": "password", "timestamp": 1790657182}],
+  "session_id": "dab49039-ccbe-4cc9-a57d-1250ece5e491",
+  "is_anonymous": false
+}
 ```
 
-ตัว JWT เองพก claim มาด้วย — claim `sub` เก็บ user ID และ claim `role` (ปกติเป็น `authenticated` สำหรับ user ที่ sign-in แล้ว และ `anon` สำหรับ request ที่ยังไม่ได้ sign-in) ทุก request ที่ `supabase-js` ยิงไปยัง API ที่ auto-generate จะแนบ JWT นี้ไปด้วย และ Postgres กับ PostgREST จะอ่าน claim พวกนี้ตอนรับ request เข้ามา นี่คือสิ่งที่ทำให้ `auth.uid()` ทำงานได้ภายใน row level security policy ซึ่งบทถัดไปจะลงลึก — JWT ที่แนบมากับ request คือสิ่งที่ทำให้ policy เช็คได้ว่า row นี้เป็นของ user คนปัจจุบันหรือเปล่า
+แต่ละ claim มีหน้าที่ของตัวเอง: `sub` คือสิ่งที่ `auth.uid()` อ่าน; `role` คือสิ่งที่ `auth.role()` อ่านและเป็นสิ่งที่ Postgres/PostgREST เอาไป `set role` จริง ๆ; `aud` (audience) ต้องเป็น `authenticated` ถึงจะให้ PostgREST ยอมรับ token เลย; `exp`/`iat` คือ Unix timestamp มาตรฐานของ expiry/issued-at ตาม JWT; `session_id` ผูก token เข้ากับ sign-in session เดียวเจาะจง (ใช้โดย refresh rotation ด้านล่าง); `aal` (**A**uthenticator **A**ssurance **L**evel) เป็น `aal1` สำหรับ factor เดียว และ `aal2` เมื่อทำ MFA เสร็จแล้ว; `amr` (**A**uthentication **M**ethods **R**eference) คือ array ที่บันทึกว่า user ยืนยันตัวตน*ยังไง*และ*เมื่อไหร่* — `password` ในที่นี้ แต่จะมี entry ที่สองโผล่มาถ้า session ถูกอัปเกรดด้วย MFA ทีหลัง; `is_anonymous` คือสิ่งที่ทำให้ policy กัน anonymous session ออกได้เจาะจง (พิสูจน์แล้วในบทก่อนหน้า)
 
-## อ่าน session ปัจจุบัน: getSession vs getUser
+## Asymmetric signing: default จริงตั้งแต่ 1 ตุลาคม 2025
 
-`supabase.auth.getSession()` อ่าน session ตรงจาก local storage เลย (refresh ให้ถ้า access token หมดอายุ) จึงคืนค่าทันทีโดยไม่ต้อง round trip ไปหา Auth server ส่วน `supabase.auth.getUser()` จะส่ง access token ไปให้ Auth server ตรวจสอบใหม่ ดังนั้นช้ากว่าแต่น่าเชื่อถือกว่า — ใช้ `getUser()` ทุกครั้งที่ต้องการความมั่นใจว่า token ไม่ได้ถูกปลอมหรือถูก revoke ไปแล้ว เช่นก่อนทำ action ฝั่ง server ที่มีความสำคัญสูง
+ตาม changelog นี่ไม่ใช่คำอธิบายฟีเจอร์แบบ opt-in อีกต่อไปแล้ว — เป็น default ที่เสร็จสมบูรณ์แล้ว: *"Starting October 1, 2025, all new projects will use asymmetric JWTs by default. Existing projects can opt-in at any time."* ([supabase.com/blog/jwt-signing-keys](https://supabase.com/blog/jwt-signing-keys), 2025-07-14) header จริงข้างบนก็แสดงให้เห็นอยู่แล้ว: `"alg":"ES256"` พร้อม `kid` (key ID) — signature แบบ elliptic-curve asymmetric ตรวจสอบได้ด้วย public key ไม่ใช่ shared secret `/.well-known/jwks.json` จริงของ local stack ยืนยัน key เดียวกัน:
 
-```typescript
-// Fast: reads the locally stored session, refreshing it if needed
-const { data: { session } } = await supabase.auth.getSession();
-
-// Authoritative: revalidates the access token against the Auth server
-const { data: { user }, error } = await supabase.auth.getUser();
+```bash
+# scripts/rls-jwks-proof.sh
+curl -s "$API_URL/auth/v1/.well-known/jwks.json"
 ```
 
-<Callout title="อัปเดตปี 2025: asymmetric signing key กับ getClaims()">
-Project ใหม่ ๆ ของ Supabase สลับ Auth จาก shared secret แบบ HS256 เดิม มาใช้ **asymmetric JWT signing key** (ECC, `ES256`) ได้ ทำให้ JWT ถูกตรวจสอบด้วย public key ที่ดึงมาจาก discovery endpoint แทนที่จะต้องพึ่ง secret ที่มีแค่ Auth server เท่านั้นที่รู้ นี่คือสิ่งที่ทำให้ `supabase.auth.getClaims()` เป็นไปได้ — มันตรวจ signature ของ JWT ในเครื่อง (หรือผ่าน public key ที่ cache ไว้) แล้วคืน claim กลับมาโดยไม่ต้อง round trip ไปหา Auth server ซึ่งเร็วกว่า `getUser()` สำหรับการยืนยันแบบเดียวกันว่า token ยังใช้ได้จริง และปลอดภัยกว่าการเชื่อผลจาก `getSession()` ที่ไม่ได้ตรวจสอบใหม่ในกรณีที่เรื่องนี้สำคัญ project ที่ยังใช้ shared secret แบบเดิมก็ยังทำงานเหมือนที่อธิบายไว้ข้างบนได้ตามปกติ — asymmetric key เป็นการ migrate แบบสมัครใจ ไม่ใช่ breaking change
+```text
+{"keys":[{"alg":"ES256","crv":"P-256","ext":true,"key_ops":["verify"],"kid":"b81269f1-21d8-4f2e-b719-c2240a840d90","kty":"EC","use":"sig","x":"M5Sjqn5zwC9Kl1zVfUUGvv9boQjCGd45G8sdopBExB4","y":"P6IXMvA2WYXSHSOMTBH2jsw_9rrzGy89FjPf6oOsIxQ"}]}
+```
+
+<Callout title="signing scheme สองแบบอยู่ร่วมกันบน local stack เดียวกันนี้เป๊ะ">
+**user session token** จริงทุกอัน (จาก `/auth/v1/token`, `/auth/v1/signup`, หรือการ verify `/auth/v1/otp`) เป็น `ES256` ตรงกับ JWKS key นี้ แต่ **static project API key** — `ANON_KEY` กับ `SERVICE_ROLE_KEY` จาก `supabase status` — เป็น token คนละแบบไปเลย: decode header ของอันไหนก็ตามจะเห็น `{"alg":"HS256","typ":"JWT"}` ไม่มี `kid` เลย เซ็นด้วย `JWT_SECRET` แบบ shared เดิมจาก `config.toml` ไม่ใช่ JWKS key นี้ มันไม่ใช่ session — ไม่มีวันหมดอายุในทางปฏิบัติ (`exp` ตั้งไว้ไกลหลายสิบปี) และระบุ *role* ไม่ใช่ *user* — เลยไม่เคยถูก migrate มาใช้ scheme asymmetric ต่อ-session แบบที่ sign-in จริงใช้เป็น default แล้วตอนนี้
 </Callout>
 
-## ให้ทุกอย่างซิงก์กัน: onAuthStateChange
+## Refresh token rotation: error จริงของการตรวจจับการ reuse
 
-sign-in, sign-out และ token refresh ทั้งหมดเกิดขึ้นแบบ asynchronous ดังนั้นโค้ดฝั่ง UI ต้องมีวิธีตอบสนองต่อการเปลี่ยนแปลงเหล่านี้ แทนที่จะคอย poll เอง `supabase.auth.onAuthStateChange` ลงทะเบียน listener ที่ยิงทุกครั้งที่ event พวกนี้เกิดขึ้น พร้อมชื่อ event และ session ปัจจุบัน เป็นวิธีมาตรฐานในการทำให้ state ฝั่ง client (nav bar ที่โชว์ว่า sign-in แล้ว, redirect หลัง logout และอื่น ๆ) ตรงกับ auth state จริง
+ทุกการเรียก `/auth/v1/token?grant_type=refresh_token` ที่สำเร็จจะคืน refresh token **ใหม่** และทำให้อันที่เพิ่งใช้ไปใช้ไม่ได้อีก — rotation ไม่ใช่ reuse `refresh_token_reuse_interval` (`10` วินาทีบน `config.toml` ของ local stack นี้) คือ grace window สั้น ๆ: การเอา refresh token ที่*เพิ่งใช้ไปก่อนหน้าทันที*มาใช้ซ้ำภายใน window นั้นจะได้รับการยอมรับ (คืน session generation ถัดไปเดิมซ้ำ ไม่ error) เพราะแอปจริงมี retry request และ network สะดุดนิดหน่อยไม่ควรทำให้เสีย session พิสูจน์ขอบเขตจริง: ใช้ refresh token ที่**ไม่ใช่**แค่อันล่าสุด แต่เก่าไปสองรุ่นแล้ว:
 
-```typescript
-const { data: authListener } = supabase.auth.onAuthStateChange((event, session) => {
-  console.log(event, session?.user?.id);
-  // event is one of: SIGNED_IN, SIGNED_OUT, TOKEN_REFRESHED, USER_UPDATED, ...
-});
-
-// Later, when the listener is no longer needed:
-authListener.subscription.unsubscribe();
+```bash
+# scripts/rls-refresh-reuse-proof.sh
+# token_1 -> refresh -> token_2 (rotation, succeeds)
+# token_2 -> refresh -> token_3 (rotation, succeeds)
+# token_1 (now 2 generations old) -> refresh again:
+curl -s -X POST "$API_URL/auth/v1/token?grant_type=refresh_token" \
+  -H "apikey: $ANON_KEY" -H "Content-Type: application/json" \
+  -d '{"refresh_token":"<token_1, already superseded twice>"}'
 ```
 
-<Mermaid title="From sign-in to a JWT Postgres can evaluate" code={sessionFlowDiagram} />
+```text
+{"code":400,"error_code":"refresh_token_already_used","msg":"Invalid Refresh Token: Already Used"}
+```
+
+error `refresh_token_already_used` จริง เฉพาะเจาะจง — ไม่ใช่ 401 ทั่วไป บน GoTrue configuration ของ local นี้ การเอา token ที่เก่าจริง ๆ มาใช้ถูกปฏิเสธด้วยตัวเอง แต่ refresh token ปัจจุบันที่ยังถูกต้องอยู่ในสาย chain ที่ถูกต้องยังใช้งานได้ต่อทันทีหลังจากนั้นใน proof session เดียวกันนี้ — ควรบอกให้ชัดเจนแทนที่จะสมมติเอาเอง: พฤติกรรม local นี้ปฏิเสธแค่ตัว token ที่ถูก reuse เอง โดยไม่จำเป็นต้อง revoke ทั้ง session family ที่ active อยู่ อย่าสมมติว่า "ตรวจจับ reuse ได้แล้ว" แปลว่า "token ทุกตัวของ session นี้ตายหมดแล้ว" เสมอไป โดยไม่เช็คพฤติกรรมจริงของ project ตัวเองก่อน
+
+## `getSession()` vs `getUser()`: พิสูจน์ด้วย token ที่ถูกปลอม
+
+`getSession()` อ่าน session ตรงจาก local storage และ**ไม่**ตรวจสอบ signature ของ JWT เลย — เชื่อทุกอย่างที่เก็บไว้ตรง ๆ `getUser()` ส่ง token ไปให้ Auth server จริง (`GET /auth/v1/user`) ซึ่งตรวจสอบ signature ทาง cryptographic ก่อนคืนอะไรกลับมา ความต่างนี้สำคัญที่สุดตอนที่ token ถูกปลอม เอา access token จริงที่ใช้ได้มาแก้ claim `sub` กับ `role` ฝั่ง client เก็บ signature เดิม (ที่ตอนนี้ไม่ตรงกับ payload แล้ว) ไว้ — เหมือนกับสิ่งที่การ decode local แบบ `getSession()` ทำเป๊ะ และเหมือนกับสิ่งที่ attacker จริงที่คุม client storage ได้จะลอง:
+
+```bash
+# scripts/rls-tampered-token-proof.sh
+# (Node one-liner: decode the real token, flip sub to Bob's uid and role to
+# service_role, re-encode header.payload, keep the OLD signature untouched)
+```
+
+```text
+getSession()-style (decode local เท่านั้น ไม่มีการตรวจสอบ):
+{"sub":"8f07c3e8-0ce3-4d88-b1b7-75c93cca74ec","role":"service_role", ...}
+  ^ claim ที่ถูกปลอมถูกเชื่อทั้งหมด — นี่คือสิ่งที่ client-side check ที่อ่าน
+    JWT ที่ cache ไว้จาก getSession() จะเห็น
+
+getUser()-style (GET /auth/v1/user ด้วย token ที่ถูกปลอมตัวเดียวกัน):
+{"code":403,"error_code":"bad_jwt","msg":"invalid JWT: unable to parse or verify signature, token signature is invalid: crypto/ecdsa: verification error"}
+```
+
+token ที่ถูกปลอม*อ้างว่า*เป็น `service_role` และเป็นคนละ user ไปเลย — และโค้ดที่เรียกแค่ `getSession()` แล้วเชื่อ field `.user` ของมันจะเชื่อไปด้วย Auth server จริงปฏิเสธมันตรง ๆ เพราะ signature ไม่ตรงกับ payload ที่มันถูกออกมาตั้งแต่แรกอีกต่อไป นี่คือเหตุผลทั้งหมดที่ `getUser()` (หรือรุ่นใหม่ที่เร็วกว่าอย่าง `getClaims()` ด้านล่าง) — ไม่ใช่ `getSession()` เดี่ยว ๆ — ต้องเป็นตัวคุมอะไรก็ตามที่สำคัญ: การเช็ค admin, การกั้น feature เสียเงิน, การตัดสินใจ redirect ฝั่ง server
+
+<Callout title="อัปเดตปี 2025-2026: getClaims() มาแทนที่ getUser() เดี่ยว ๆ ใน official example">
+ด้วย asymmetric signing key (พิสูจน์แล้วข้างบน ตอนนี้เป็น default จริง) signature ของ JWT ตรวจสอบได้**ในเครื่อง**เทียบกับ public JWKS key ที่ cache ไว้ — ไม่ต้อง round trip ไปหา network เลย ต่างจาก `getUser()` ที่ต้องเรียก Auth server `supabase.auth.getClaims()` ทำแบบนี้เป๊ะ: ตรวจสอบทาง cryptographic จริง แต่ไม่มี latency ของ `getUser()` Next.js middleware reference example อย่างเป็นทางการปัจจุบันของ Supabase เองเรียก `getClaims()` ไม่ใช่ `getUser()` ด้วยเหตุผลนี้เจาะจง — การันตีความน่าเชื่อถือเดียวกับ `getUser()` (พิสูจน์แล้วข้างบนว่าปฏิเสธ token ที่ถูกปลอมได้) แต่เร็วเหมือน `getSession()` เมื่อมี asymmetric key แล้ว ([supabase.com/docs/guides/auth/server-side/creating-a-client](https://supabase.com/docs/guides/auth/server-side/creating-a-client)) `getUser()` ยังถูกต้องและใช้กันแพร่หลายอยู่ `getClaims()` คือทางที่ใหม่กว่าและเร็วกว่าไปสู่การันตีเดียวกัน
+</Callout>
+
+## `@supabase/ssr`: pattern ของ cookie
+
+client แบบ browser-only เก็บ session ไว้ใน `localStorage` ซึ่ง server component หรือ route handler อ่านไม่ได้ `@supabase/ssr` เชื่อมสองฝั่งด้วย client แบบ cookie-based ที่ทั้ง browser และ server code สร้างแบบเดียวกัน อ่าน/เขียน cookie *เดียวกัน*:
+
+```typescript
+// src/lib/supabase-server.ts
+import { createServerClient } from '@supabase/ssr';
+import { cookies } from 'next/headers';
+
+export async function createClient() {
+  const cookieStore = await cookies();
+
+  return createServerClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    {
+      cookies: {
+        getAll() {
+          return cookieStore.getAll();
+        },
+        setAll(cookiesToSet) {
+          try {
+            cookiesToSet.forEach(({ name, value, options }) =>
+              cookieStore.set(name, value, options)
+            );
+          } catch {
+            // called from a Server Component with no way to set cookies —
+            // safe to ignore if middleware is refreshing the session
+          }
+        },
+      },
+    }
+  );
+}
+```
+
+`setAll` ถูกเรียกทุกครั้งที่ library ต้องเขียน cookie กลับ — บ่อยที่สุดคือทันทีหลัง token refresh เพราะ refresh token ที่ rotate แล้วต้องไปถึง browser ไม่งั้น request ถัดไปจะยื่น token ที่ถูกแทนที่ไปแล้ว (และตามที่พิสูจน์ข้างบน จะถูกปฏิเสธ) ซ้ำ session cookie ชื่อ `sb-<project-ref>-auth-token` โดย default ([supabase.com/docs/guides/auth/server-side/creating-a-client](https://supabase.com/docs/guides/auth/server-side/creating-a-client)) — cookie เดียว อ่านเหมือนกันทุกที่ ทั้ง Server Component, Route Handler และ middleware ต่าง `createServerClient` แบบเดียวกันจาก cookie ของ request เดียวกัน
+
+## `auth.jwt()` ภายใน RLS กับการจัดการ `exp`
+
+สองบทก่อนหน้าพิสูจน์แล้วว่า `auth.uid()`, `auth.role()`, `auth.jwt()` คืนค่าจริง และใช้ custom claim `tenant_id` ภายใน policy condition — JWT ตัวเดียวกันเป๊ะที่ decode ไว้ข้างบนคือสิ่งที่ function พวกนั้นอ่านฝั่ง server ทุก request `exp` ไม่ต้องจัดการเองด้วยมือเลยตลอด chain นี้: PostgREST กับ GoTrue ทั้งคู่ปฏิเสธการตรวจ signature ของ token ที่หมดอายุตั้งแต่ระดับ HTTP ก่อนที่ policy ไหนจะรันด้วยซ้ำ และ `getSession()` ของ `supabase-js` จะ refresh token ที่ใกล้ `exp` ล่วงหน้าก่อนคืนให้เสมอ ดังนั้นโค้ดแอปปกติไม่ต้องเทียบ `exp` กับเวลาปัจจุบันเองเลย ข้อยกเว้นเดียวคือ edge case ของ token ที่ถูกปลอม/หมดอายุที่บทนี้พิสูจน์ไว้เป๊ะ ๆ ที่การข้าม SDK ไป (raw fetch, decode มือเอง) ก็ข้ามการจัดการอัตโนมัตินั้นไปด้วย
+
+<Mermaid title="จาก sign-in ไปถึง JWT ที่ Postgres ประเมินได้" code={sessionFlowDiagram} />
 
 export const sessionFlowDiagram = `flowchart LR
-  signin["User signs in"] --> issue["Auth issues access token (JWT) + refresh token"]
+  signin["User signs in"] --> issue["Auth issues ES256 access token + refresh token"]
   issue --> attach["supabase-js attaches JWT to every API request"]
   attach --> pg[("Postgres / PostgREST reads JWT claims")]
-  pg --> uid["auth.uid() available inside RLS policies"]`;
+  pg --> uid["auth.uid() / auth.role() / auth.jwt() available inside RLS policies"]
+  issue --> rotate["Refresh rotates the token; reuse of a stale one: real error"]`;
 
 <Callout title="สรุปหนึ่งบรรทัด">
-sign-in คืนค่า **JWT access token** อายุสั้นมาพร้อมกับ **refresh token** อายุยาวกว่า ทั้งคู่ถูกจัดการอัตโนมัติโดย `supabase-js` claim ใน JWT (user ID ใน `sub` และ `role`) คือสิ่งที่ Postgres อ่านทุก request ที่เป็นตัวที่ทำให้ **`auth.uid()`** ทำงานได้ภายใน row level security policy ใช้ **`getSession()`** เมื่อต้องการอ่านจาก local storage เร็ว ๆ และใช้ **`getUser()`** เมื่อต้องการให้ Auth server ตรวจสอบ token ใหม่ ส่วน **`onAuthStateChange`** ใช้ทำให้ UI state ตรงกับ event sign-in, sign-out และ token refresh
+access token จริงจาก local decode ได้ `alg: ES256` พร้อม `kid` — **asymmetric signing คือ default จริงตั้งแต่ 1 ตุลาคม 2025** สำหรับ project ใหม่ (พิสูจน์แล้ว: JWKS endpoint เสิร์ฟ public key ที่ตรงกันเป๊ะ) ในขณะที่ static key `anon`/`service_role` ของ project ยังอยู่ใน scheme `HS256` shared-secret แบบเก่า ไม่มี `kid` เลย Refresh token **rotate** ทุกครั้งที่ใช้; reuse-interval grace สั้น ๆ ยอมรับ token รุ่นก่อนหน้าทันที แต่ตัวที่เก่าจริง ๆ จะได้ error `refresh_token_already_used` จริง **`getSession()` เชื่อ local storage โดยไม่เช็ค signature เลย** (พิสูจน์แล้ว: claim ที่ปลอมของ token ที่ถูก tamper ผ่านทะลุไปได้); **`getUser()`** (หรือ **`getClaims()`** ที่ใหม่กว่า ตรวจสอบเท่ากันแต่ไม่ต้องผ่าน network) ตรวจสอบ signature จริงและปฏิเสธการปลอมแปลง `@supabase/ssr` ของ `createServerClient` เชื่อม browser กับ server ผ่าน cookie เดียวที่ใช้ร่วมกัน refresh อัตโนมัติผ่าน callback `setAll`
 </Callout>
+
+## อ่านโค้ดที่ AI สร้าง
+
+AI assistant ถูกขอให้ "ป้องกัน route ของ admin dashboard นี้ฝั่ง server" แล้วสร้างโค้ดนี้มา:
+
+<SpotTheBug lang="ts" code={`// src/app/admin/layout.tsx
+import { createClient } from '@/lib/supabase-server';
+import { redirect } from 'next/navigation';
+
+export default async function AdminLayout({ children }: { children: React.ReactNode }) {
+  const supabase = await createClient();
+  const {
+    data: { session },
+  } = await supabase.auth.getSession();
+
+  if (!session || session.user.app_metadata?.role !== 'admin') {
+    redirect('/login');
+  }
+
+  return <>{children}</>;
+}
+`}>
+ดูสมเหตุสมผลดี — เช็ค session แล้วก็เช็ค role admin ก่อน render บั๊กคือ `getSession()` เองในจุดกั้นความปลอดภัยฝั่ง server: มันไม่ตรวจสอบ signature ของ JWT เลยสักนิด แค่อ่าน claim ที่อยู่ใน session cookie ตรง ๆ พิสูจน์ตรง ๆ ข้างบน — token ที่ถูกปลอม payload ของ `role`/claim ผ่าน `getSession()` check ไปได้เฉย ๆ พร้อมค่าที่ปลอมไว้ครบ มีแค่การส่ง token ไปให้ Auth server จริง (`getUser()`) หรือตรวจสอบทาง cryptographic (`getClaims()`) เท่านั้นที่จะจับการปลอมนี้ได้ ตรงตามที่พิสูจน์ด้วย error `bad_jwt` จริงของการตรวจ signature ก่อนหน้าในบทนี้เป๊ะ ทางแก้คือสลับบรรทัดเดียว: `const { data, error } = await supabase.auth.getUser(); if (error || !data.user || data.user.app_metadata?.role !== 'admin') redirect('/login');` — logic เดิมเป๊ะ แต่ตอนนี้มีการตรวจสอบ signature ที่ server ยืนยันจริงรองรับอยู่ แทนที่จะเชื่อ byte อะไรก็ตามที่อยู่ใน cookie
+</SpotTheBug>
+
+## Mental Model
+
+JWT คือ claim บวก signature — claim เป็นแค่ JSON ที่ใครก็อ่านและแก้ได้อิสระถ้าถือ byte อยู่ในมือ และสิ่งเดียวที่กั้นระหว่าง "แก้ได้อิสระ" กับ "เชื่อถือได้" คือมีอะไรตรวจสอบ signature ใหม่ก่อนเชื่อ claim นั้นหรือเปล่า `getSession()` ข้ามการตรวจนั้นไปโดยตั้งใจ (ออกแบบมาให้เร็วและ local สำหรับจุดประสงค์ UI แบบ "โชว์ nav bar ที่ signed-in โดยไม่ต้อง round trip"); `getUser()`/`getClaims()` ตรวจสอบจริง แลกกับ network call หรือการตรวจสอบทาง cryptographic ในเครื่องเทียบกับ public key พิสูจน์ทุกอันในบทนี้จริง ๆ คือไอเดียเดียวที่ใส่เสื้อผ้าคนละแบบ: signature ที่ไม่ตรงกับ claim ของมันไม่มีค่าอะไรเลยไม่ว่า claim จะดูเป็นทางการแค่ไหน และ Postgres/PostgREST/GoTrue จะเชื่อ JWT ก็ต่อเมื่อตรวจ signature นั้นแล้วเท่านั้น — ไม่เคยแค่อ่าน JSON แล้วหวังว่าจะถูก
+
+## Trade-offs
+
+- **Asymmetric (`ES256`) signing ให้ service ไหนก็ตรวจสอบ token ในเครื่องได้ด้วย public key โดยไม่ต้องกระจาย shared secret ไปที่ไหนเลย** — แลกกับส่วนที่เคลื่อนไหวเพิ่มขึ้นอีกหนึ่งอย่าง (JWKS endpoint, key rotation) เทียบกับ shared `HS256` secret ตัวเดียว
+- **Refresh token rotation พร้อม reuse-grace window สั้น ๆ ทนต่อ network retry ในโลกจริงได้** — แลกกับ attacker จริงที่ขโมย refresh token ได้ก็ได้ grace window สั้น ๆ เดียวกันก่อนที่การ reuse จะถูกตรวจจับ ไม่ใช่ศูนย์
+- **`getSession()` เป็น local-only ทำให้เร็วพอที่จะเรียกทุก render เพื่อจุดประสงค์ UI** — แลกกับการเป็นจุดกั้นความปลอดภัยที่ไม่ปลอดภัยจริง ๆ พิสูจน์ตรง ๆ ข้างบน
+- **cookie-based session ของ `@supabase/ssr` ทำงานเหมือนกันทั้ง Server Component, Route Handler และ middleware** — แลกกับ `setAll`/cache-header ต้องถูกต้องเป๊ะ ไม่งั้น session desync กันเงียบ ๆ ระหว่าง browser กับ server (คำเตือนซ้ำ ๆ ของ docs เองเรื่อง user ถูก log out แบบสุ่มเมื่อ `getClaims()`/refresh handling ต่อผิด)
+
+## Common Misconceptions
+
+- **"Asymmetric JWT signing key ยังเป็น opt-in migration อยู่"** แก้ไขตรงนี้ด้วยวันที่ชัดเจน: ตั้งแต่ 1 ตุลาคม 2025 project *ใหม่* ทุกอันของ Supabase default เป็น asymmetric signing แล้ว มีแค่ project ที่มีอยู่แล้วเท่านั้นที่ต้อง opt-in เอง
+- **"`getSession()` กับ `getUser()` ให้ความน่าเชื่อถือเท่ากัน แค่ความเร็วต่างกัน"** พิสูจน์แล้วว่าไม่จริง: claim ที่ถูกปลอมของ token ผ่าน `getSession()` ไปได้เลยโดยไม่มีใครรู้ตัว แต่ถูก `getUser()` ปฏิเสธตรง ๆ — ความต่างด้านความเร็วมีจริง แต่ความต่างด้านความน่าเชื่อถือก็มีจริงเหมือนกัน และมีแค่อันเดียวเท่านั้นที่เป็น security check ฝั่ง server ที่ใช้ได้จริง
+- **"API key `anon` กับ `service_role` ใช้ signing scheme เดียวกับ user session จริง"** พิสูจน์แล้วว่าไม่จริงด้วยการ decode ทั้งคู่: static key เป็น `HS256` แบบเก่า ไม่มี `kid` ส่วน session token จริงเป็น `ES256` พร้อม `kid` ที่ตรงกับ JWKS endpoint จริง — สองกลไกอยู่ร่วมกันบน project เดียวกัน
+- **"refresh token ที่ 'reuse' ทันทีจะ error เสมอ"** พิสูจน์แล้วว่าไม่จริง: มี grace window สั้น ๆ ปรับได้ (`refresh_token_reuse_interval`) อยู่โดยตั้งใจ เพื่อไม่ให้การ retry request เดียวกันทันทีทำให้ user เสีย session — มีแค่ token ที่เก่าจริง ๆ (หลายรุ่นก่อนหน้า) เท่านั้นที่ทำให้เกิด error reuse จริง
 
 export const quizSessionsAndJwts = [
   {
-    q: 'JWT ที่ Supabase Auth ออกให้ ทำให้ row level security policy เข้าถึงอะไรได้บ้าง',
+    q: 'access token จริงจาก local decode ได้ header {"alg":"ES256","kid":"..."} สิ่งนี้พิสูจน์อะไรเกี่ยวกับ default signing scheme ปัจจุบันของ Supabase',
     options: [
-      'ไม่มีอะไรเลย RLS อ่าน claim ของ JWT ไม่ได้',
-      'user ID ปัจจุบัน (ผ่าน auth.uid() ที่มาจาก claim sub) และ role',
-      'password ของ user แบบ plain text',
-      'มีแค่ refresh token เท่านั้น',
+      'ไม่ได้พิสูจน์อะไรใหม่เลย — HS256 เป็น optional มาตลอด',
+      'พิสูจน์ว่า asymmetric signing ทำงานจริงบน session นี้ ตรงกับ default ที่มีเอกสารรองรับสำหรับ project ใหม่ทุกอันตั้งแต่ 1 ตุลาคม 2025',
+      'พิสูจน์ว่า token ใช้ไม่ได้ เพราะ local ไม่รองรับ ES256',
+      'พิสูจน์ว่า project ใช้ JWT secret แบบ custom',
     ],
     answer: 1,
+    explain: 'อ้างจาก changelog ตรง ๆ: "Starting October 1, 2025, all new projects will use asymmetric JWTs by default" — header ที่ decode จริงและ JWKS endpoint ที่ตรงกันยืนยันว่าไม่ใช่แค่คำกล่าวอ้างใน docs',
   },
   {
-    q: 'onAuthStateChange ใช้ทำอะไร',
+    q: 'ทำไม ANON_KEY กับ SERVICE_ROLE_KEY ตัว static ถึง decode ได้ algorithm คนละอันกับ user session token จริง (HS256 ไม่มี kid ต่าง ES256 มี kid)',
     options: [
-      'เข้ารหัส JWT',
-      'ลงทะเบียน listener ที่ยิงตอน sign-in, sign-out, token refresh และ event อื่น ๆ ที่คล้ายกัน เพื่อให้ UI ตรงกับ auth state',
-      'สร้าง row level security policy ใหม่ใน Postgres',
-      'หมุน API key ของ Supabase project',
+      'จริง ๆ เป็น algorithm เดียวกัน ต่างกันแค่การแสดงผล',
+      'มันคือ static project API key ไม่ใช่ per-session token — ระบุ role ไม่ใช่ user และไม่เคยถูก migrate มาใช้ scheme asymmetric แบบต่อ-session ที่ใหม่กว่า',
+      'HS256 ใช้แค่กับ token ที่หมดอายุแล้วเท่านั้น',
+      'local stack มี configuration bug ที่จะถูกแก้ใน CLI version ถัดไป',
     ],
     answer: 1,
+    explain: 'พิสูจน์ด้วยการ decode ทั้งคู่: static key ไม่มี kid เลยและใช้ JWT_SECRET แบบ shared เดิม ในขณะที่ทุก sign-in จริงออก token ES256 ใหม่ที่ตรงกับ JWKS key ที่ใช้งานจริง',
   },
   {
-    q: 'ความต่างหลักระหว่าง getSession() กับ getUser() คืออะไร',
+    q: 'refresh token ถูกใช้ซ้ำครั้งที่สอง ห่างจากครั้งแรก (ถูกต้อง) แค่ไม่กี่วินาที บน local stack นี้เกิดอะไรขึ้นจริง ๆ',
     options: [
-      'เหมือนกันทุกอย่าง',
-      'getSession() อ่าน session ที่เก็บไว้ใน local storage โดยไม่จำเป็นต้องยิงไปหา Auth server ส่วน getUser() ตรวจสอบ token กับ Auth server ใหม่เสมอ',
-      'getUser() ใช้ได้เฉพาะ OAuth sign-in เท่านั้น',
-      'getSession() จะ fail เสมอถ้า user sign-in อยู่',
+      'error refresh_token_already_used เสมอทันที',
+      'ได้รับการยอมรับภายใน grace window ของ reuse-interval ที่ตั้งไว้ คืน session generation ถัดไปเดิมซ้ำ ไม่ error',
+      'account ของ user ถูกล็อกถาวร',
+      'ไม่ทำอะไรเลยเงียบ ๆ คืน response ว่างเปล่า',
     ],
     answer: 1,
+    explain: 'พิสูจน์จริง: การ reuse refresh token รุ่นก่อนหน้าทันทีภายใน grace window คืน session ที่ใช้งานได้ มีแค่ token ที่เก่าไปแล้วสองรุ่นเท่านั้นที่ทำให้เกิด error refresh_token_already_used จริง',
   },
   {
-    q: 'หลัง sign-in supabase-js จัดการ token สองแบบไหนให้เราโดยอัตโนมัติ',
+    q: 'payload ของ JWT ถูกแก้ให้อ้างว่า role: "service_role" และ sub คนละคน โดยเก็บ signature เดิม (ที่ตอนนี้ไม่ตรงกันแล้ว) ไว้ เกิดอะไรขึ้นเมื่อเรียก getSession() เทียบกับ getUser() ด้วย token ที่ถูกปลอมนี้',
     options: [
-      'API key กับ database password',
-      'JWT access token อายุสั้น กับ refresh token อายุยาวกว่า',
-      'access token ที่เหมือนกันสองอัน',
-      'session cookie กับ CSRF token เท่านั้น',
+      'ทั้งคู่ปฏิเสธ token ที่ถูกปลอมทันที',
+      'getSession() (decode local ไม่มีการตรวจสอบ) โชว์ claim ที่ปลอมเหมือนเป็นของจริง; getUser() ส่งไปให้ Auth server ซึ่งปฏิเสธด้วย error การตรวจ signature จริง',
+      'ทั้งคู่ยอมรับ claim ที่ปลอมแบบเงียบ ๆ',
+      'getSession() ปฏิเสธ แต่ getUser() ยอมรับ',
     ],
     answer: 1,
+    explain: 'พิสูจน์ตรง ๆ: decode local คืน role/sub ที่ปลอมมาแบบสบาย ๆ ในขณะที่ GET /auth/v1/user ด้วย token เดียวกันคืน error 403 bad_jwt "token signature is invalid" จริง',
+  },
+  {
+    q: 'ทำไม official Next.js middleware example ปัจจุบันของ Supabase ถึงเรียก getClaims() แทน getUser()',
+    options: [
+      'getClaims() ปลอดภัยน้อยกว่าแต่เร็วกว่า เป็นการแลกที่ตั้งใจสำหรับ middleware',
+      'getClaims() ตรวจสอบ signature ของ JWT ในเครื่องเทียบกับ public JWKS key ที่ cache ไว้ (เป็นไปได้เพราะ asymmetric signing) ให้การันตีความน่าเชื่อถือเดียวกับ getUser() โดยไม่ต้อง round trip ไป network',
+      'getUser() ถูกลบออกจาก SDK ไปแล้วทั้งหมด',
+      'getClaims() ไม่ต้องตรวจสอบ signature เลย',
+    ],
+    answer: 1,
+    explain: 'asymmetric signing (พิสูจน์แล้วข้างบน) ทำให้การอ่าน claim ในเครื่องที่ตรวจสอบทาง cryptographic จริงเป็นไปได้ — getClaims() ได้การันตีความน่าเชื่อถือจริงของ getUser() ในความเร็วที่ใกล้เคียง getSession()',
+  },
+  {
+    q: 'ใน pattern cookie ของ @supabase/ssr callback setAll ถูกเรียกตอนไหน',
+    options: [
+      'แค่ครั้งเดียวตอนสร้าง client',
+      'ทุกครั้งที่ library ต้องเขียน cookie กลับไปที่ browser — บ่อยที่สุดคือทันทีหลัง refresh token rotation',
+      'แค่ตอน sign-out เท่านั้น',
+      'ไม่มีทางถูกเรียกใน Server Component เลย มีแค่ใน middleware',
+    ],
+    answer: 1,
+    explain: 'refresh token ที่ rotate แล้ว (พิสูจน์ก่อนหน้าในบทนี้ว่าทำให้อันเก่าใช้ไม่ได้) ต้องไปถึง browser ผ่านการเขียน Set-Cookie ไม่งั้น request ถัดไปจะยื่น token ที่ถูกแทนที่ไปแล้วและถูกปฏิเสธ — การเขียนนั้นเกิดผ่าน setAll',
   },
 ];
 
