@@ -1,6 +1,6 @@
 ---
 title: 'Auth in the Client'
-description: 'A complete sign-up, sign-in, and sign-out flow in supabase-js, keeping UI state in sync with onAuthStateChange, and why client-side route protection is UX, not security.'
+description: 'A complete sign-up, sign-in, and sign-out flow, the real onAuthStateChange event order proven live, where a session lives in the browser versus Node, the PKCE code exchange proven end to end, and why client-side route protection is UX, not security.'
 sidebar:
   order: 2
 ---
@@ -8,15 +8,16 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
 
-`supabase.auth` gives you `signUp`, `signInWithPassword`, and `signOut` to drive a session, `onAuthStateChange` to keep your app's UI in sync with that session automatically, and a hard rule to remember throughout: any check you do against that session in client code is a UX convenience, while row level security on the database is the actual security boundary.
+`supabase.auth` gives you `signUp`, `signInWithPassword`, and `signOut` to drive a session, `onAuthStateChange` to keep your app's UI in sync with that session automatically — in a real, provable order — and a hard rule to remember throughout: any check you do against that session in client code is a UX convenience, while row level security on the database is the actual security boundary.
 
 ## A complete sign-up, sign-in, sign-out flow
 
-Every one of these calls resolves to `{ data, error }` rather than throwing, so check `error` before trusting the result — the same pattern you will see formalized in the next lesson.
+Every one of these calls resolves to `{ data, error }` rather than throwing, so check `error` before trusting the result — the same pattern formalized in the next lesson.
 
 ```typescript
 // Sign up a new user
@@ -49,18 +50,160 @@ if (signOutError) {
 
 A successful `signUp` or `signInWithPassword` call stores a session (an access token and a refresh token) in the client, and every subsequent request from that client is sent as that authenticated user.
 
-## Keeping UI state in sync with `onAuthStateChange`
+## `onAuthStateChange`: the real event order, proven live
 
-Rather than manually tracking whether a user is signed in — and re-checking it after every sign-in, sign-out, or silent token refresh — subscribe once, typically at app startup:
+Rather than manually tracking whether a user is signed in, subscribe once, typically at app startup. What actually fires, and in what order, is not a guess here — signing in, manually refreshing, then signing out on one real local client, logging every event as it arrives:
 
-```typescript
-supabase.auth.onAuthStateChange((event, session) => {
-  // Fires on SIGNED_IN, SIGNED_OUT, TOKEN_REFRESHED, and more
-  setSession(session);
+```ts
+// src/cli-auth-state-sequence.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+const API_URL = process.env.SUPABASE_URL!;
+const admin = createClient(API_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+
+const email = 'cli-client-dev-authseq@example.com';
+const password = 'cli-pw-authseq-12345';
+let user = (await admin.auth.admin.listUsers()).data.users.find((u) => u.email === email);
+if (!user) user = (await admin.auth.admin.createUser({ email, password, email_confirm: true })).data.user!;
+
+const client = createClient(API_URL, process.env.SUPABASE_ANON_KEY!);
+const events: string[] = [];
+client.auth.onAuthStateChange((event, session) => {
+  events.push(`${event} (session=${session ? 'yes' : 'no'})`);
 });
+
+await new Promise((r) => setTimeout(r, 300)); // let INITIAL_SESSION fire
+await client.auth.signInWithPassword({ email, password });
+await new Promise((r) => setTimeout(r, 300));
+
+await client.auth.refreshSession(); // force a token refresh instead of waiting on the timer
+await new Promise((r) => setTimeout(r, 300));
+
+await client.auth.signOut();
+await new Promise((r) => setTimeout(r, 300));
+
+console.log('event sequence:', JSON.stringify(events));
+await admin.auth.admin.deleteUser(user.id);
 ```
 
-This one subscription fires for every auth-related event for the lifetime of the app: the initial session on load, a sign-in, a sign-out, and a token refresh happening quietly in the background. Wiring your app's local state to this single callback means the UI is always a reflection of the client's real session, and you never have to remember to call it manually after each auth action.
+```text
+event sequence: ["INITIAL_SESSION (session=no)","SIGNED_IN (session=yes)","TOKEN_REFRESHED (session=yes)","SIGNED_OUT (session=no)"]
+```
+
+Four real, distinct events, in this exact order: **`INITIAL_SESSION`** fires once, right after the client is constructed, whether or not a session exists yet (`session=no` here, since this client starts fresh); **`SIGNED_IN`** fires on the `signInWithPassword` call above, but per the SDK's own reference docs it also fires on other session-(re)establishing moments — a tab regaining focus, for example — so application code should check the `session.user` it receives rather than assuming `SIGNED_IN` always means "a brand new sign-in just happened"; **`TOKEN_REFRESHED`** fires on both the automatic background refresh (driven by `autoRefreshToken`, the default from the previous lesson's configuration table) and, as proved here, a manual `refreshSession()` call; **`SIGNED_OUT`** fires on `signOut()`, and also whenever a session becomes invalid for any other reason (expired past its refresh window, revoked on another device, and similar). Wiring your app's local state to this single callback means the UI is always a reflection of the client's real session, and you never have to remember to call it manually after each auth action.
+
+Two events this course's local stack did not exercise here, but that the same callback also delivers: **`USER_UPDATED`** (after `updateUser()` succeeds) and **`PASSWORD_RECOVERY`** (in place of `SIGNED_IN`, when a user lands on a page via a password-recovery link).
+
+## Where the session actually lives: browser vs. Node
+
+`persistSession: true` is the default, but *where* it persists is runtime-dependent, not a fixed answer. In a browser, it is `localStorage` by default. In Node — this course's proof environment, with no `localStorage` global — `supabase-js` falls back to an **in-memory** store scoped to that one client instance, proved by creating a second, completely independent client in the same process and checking whether it can see the first one's session:
+
+```ts
+// src/cli-auth-storage-location.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+const API_URL = process.env.SUPABASE_URL!;
+const ANON_KEY = process.env.SUPABASE_ANON_KEY!;
+const admin = createClient(API_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+
+const email = 'cli-client-dev-storage@example.com';
+const password = 'cli-pw-storage-12345';
+let user = (await admin.auth.admin.listUsers()).data.users.find((u) => u.email === email);
+if (!user) user = (await admin.auth.admin.createUser({ email, password, email_confirm: true })).data.user!;
+
+const clientA = createClient(API_URL, ANON_KEY);
+await clientA.auth.signInWithPassword({ email, password });
+const sessionA = await clientA.auth.getSession();
+console.log('clientA (signed in) session present =', !!sessionA.data.session);
+
+const clientB = createClient(API_URL, ANON_KEY); // fresh instance, same process, no storage option passed
+const sessionB = await clientB.auth.getSession();
+console.log('clientB (fresh instance) session present =', !!sessionB.data.session);
+
+await admin.auth.admin.deleteUser(user.id);
+```
+
+```text
+clientA (signed in) session present = true
+clientB (fresh instance) session present = false
+```
+
+`clientB` cannot see `clientA`'s session even though both were created in the same Node process, seconds apart, with the identical URL and `anon` key — proof that the default storage is per-instance in-memory in Node, not a shared process-level cache and nothing like a browser's shared `localStorage`. This is exactly why the singleton pattern from the previous lesson matters in the browser (one client, one shared in-memory-or-`localStorage` session) and why a server needs a real adapter — cookies, via `@supabase/ssr`, already proved in the Auth module — rather than relying on this in-memory default across requests.
+
+## PKCE, end to end: from a real magic-link email to a real session
+
+`flowType: 'pkce'` is `supabase-js`'s default and recommended flow (the earlier `implicit` flow, which returned tokens directly in a URL fragment, remains available but is not the default). A magic link or OAuth redirect under PKCE carries a `?code=` authorization code, not the tokens themselves — the client must call `exchangeCodeForSession(code)` to turn that code into a real session:
+
+```typescript
+// A server-side OAuth/magic-link callback route — code + citation
+// source: supabase.com/docs (_partials/oauth_pkce_flow.mdx)
+export async function GET(request: Request) {
+  const { searchParams, origin } = new URL(request.url);
+  const code = searchParams.get('code');
+
+  if (code) {
+    const supabase = await createClient();
+    const { error } = await supabase.auth.exchangeCodeForSession(code);
+    if (!error) {
+      return NextResponse.redirect(`${origin}/`);
+    }
+  }
+
+  return NextResponse.redirect(`${origin}/auth/auth-code-error`);
+}
+```
+
+`detectSessionInUrl: true` (the previous lesson's configuration table) does this automatically for a pure client-side app; a server-side callback route — no `localStorage`, no URL to auto-detect from — calls `exchangeCodeForSession` by hand instead, per the docs above. This course's local stack captures every outgoing email in Mailpit, which makes the entire flow provable end to end rather than just cited: send a real magic link, read the real email, follow the real redirect, and exchange the real code.
+
+```ts
+// src/cli-auth-pkce-full-flow.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+const API_URL = process.env.SUPABASE_URL!;
+const MAILPIT_URL = 'http://127.0.0.1:55324'; // this course's fixed local Mailpit port (tools/probe/supabase/config.toml)
+const email = 'cli-client-dev-pkce@example.com';
+
+const client = createClient(API_URL, process.env.SUPABASE_ANON_KEY!, { auth: { flowType: 'pkce' } });
+await client.auth.signInWithOtp({ email, options: { emailRedirectTo: 'http://127.0.0.1:3000' } });
+
+await new Promise((r) => setTimeout(r, 500));
+const list = await fetch(`${MAILPIT_URL}/api/v1/messages?limit=5`).then((r) => r.json());
+const msg = list.messages.find((m: any) => m.To?.[0]?.Address === email);
+const full = await fetch(`${MAILPIT_URL}/api/v1/message/${msg.ID}`).then((r) => r.json());
+const verifyLink = ((full.Text || full.HTML).match(/https?:\/\/[^\s"'<>]+/g) || [])[0];
+console.log('link from the real Mailpit email:', verifyLink);
+
+// Clicking the link hits GoTrue's own /verify endpoint, which redirects to
+// emailRedirectTo with the PKCE code attached — followed here with redirect: 'manual'
+// instead of a real browser, to read the Location header directly.
+const redirectResp = await fetch(verifyLink, { redirect: 'manual' });
+const code = new URL(redirectResp.headers.get('location')!).searchParams.get('code')!;
+console.log('extracted PKCE code:', code);
+
+const { data, error } = await client.auth.exchangeCodeForSession(code);
+console.log('exchangeCodeForSession error =', error?.message ?? null);
+console.log('session established =', !!data.session, '| user email =', data.user?.email);
+
+const admin = createClient(API_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+const user = (await admin.auth.admin.listUsers()).data.users.find((u) => u.email === email);
+if (user) await admin.auth.admin.deleteUser(user.id);
+```
+
+```text
+link from the real Mailpit email: http://127.0.0.1:55321/auth/v1/verify?token=pkce_ee6df2f67dfa487c20b405fd1a0a508d40b204a4f359ba3e411530c9&type=magiclink&redirect_to=http://127.0.0.1:3000
+extracted PKCE code: 7abcaf1d-47f2-4fda-9a0c-ac60e8266ebb
+exchangeCodeForSession error = null
+session established = true | user email = cli-client-dev-pkce@example.com
+```
+
+Every step is real: a real GoTrue-issued `pkce_...` token in a real Mailpit email, a real `303` redirect from `/auth/v1/verify` that appends `?code=<uuid>` to `emailRedirectTo`, and a real `exchangeCodeForSession` call that turns that code into an actual session — the same call the server-side callback route above makes, just driven directly instead of through a browser click.
+
+## `getClaims()`: verified to exist in this version
+
+The Auth module's [Sessions and JWTs](/supabase/en/auth-and-row-level-security/sessions-and-jwts/) lesson already proved `getSession()` (fast, unverified, local-only) versus `getUser()` (slower, network-verified) with a tampered token, and covered `getClaims()` as the newer, cryptographically-verified-but-network-free option current official examples now call instead of `getUser()` — read that proof there rather than repeating it. Confirmed here for this course's exact installed version: `typeof supabase.auth.getClaims === 'function'` is `true` against `@supabase/supabase-js@2.117.2`, so every code sample in that lesson and this one is checked against a version that actually has it, not a forward-looking API that has not shipped yet.
 
 ## Protecting a route: a UX convenience, not real security
 
@@ -72,65 +215,178 @@ const {
 } = await supabase.auth.getSession();
 
 if (!session) {
-  // No session: hide the page and send the user to sign in
   redirectToLogin();
 }
 ```
 
-This is genuinely useful — it avoids flashing protected content at a signed-out visitor and avoids firing requests you know will fail. But it must not be mistaken for the actual security mechanism. Client-side JavaScript can always be inspected, modified, or skipped entirely by a determined visitor — nothing stops someone from calling your Supabase project directly with their own token, bypassing your UI altogether. The real boundary that decides whether a request can read or write a given row is **row level security (RLS)** enforced by Postgres itself, on the server side, regardless of what any client chose to check or render.
+This is genuinely useful — it avoids flashing protected content at a signed-out visitor and avoids firing requests you know will fail. But it must not be mistaken for the actual security mechanism: client-side JavaScript can always be inspected, modified, or skipped entirely, and nothing stops someone from calling your Supabase project directly with their own token, bypassing your UI altogether. What a client-side check **cannot** guarantee — proved with a tampered token in the Sessions and JWTs lesson — is that the session it is looking at is even genuine; `getSession()` does no signature verification at all. The real boundary that decides whether a request can read or write a given row is **row level security (RLS)** enforced by Postgres itself, on the server side, regardless of what any client chose to check or render. A server-side gate needs `getUser()` or `getClaims()`, not `getSession()` — that exact bug, and its fix, is this course's `SpotTheBug` in the Sessions and JWTs lesson.
 
-<Mermaid title="A session drives the UI, but RLS is still the real gate" code={authClientDiagram} />
+## MFA: enrollment, challenge, verify — and a real local-config gate
+
+Multi-factor authentication adds a second factor (typically a TOTP authenticator app) on top of a password, moving a session from `aal1` to `aal2` (Authenticator Assurance Level — the same claim decoded from a real token in the Sessions and JWTs lesson). The flow is `enroll()` → `challenge()` → `verify()`:
+
+```typescript
+const { data: factors, error: factorsErr } = await supabase.auth.mfa.enroll({ factorType: 'totp' });
+// factors.totp.qr_code — an SVG the user scans with an authenticator app
+// factors.totp.secret — the same secret, for manual entry
+
+const { data: challenge } = await supabase.auth.mfa.challenge({ factorId: factors!.id });
+const { data: verified, error: verifyErr } = await supabase.auth.mfa.verify({
+  factorId: factors!.id,
+  challengeId: challenge!.id,
+  code: userEnteredCode, // the 6-digit code from the authenticator app
+});
+// on success, the session is transparently upgraded to aal2
+```
+
+TOTP is enabled by default on a hosted Supabase project ([supabase.com/docs/guides/auth/auth-mfa](https://supabase.com/docs/guides/auth/auth-mfa)) — but running `enroll()` for real against this course's local stack returns a real, honest answer that it is not available here:
+
+```ts
+// src/cli-auth-mfa-enroll.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+const API_URL = process.env.SUPABASE_URL!;
+const admin = createClient(API_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+const email = 'cli-client-dev-mfa@example.com';
+const password = 'cli-pw-mfa-12345';
+let user = (await admin.auth.admin.listUsers()).data.users.find((u) => u.email === email);
+if (!user) user = (await admin.auth.admin.createUser({ email, password, email_confirm: true })).data.user!;
+
+const client = createClient(API_URL, process.env.SUPABASE_ANON_KEY!);
+await client.auth.signInWithPassword({ email, password }); // mfa.enroll needs a real, signed-in session
+
+const { data, error } = await client.auth.mfa.enroll({ factorType: 'totp' });
+console.log('mfa.enroll error =', error?.message ?? null);
+
+const aal = await client.auth.mfa.getAuthenticatorAssuranceLevel();
+console.log('AAL currentLevel =', aal.data?.currentLevel, '| nextLevel =', aal.data?.nextLevel);
+
+await admin.auth.admin.deleteUser(user.id);
+```
+
+```text
+mfa.enroll error = MFA enroll is disabled for TOTP
+AAL currentLevel = aal1 | nextLevel = aal1
+```
+
+Stated honestly rather than worked around: this local CLI stack's `config.toml` does not enable `[auth.mfa.totp]` by default, so `enroll()` correctly refuses with a real, specific error rather than silently no-op'ing — proving the *gate* is real, even without a local proof of a completed enrollment. `getAuthenticatorAssuranceLevel()` still works and correctly reports `aal1`/`aal1` (no upgrade pending) for this unenrolled session. Client code should call `getAuthenticatorAssuranceLevel()` after sign-in and prompt for a challenge whenever `nextLevel !== currentLevel`, per the docs' own reference pattern.
+
+<Mermaid title="A session drives the UI in a real, provable event order, but RLS is still the real gate" code={authClientDiagram} />
 
 export const authClientDiagram = `flowchart LR
-  action["signUp() or signInWithPassword()"] --> session["Session created and stored in the client"]
-  session --> event["onAuthStateChange fires"]
-  event --> ui["App UI updates; a protected route becomes reachable"]
+  construct["Client constructed"] --> initial["INITIAL_SESSION fires"]
+  initial --> action["signInWithPassword() / exchangeCodeForSession()"]
+  action --> signedin["SIGNED_IN fires"]
+  signedin --> refresh["TOKEN_REFRESHED fires (auto, or refreshSession())"]
+  refresh --> ui["App UI stays in sync via one onAuthStateChange subscription"]
   ui --> rls[("Real enforcement still happens via RLS on the database")]`;
 
 <Callout title="The one-line takeaway">
-`supabase.auth.signUp()`, `signInWithPassword()`, and `signOut()` each resolve to `{ data, error }` and drive a stored session; subscribing once to **`onAuthStateChange`** keeps your app's UI synced with sign-in, sign-out, and token refresh without manually re-checking session state everywhere. Checking `session` before rendering a protected page is a genuine **UX convenience**, but it is not real security — a determined client can always bypass it, so **row level security (RLS)** on the database remains the actual boundary that decides what a request is allowed to read or write.
+`supabase.auth.signUp()`, `signInWithPassword()`, and `signOut()` each resolve to `{ data, error }` and drive a stored session; subscribing once to **`onAuthStateChange`** delivers a real, proven event order — **`INITIAL_SESSION` → `SIGNED_IN` → `TOKEN_REFRESHED` → `SIGNED_OUT`** — without manually re-checking session state anywhere. That session lives in `localStorage` in a browser but only **in-memory, per client instance** in Node by default (proved: a second same-process client cannot see the first's session). The default **PKCE** flow was proven end to end — a real magic-link email, a real `?code=` redirect, a real `exchangeCodeForSession()` — and **`getClaims()`** is confirmed to exist on this installed version. Checking `session` before rendering a protected page is a genuine **UX convenience**, never real security — a determined client can always bypass it, so **row level security (RLS)** remains the actual boundary, and a server-side gate needs `getUser()`/`getClaims()`, not `getSession()`.
 </Callout>
+
+## Reading AI-generated code
+
+An AI assistant asked to "gate this settings page behind MFA" produced this:
+
+<SpotTheBug lang="ts" code={`function SettingsPage() {
+  const [ready, setReady] = useState(false);
+  const [session, setSession] = useState<Session | null>(null);
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => {
+      setSession(data.session);
+      setReady(true);
+    });
+  }, []);
+
+  if (!ready) return <Spinner />;
+  if (!session) return <Navigate to="/login" />;
+
+  // "MFA-gated" because the JWT has an aal claim, right?
+  const isMfaVerified = session.user.app_metadata?.aal === 'aal2';
+  if (!isMfaVerified) return <Navigate to="/mfa-challenge" />;
+
+  return <RealSettingsForm />;
+}
+`}>
+Two separate bugs stacked on each other. First, `aal` is a top-level claim on the decoded JWT itself (proved by decoding a real token in the Sessions and JWTs lesson) — it is never copied into `session.user.app_metadata`, so `session.user.app_metadata?.aal` is always `undefined`, and `undefined === 'aal2'` is always `false`; this check fails closed by accident, not by design, which is a maintenance trap even though it happens to be "safe" today. Second, and more fundamentally, `getSession()` — proved earlier in this lesson and in Sessions and JWTs to do no signature verification — is the wrong tool for a client-side MFA gate in the first place, for the same reason it is the wrong tool for any server-side security decision: nothing stops a visitor from editing the cached session object's claims before this component reads them. The fix is `supabase.auth.mfa.getAuthenticatorAssuranceLevel()`, this lesson's real, purpose-built API for exactly this check: `const { data } = await supabase.auth.mfa.getAuthenticatorAssuranceLevel(); if (data.nextLevel === 'aal2' && data.nextLevel !== data.currentLevel) { /* show the MFA challenge */ }` — and even then, remember this lesson's own rule: this is still a client-side UX convenience for *showing* the challenge, not a substitute for an MFA-aware RLS policy or server-side check on whatever the settings page actually writes.
+</SpotTheBug>
+
+## Mental Model
+
+Everything in this lesson is one idea seen from different angles: the client keeps *one* mutable piece of state — the session — and every API here is either a way to *change* that state (`signInWithPassword`, `signOut`, `exchangeCodeForSession`, a token refresh) or a way to *observe* it (`onAuthStateChange`, `getSession`, `getUser`, `getClaims`, `getAuthenticatorAssuranceLevel`). The proven event order in this lesson is not an implementation detail to memorize — it is the direct consequence of that state machine: construct (`INITIAL_SESSION`), establish (`SIGNED_IN`), maintain (`TOKEN_REFRESHED`, potentially many times), and end (`SIGNED_OUT`). PKCE's `exchangeCodeForSession` is just a state-changing call that happens to arrive via a URL instead of a form submission. And the entire "UX vs. security" theme running through this lesson reduces to one sentence: anything this client-side state machine reports about itself is only as trustworthy as whatever last verified it cryptographically — which is never the state machine itself, only `getUser()`/`getClaims()` on the server, or RLS on the database.
+
+## Trade-offs
+
+- **Subscribing once to `onAuthStateChange` keeps UI state trivially in sync** — at the cost of a callback that can fire more often than intuition suggests (`SIGNED_IN` on tab refocus, not just a genuine new sign-in, per the SDK's own docs), so code in that callback must stay idempotent and cheap.
+- **In-memory session storage in Node avoids ever touching disk in a serverless/edge environment** — at the cost of a session that vanishes the moment the process or client instance is discarded, which is exactly why a real server needs `@supabase/ssr`'s cookie adapter rather than relying on this default.
+- **PKCE's `?code=` redirect never puts tokens directly in a URL** (unlike the older implicit flow) — at the cost of one extra network round trip (`exchangeCodeForSession`) before a session exists, proved above as a real, necessary step, not an optional one.
+- **MFA raises the assurance bar for the calls that check it** — at the cost of doing nothing for calls that do not: an RLS policy or server-side check must explicitly require `aal2` (via `auth.jwt()->>'aal'` or the request's actual JWT) for MFA to matter to anything beyond the client's own UI.
+
+## Common Misconceptions
+
+- **"`onAuthStateChange`'s `SIGNED_IN` event only fires on an actual new sign-in."** Corrected by the SDK's own docs, quoted directly in this lesson: it also fires on session re-establishment, such as a tab regaining focus — check the `session.user` payload, not just the event name, if "a genuinely new user just signed in" is what your code actually needs to know.
+- **"A session persists the same way regardless of runtime."** Proved false: a browser defaults to `localStorage`; Node defaults to an in-memory store scoped to one client instance, proved here by a second, sibling client in the same process being unable to see the first's session at all.
+- **"PKCE means the client never needs a network call to finish signing in."** Proved false end to end: a real magic-link click redirects with a `?code=`, and a real `exchangeCodeForSession(code)` network call is what actually turns that code into a usable session — skip that call, and the redirect alone accomplishes nothing.
+- **"A JWT's `aal` claim shows up on `session.user.app_metadata`."** Proved wrong by this lesson's `SpotTheBug`: `aal` is a top-level claim on the token itself (decoded directly in the Sessions and JWTs lesson), never copied into `app_metadata` — the correct, purpose-built read is `supabase.auth.mfa.getAuthenticatorAssuranceLevel()`.
 
 export const quizAuthClient = [
   {
-    q: 'What does subscribing once to onAuthStateChange let you avoid doing manually?',
+    q: 'A client is constructed, immediately signed in, then a manual refreshSession() is called, then signed out — all logged via one onAuthStateChange subscription. What is the real, proven event order?',
     options: [
-      'Writing any sign-in code at all',
-      'Re-checking and re-syncing auth state yourself after every sign-in, sign-out, or token refresh',
-      'Calling signOut when a user leaves the page',
-      'Storing the anon key in your app',
+      'SIGNED_IN, TOKEN_REFRESHED, SIGNED_OUT (no INITIAL_SESSION, since the client was never idle)',
+      'INITIAL_SESSION, SIGNED_IN, TOKEN_REFRESHED, SIGNED_OUT',
+      'INITIAL_SESSION, SIGNED_OUT, SIGNED_IN, TOKEN_REFRESHED',
+      'Only SIGNED_IN and SIGNED_OUT fire; a manual refreshSession() does not trigger a callback event',
     ],
     answer: 1,
+    explain: 'Proved live against the local stack: INITIAL_SESSION fires once right after construction (even with no session yet), then SIGNED_IN, then TOKEN_REFRESHED (a manual refreshSession() triggers the same event as an automatic one), then SIGNED_OUT.',
   },
   {
-    q: 'Why is checking session before rendering a protected page only a UX convenience?',
+    q: 'Two independent supabase-js clients are created in the same Node process with the same URL and anon key. The first signs in. Can the second see that session via getSession()?',
+    options: [
+      'Yes, Node shares session storage across clients in the same process by default',
+      'No — proved directly: the default Node storage is in-memory and scoped per client instance, unlike a browser\'s shared localStorage',
+      'Only if both clients are passed the exact same options object',
+      'Yes, but only for 60 seconds due to a shared cache TTL',
+    ],
+    answer: 1,
+    explain: 'Proved with two real client instances: the second, freshly-constructed client\'s getSession() returned no session at all, despite the first being signed in seconds earlier in the same process.',
+  },
+  {
+    q: 'Under the default PKCE flow, what does a real magic-link email actually deliver, and what has to happen next?',
+    options: [
+      'The access and refresh tokens directly in the URL fragment; no further call is needed',
+      'A link that, once followed, redirects to a `?code=` URL — exchangeCodeForSession(code) must then be called to actually establish a session',
+      'A one-time password the user types in manually; there is no link at all',
+      'A pre-authenticated session cookie set automatically by the email client',
+    ],
+    answer: 1,
+    explain: 'Proved end to end against this course\'s local stack: the real Mailpit email\'s link redirected to a URL with a real ?code=<uuid>, and only the subsequent exchangeCodeForSession(code) call produced an actual session.',
+  },
+  {
+    q: 'Why is checking session before rendering a protected page only a UX convenience, never the real security boundary?',
     options: [
       'Because getSession() is deprecated in supabase-js',
-      'Because client-side code can be inspected or bypassed by a determined visitor, so it cannot be the actual security boundary',
+      'Because client-side code and its cached session data can always be inspected or bypassed by a determined visitor, so it cannot be the actual enforcement point — that is row level security on the database',
       'Because sessions never expire so the check is unnecessary',
       'Because it only works for OAuth sign-ins, not passwords',
     ],
     answer: 1,
+    explain: 'getSession() does no signature verification at all (proved with a tampered token in the Sessions and JWTs lesson) and client code itself can always be modified or bypassed — RLS, enforced server-side by Postgres, is the actual boundary.',
   },
   {
-    q: 'What actually enforces which rows a request can read or write, regardless of client-side checks?',
+    q: 'An AI-generated component reads session.user.app_metadata?.aal === \'aal2\' to decide whether MFA is satisfied. What is actually wrong with this?',
     options: [
-      'The onAuthStateChange callback',
-      'Row level security (RLS) enforced by Postgres on the server side',
-      'Whether the browser tab is focused',
-      'The order in which signUp and signInWithPassword are called',
+      'Nothing — this is the documented way to read the AAL claim',
+      'aal is a top-level claim on the decoded JWT itself, never copied into app_metadata, so this check is always undefined/false regardless of the real assurance level — the correct call is auth.mfa.getAuthenticatorAssuranceLevel()',
+      'aal2 should be written as "AAL2" in uppercase',
+      'MFA cannot be checked client-side under any circumstances',
     ],
     answer: 1,
-  },
-  {
-    q: 'What shape does a call like supabase.auth.signOut() resolve to?',
-    options: [
-      'It throws an exception on failure instead of returning a value',
-      'An object shaped { data, error } (or { error } for signOut) that must be checked explicitly',
-      'A plain boolean, true or false',
-      'Nothing; it always resolves to undefined',
-    ],
-    answer: 1,
+    explain: 'Proved by this lesson\'s SpotTheBug: aal lives on the token payload directly (shown decoded in the Sessions and JWTs lesson), not inside app_metadata — the purpose-built, correct API is getAuthenticatorAssuranceLevel().',
   },
 ];
 

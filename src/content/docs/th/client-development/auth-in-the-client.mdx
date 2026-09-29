@@ -1,6 +1,6 @@
 ---
 title: 'Auth in the Client'
-description: 'flow sign-up sign-in และ sign-out แบบสมบูรณ์ใน supabase-js การ sync UI state ด้วย onAuthStateChange และเหตุผลที่ client-side route protection เป็นแค่ UX ไม่ใช่ security'
+description: 'sign-up, sign-in, sign-out แบบครบวงจร ลำดับ event จริงของ onAuthStateChange ที่พิสูจน์สด session อยู่ที่ไหนจริง ๆ ระหว่าง browser กับ Node การ exchange code ของ PKCE ที่พิสูจน์ end to end และทำไม client-side route protection คือ UX ไม่ใช่ security'
 sidebar:
   order: 2
 ---
@@ -8,15 +8,16 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
 
-`supabase.auth` ให้ `signUp`, `signInWithPassword` และ `signOut` มาขับเคลื่อน session ให้ `onAuthStateChange` มา sync UI ของแอปกับ session นั้นให้อัตโนมัติ และมีกฎที่ต้องจำไว้ตลอด — การเช็ก session ในโค้ดฝั่ง client เป็นแค่ UX convenience ส่วน row level security บน database คือ security boundary จริง
+`supabase.auth` ให้ `signUp`, `signInWithPassword` และ `signOut` มาขับเคลื่อน session, `onAuthStateChange` มาคอย sync UI ของแอปกับ session นั้นอัตโนมัติ — ตามลำดับจริงที่พิสูจน์ได้ — และกติกาเหล็กที่ต้องจำตลอดบทนี้: การเช็ค session ในโค้ดฝั่ง client เป็นแค่ความสะดวกด้าน UX ส่วน row level security บน database คือ security boundary ตัวจริง
 
-## flow sign-up, sign-in, sign-out แบบสมบูรณ์
+## Flow sign-up, sign-in, sign-out แบบครบวงจร
 
-ทุก call เหล่านี้ resolve เป็น `{ data, error }` ไม่ throw exception ดังนั้นต้องเช็ก `error` ก่อนเชื่อผลลัพธ์ — pattern เดียวกับที่จะเห็นแบบเป็นทางการในบทถัดไป
+ทุก call เหล่านี้ resolve เป็น `{ data, error }` ไม่ throw ดังนั้นต้องเช็ค `error` ก่อนเชื่อผลลัพธ์ — pattern เดียวกับที่จะถูก formalize ในบทถัดไป
 
 ```typescript
 // Sign up a new user
@@ -47,24 +48,166 @@ if (signOutError) {
 }
 ```
 
-`signUp` หรือ `signInWithPassword` ที่สำเร็จจะเก็บ session (access token กับ refresh token) ไว้ใน client และ request ถัดไปทุกอันจาก client นั้นจะถูกส่งในฐานะ user ที่ authenticated แล้ว
+`signUp` หรือ `signInWithPassword` ที่สำเร็จจะเก็บ session (access token กับ refresh token) ไว้ใน client และทุก request ถัดไปจาก client นี้จะถูกส่งในฐานะ user ที่ authenticated แล้ว
 
-## Sync UI state ด้วย `onAuthStateChange`
+## `onAuthStateChange`: ลำดับ event จริง พิสูจน์สด
 
-แทนที่จะไล่เช็กเองว่า user sign in อยู่หรือไม่ — แล้วต้องมาเช็กซ้ำทุกครั้งหลัง sign-in, sign-out หรือ token refresh แบบเงียบ ๆ — subscribe แค่ครั้งเดียวตอนแอป start ก็พอ
+แทนที่จะ track ด้วยมือว่า user signed in อยู่ไหม ให้ subscribe แค่ครั้งเดียว มักจะตอนแอป startup สิ่งที่ fire จริงและลำดับของมันไม่ใช่การเดาในบทนี้ — sign-in, refresh ด้วยมือ แล้ว sign-out บน client จริงตัวเดียว log ทุก event ที่เข้ามา:
 
-```typescript
-supabase.auth.onAuthStateChange((event, session) => {
-  // Fires on SIGNED_IN, SIGNED_OUT, TOKEN_REFRESHED, and more
-  setSession(session);
+```ts
+// src/cli-auth-state-sequence.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+const API_URL = process.env.SUPABASE_URL!;
+const admin = createClient(API_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+
+const email = 'cli-client-dev-authseq@example.com';
+const password = 'cli-pw-authseq-12345';
+let user = (await admin.auth.admin.listUsers()).data.users.find((u) => u.email === email);
+if (!user) user = (await admin.auth.admin.createUser({ email, password, email_confirm: true })).data.user!;
+
+const client = createClient(API_URL, process.env.SUPABASE_ANON_KEY!);
+const events: string[] = [];
+client.auth.onAuthStateChange((event, session) => {
+  events.push(`${event} (session=${session ? 'yes' : 'no'})`);
 });
+
+await new Promise((r) => setTimeout(r, 300)); // let INITIAL_SESSION fire
+await client.auth.signInWithPassword({ email, password });
+await new Promise((r) => setTimeout(r, 300));
+
+await client.auth.refreshSession(); // force a token refresh instead of waiting on the timer
+await new Promise((r) => setTimeout(r, 300));
+
+await client.auth.signOut();
+await new Promise((r) => setTimeout(r, 300));
+
+console.log('event sequence:', JSON.stringify(events));
+await admin.auth.admin.deleteUser(user.id);
 ```
 
-subscription เดียวนี้ fire ทุก event ที่เกี่ยวกับ auth ตลอดอายุแอป ทั้ง session แรกตอนโหลด, sign-in, sign-out และ token refresh ที่เกิดขึ้นเงียบ ๆ อยู่เบื้องหลัง การผูก local state ของแอปเข้ากับ callback ตัวเดียวนี้แปลว่า UI จะสะท้อน session จริงของ client อยู่เสมอ และไม่ต้องมานั่งจำว่าต้องเรียกอะไรเองหลัง auth action แต่ละครั้ง
+```text
+event sequence: ["INITIAL_SESSION (session=no)","SIGNED_IN (session=yes)","TOKEN_REFRESHED (session=yes)","SIGNED_OUT (session=no)"]
+```
 
-## Protect route: UX convenience ไม่ใช่ security จริง
+Event จริงสี่ตัว เรียงตามลำดับนี้เป๊ะ: **`INITIAL_SESSION`** fire ครั้งเดียว ทันทีหลัง client ถูกสร้าง ไม่ว่าจะมี session อยู่แล้วหรือไม่ (`session=no` ที่นี่เพราะ client เริ่มใหม่); **`SIGNED_IN`** fire ตอนเรียก `signInWithPassword` ข้างบน แต่ตาม reference docs ของ SDK เองมัน fire ตอนอื่นที่เป็นการ (re-)establish session ด้วยเหมือนกัน — เช่น tab กลับมา focus — ดังนั้นโค้ดแอปควรเช็ค `session.user` ที่ได้รับ แทนที่จะสมมติว่า `SIGNED_IN` แปลว่า "เพิ่ง sign-in ใหม่จริง ๆ" เสมอ; **`TOKEN_REFRESHED`** fire ทั้งตอน background refresh อัตโนมัติ (ขับเคลื่อนด้วย `autoRefreshToken` ค่า default จากตารางค่าของบทที่แล้ว) และตามที่พิสูจน์ที่นี่ การเรียก `refreshSession()` ด้วยมือ; **`SIGNED_OUT`** fire ตอน `signOut()` และทุกครั้งที่ session กลายเป็น invalid ด้วยเหตุผลอื่นเช่นกัน (หมดอายุเกิน refresh window, ถูก revoke จากอุปกรณ์อื่น และอื่น ๆ) การผูก state ของแอปเข้ากับ callback ตัวเดียวนี้ทำให้ UI เป็นภาพสะท้อนของ session จริงของ client เสมอ ไม่ต้องจำไปเรียกมันเองหลัง auth action แต่ละครั้ง
 
-pattern ที่พบบ่อยฝั่ง client คือเช็ก session ก่อน render หน้าที่ต้อง protect หรือก่อนยิง request ที่ต้อง authenticated
+อีกสอง event ที่บทนี้ไม่ได้ทดสอบ แต่ callback เดียวกันก็ส่งให้เหมือนกัน: **`USER_UPDATED`** (หลัง `updateUser()` สำเร็จ) และ **`PASSWORD_RECOVERY`** (แทนที่ `SIGNED_IN` ตอน user เข้าหน้าผ่าน password-recovery link)
+
+## Session อยู่ที่ไหนจริง ๆ: browser vs. Node
+
+`persistSession: true` เป็นค่า default แต่ *เก็บไว้ที่ไหน* ขึ้นกับ runtime ไม่ใช่คำตอบตายตัว ใน browser จะเป็น `localStorage` โดย default ใน Node — environment พิสูจน์ของคอร์สนี้ ที่ไม่มี `localStorage` global — `supabase-js` fallback เป็น store แบบ **in-memory** ที่ scope อยู่กับ client instance ตัวนั้นตัวเดียว พิสูจน์ด้วยการสร้าง client ตัวที่สองที่เป็นอิสระสมบูรณ์ใน process เดียวกัน แล้วเช็คว่ามันเห็น session ของตัวแรกไหม:
+
+```ts
+// src/cli-auth-storage-location.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+const API_URL = process.env.SUPABASE_URL!;
+const ANON_KEY = process.env.SUPABASE_ANON_KEY!;
+const admin = createClient(API_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+
+const email = 'cli-client-dev-storage@example.com';
+const password = 'cli-pw-storage-12345';
+let user = (await admin.auth.admin.listUsers()).data.users.find((u) => u.email === email);
+if (!user) user = (await admin.auth.admin.createUser({ email, password, email_confirm: true })).data.user!;
+
+const clientA = createClient(API_URL, ANON_KEY);
+await clientA.auth.signInWithPassword({ email, password });
+const sessionA = await clientA.auth.getSession();
+console.log('clientA (signed in) session present =', !!sessionA.data.session);
+
+const clientB = createClient(API_URL, ANON_KEY); // fresh instance, same process, no storage option passed
+const sessionB = await clientB.auth.getSession();
+console.log('clientB (fresh instance) session present =', !!sessionB.data.session);
+
+await admin.auth.admin.deleteUser(user.id);
+```
+
+```text
+clientA (signed in) session present = true
+clientB (fresh instance) session present = false
+```
+
+`clientB` มองไม่เห็น session ของ `clientA` เลยแม้ทั้งคู่ถูกสร้างใน Node process เดียวกัน ห่างกันไม่กี่วินาที ด้วย URL และ `anon` key เดียวกันเป๊ะ — พิสูจน์ว่า default storage ใน Node เป็น in-memory ต่อ instance ไม่ใช่ shared cache ระดับ process และไม่เหมือน `localStorage` ที่แชร์กันของ brow­ser เลย นี่คือเหตุผลที่ pattern singleton จากบทที่แล้วสำคัญใน browser (client เดียว, session ที่แชร์ใน memory-หรือ-`localStorage` ตัวเดียว) และทำไม server ต้องการ adapter จริง — cookie ผ่าน `@supabase/ssr` ที่พิสูจน์แล้วในโมดูล Auth — แทนที่จะพึ่ง default in-memory นี้ข้าม request
+
+## PKCE แบบ end to end: จาก magic-link email จริงไปถึง session จริง
+
+`flowType: 'pkce'` เป็น flow default และแนะนำของ `supabase-js` (flow `implicit` แบบเก่าที่คืน token ตรง ๆ ใน URL fragment ยังใช้ได้อยู่แต่ไม่ใช่ default แล้ว) magic link หรือ OAuth redirect ภายใต้ PKCE จะพก authorization code `?code=` ไม่ใช่ token ตรง ๆ — client ต้องเรียก `exchangeCodeForSession(code)` เพื่อเปลี่ยน code นั้นเป็น session จริง:
+
+```typescript
+// A server-side OAuth/magic-link callback route — code + citation
+// source: supabase.com/docs (_partials/oauth_pkce_flow.mdx)
+export async function GET(request: Request) {
+  const { searchParams, origin } = new URL(request.url);
+  const code = searchParams.get('code');
+
+  if (code) {
+    const supabase = await createClient();
+    const { error } = await supabase.auth.exchangeCodeForSession(code);
+    if (!error) {
+      return NextResponse.redirect(`${origin}/`);
+    }
+  }
+
+  return NextResponse.redirect(`${origin}/auth/auth-code-error`);
+}
+```
+
+`detectSessionInUrl: true` (ตารางค่าของบทที่แล้ว) ทำแบบนี้ให้อัตโนมัติสำหรับแอปฝั่ง client ล้วน ๆ ส่วน server-side callback route — ไม่มี `localStorage` ไม่มี URL ให้ auto-detect — เรียก `exchangeCodeForSession` เองแทน ตามโค้ด docs ข้างบน local stack ของคอร์สนี้ดัก email ที่ส่งออกทุกฉบับไว้ใน Mailpit ทำให้พิสูจน์ flow ทั้งหมด end to end ได้จริง ไม่ใช่แค่อ้างอิง: ส่ง magic link จริง อ่าน email จริง ตาม redirect จริง แล้ว exchange code จริง
+
+```ts
+// src/cli-auth-pkce-full-flow.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+const API_URL = process.env.SUPABASE_URL!;
+const MAILPIT_URL = 'http://127.0.0.1:55324'; // this course's fixed local Mailpit port (tools/probe/supabase/config.toml)
+const email = 'cli-client-dev-pkce@example.com';
+
+const client = createClient(API_URL, process.env.SUPABASE_ANON_KEY!, { auth: { flowType: 'pkce' } });
+await client.auth.signInWithOtp({ email, options: { emailRedirectTo: 'http://127.0.0.1:3000' } });
+
+await new Promise((r) => setTimeout(r, 500));
+const list = await fetch(`${MAILPIT_URL}/api/v1/messages?limit=5`).then((r) => r.json());
+const msg = list.messages.find((m: any) => m.To?.[0]?.Address === email);
+const full = await fetch(`${MAILPIT_URL}/api/v1/message/${msg.ID}`).then((r) => r.json());
+const verifyLink = ((full.Text || full.HTML).match(/https?:\/\/[^\s"'<>]+/g) || [])[0];
+console.log('link from the real Mailpit email:', verifyLink);
+
+// Clicking the link hits GoTrue's own /verify endpoint, which redirects to
+// emailRedirectTo with the PKCE code attached — followed here with redirect: 'manual'
+// instead of a real browser, to read the Location header directly.
+const redirectResp = await fetch(verifyLink, { redirect: 'manual' });
+const code = new URL(redirectResp.headers.get('location')!).searchParams.get('code')!;
+console.log('extracted PKCE code:', code);
+
+const { data, error } = await client.auth.exchangeCodeForSession(code);
+console.log('exchangeCodeForSession error =', error?.message ?? null);
+console.log('session established =', !!data.session, '| user email =', data.user?.email);
+
+const admin = createClient(API_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+const user = (await admin.auth.admin.listUsers()).data.users.find((u) => u.email === email);
+if (user) await admin.auth.admin.deleteUser(user.id);
+```
+
+```text
+link from the real Mailpit email: http://127.0.0.1:55321/auth/v1/verify?token=pkce_ee6df2f67dfa487c20b405fd1a0a508d40b204a4f359ba3e411530c9&type=magiclink&redirect_to=http://127.0.0.1:3000
+extracted PKCE code: 7abcaf1d-47f2-4fda-9a0c-ac60e8266ebb
+exchangeCodeForSession error = null
+session established = true | user email = cli-client-dev-pkce@example.com
+```
+
+ทุก step เป็นของจริง: `pkce_...` token จริงที่ GoTrue ออกให้ใน Mailpit email จริง redirect `303` จริงจาก `/auth/v1/verify` ที่แนบ `?code=<uuid>` ต่อท้าย `emailRedirectTo` และ call `exchangeCodeForSession` จริงที่เปลี่ยน code นั้นเป็น session จริง — call เดียวกับที่ server-side callback route ข้างบนเรียก แค่ขับเคลื่อนตรง ๆ แทนที่จะผ่านการคลิกใน browser
+
+## `getClaims()`: ยืนยันแล้วว่ามีอยู่จริงใน version นี้
+
+บท [Sessions and JWTs](/supabase/th/auth-and-row-level-security/sessions-and-jwts/) ของโมดูล Auth พิสูจน์ `getSession()` (เร็ว ไม่ verify local-only) เทียบกับ `getUser()` (ช้ากว่า verify ผ่าน network) ด้วย token ที่ถูก tamper ไปแล้ว และครอบคลุม `getClaims()` ในฐานะตัวเลือกใหม่ ที่ verify แบบ cryptographic แต่ไม่ต้องผ่าน network ที่ official example ปัจจุบันเรียกแทน `getUser()` แล้ว — ไปอ่านการพิสูจน์ที่นั่นแทนที่จะพูดซ้ำ ยืนยันที่นี่สำหรับ version ที่ติดตั้งจริงของคอร์สนี้: `typeof supabase.auth.getClaims === 'function'` เป็น `true` บน `@supabase/supabase-js@2.117.2` ดังนั้นทุกตัวอย่างโค้ดในบทนั้นและบทนี้ถูกเช็คกับ version ที่มีมันจริง ไม่ใช่ API ในอนาคตที่ยังไม่ออก
+
+## Protect route: ความสะดวกด้าน UX ไม่ใช่ security จริง
+
+pattern ที่พบบ่อยฝั่ง client คือเช็ค session ก่อน render หน้าที่ป้องกันไว้ หรือก่อนยิง request ที่ต้อง authenticated:
 
 ```typescript
 const {
@@ -72,65 +215,178 @@ const {
 } = await supabase.auth.getSession();
 
 if (!session) {
-  // No session: hide the page and send the user to sign in
   redirectToLogin();
 }
 ```
 
-สิ่งนี้มีประโยชน์จริง เพราะช่วยไม่ให้ protected content แวบขึ้นมาให้คนที่ sign out อยู่เห็น และไม่ต้องยิง request ที่รู้อยู่แล้วว่าจะ fail แต่ห้ามเข้าใจผิดว่านี่คือกลไก security จริง โค้ด JavaScript ฝั่ง client ถูก inspect, แก้ไข หรือข้ามไปเลยได้เสมอโดยคนที่ตั้งใจจะทำ ไม่มีอะไรห้ามใครสักคนยิงตรงไปที่ Supabase project ด้วย token ของตัวเอง ข้าม UI ของคุณไปทั้งหมด สิ่งที่เป็น boundary จริงว่า request หนึ่งจะอ่านหรือเขียน row ไหนได้บ้างคือ **row level security (RLS)** ที่ Postgres บังคับใช้เองฝั่ง server ไม่ว่า client จะเช็กหรือ render อะไรก็ตาม
+วิธีนี้มีประโยชน์จริง — เลี่ยงการ flash เนื้อหาที่ป้องกันไว้ให้ visitor ที่ signed-out เห็น และเลี่ยงการยิง request ที่รู้อยู่แล้วว่าจะ fail แต่ต้องไม่เข้าใจผิดว่านี่คือกลไก security จริง: โค้ด JavaScript ฝั่ง client ถูก inspect, แก้ไข หรือข้ามได้เสมอ และไม่มีอะไรกันคนเรียก Supabase project ของคุณตรง ๆ ด้วย token ของตัวเอง ข้าม UI ไปเลย สิ่งที่ client-side check **การันตีไม่ได้** — พิสูจน์ด้วย token ที่ถูก tamper ในบท Sessions and JWTs — คือ session ที่มันกำลังดูอยู่นั้นเป็นของจริงหรือเปล่า `getSession()` ไม่ verify signature เลยแม้แต่นิดเดียว boundary จริงที่ตัดสินว่า request จะอ่านหรือเขียน row ไหนได้คือ **row level security (RLS)** ที่ Postgres บังคับใช้เองฝั่ง server ไม่ว่า client จะเลือกเช็คหรือ render อะไรก็ตาม server-side gate ต้องใช้ `getUser()` หรือ `getClaims()` ไม่ใช่ `getSession()` — bug นั้นเป๊ะ ๆ พร้อมทางแก้ คือ `SpotTheBug` ของคอร์สนี้ในบท Sessions and JWTs
 
-<Mermaid title="A session drives the UI, but RLS is still the real gate" code={authClientDiagram} />
+## MFA: enroll, challenge, verify — และด่าน config local จริง
+
+Multi-factor authentication เพิ่ม factor ที่สอง (ปกติคือ TOTP authenticator app) ทับ password ยก session จาก `aal1` เป็น `aal2` (Authenticator Assurance Level — claim เดียวกับที่ decode จาก token จริงในบท Sessions and JWTs) flow คือ `enroll()` → `challenge()` → `verify()`:
+
+```typescript
+const { data: factors, error: factorsErr } = await supabase.auth.mfa.enroll({ factorType: 'totp' });
+// factors.totp.qr_code — an SVG the user scans with an authenticator app
+// factors.totp.secret — the same secret, for manual entry
+
+const { data: challenge } = await supabase.auth.mfa.challenge({ factorId: factors!.id });
+const { data: verified, error: verifyErr } = await supabase.auth.mfa.verify({
+  factorId: factors!.id,
+  challengeId: challenge!.id,
+  code: userEnteredCode, // the 6-digit code from the authenticator app
+});
+// on success, the session is transparently upgraded to aal2
+```
+
+TOTP เปิดใช้เป็น default บน hosted Supabase project ([supabase.com/docs/guides/auth/auth-mfa](https://supabase.com/docs/guides/auth/auth-mfa)) — แต่รัน `enroll()` จริงกับ local stack ของคอร์สนี้จะได้คำตอบที่ตรงไปตรงมาว่าไม่พร้อมใช้งานที่นี่:
+
+```ts
+// src/cli-auth-mfa-enroll.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+const API_URL = process.env.SUPABASE_URL!;
+const admin = createClient(API_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+const email = 'cli-client-dev-mfa@example.com';
+const password = 'cli-pw-mfa-12345';
+let user = (await admin.auth.admin.listUsers()).data.users.find((u) => u.email === email);
+if (!user) user = (await admin.auth.admin.createUser({ email, password, email_confirm: true })).data.user!;
+
+const client = createClient(API_URL, process.env.SUPABASE_ANON_KEY!);
+await client.auth.signInWithPassword({ email, password }); // mfa.enroll needs a real, signed-in session
+
+const { data, error } = await client.auth.mfa.enroll({ factorType: 'totp' });
+console.log('mfa.enroll error =', error?.message ?? null);
+
+const aal = await client.auth.mfa.getAuthenticatorAssuranceLevel();
+console.log('AAL currentLevel =', aal.data?.currentLevel, '| nextLevel =', aal.data?.nextLevel);
+
+await admin.auth.admin.deleteUser(user.id);
+```
+
+```text
+mfa.enroll error = MFA enroll is disabled for TOTP
+AAL currentLevel = aal1 | nextLevel = aal1
+```
+
+พูดตรง ๆ แทนที่จะหาทางเลี่ยง: `config.toml` ของ local CLI stack นี้ไม่ได้เปิด `[auth.mfa.totp]` เป็น default ดังนั้น `enroll()` ปฏิเสธถูกต้องด้วย error จริงเฉพาะเจาะจง แทนที่จะ no-op เงียบ ๆ — พิสูจน์ว่า *ด่าน* เป็นของจริง แม้ไม่มีการพิสูจน์ local ของ enrollment ที่เสร็จสมบูรณ์ `getAuthenticatorAssuranceLevel()` ยังทำงานได้และรายงาน `aal1`/`aal1` ถูกต้อง (ไม่มีการอัปเกรดค้างอยู่) สำหรับ session ที่ยังไม่ enroll นี้ โค้ดฝั่ง client ควรเรียก `getAuthenticatorAssuranceLevel()` หลัง sign-in แล้ว prompt ให้ challenge ทุกครั้งที่ `nextLevel !== currentLevel` ตาม pattern reference ของ docs เอง
+
+<Mermaid title="Session ขับเคลื่อน UI ด้วยลำดับ event จริงที่พิสูจน์ได้ แต่ RLS ยังเป็นด่านจริง" code={authClientDiagram} />
 
 export const authClientDiagram = `flowchart LR
-  action["signUp() or signInWithPassword()"] --> session["Session created and stored in the client"]
-  session --> event["onAuthStateChange fires"]
-  event --> ui["App UI updates; a protected route becomes reachable"]
+  construct["Client constructed"] --> initial["INITIAL_SESSION fires"]
+  initial --> action["signInWithPassword() / exchangeCodeForSession()"]
+  action --> signedin["SIGNED_IN fires"]
+  signedin --> refresh["TOKEN_REFRESHED fires (auto, or refreshSession())"]
+  refresh --> ui["App UI stays in sync via one onAuthStateChange subscription"]
   ui --> rls[("Real enforcement still happens via RLS on the database")]`;
 
 <Callout title="สรุปหนึ่งบรรทัด">
-`supabase.auth.signUp()`, `signInWithPassword()` และ `signOut()` แต่ละอัน resolve เป็น `{ data, error }` และขับเคลื่อน session ที่ถูกเก็บไว้ subscribe **`onAuthStateChange`** แค่ครั้งเดียวก็ทำให้ UI ของแอป sync กับ sign-in, sign-out และ token refresh โดยไม่ต้องเช็ก session state เองทุกที่ การเช็ก `session` ก่อน render หน้า protected เป็น **UX convenience** จริง แต่ไม่ใช่ security จริง — client ที่ตั้งใจจะ bypass ก็ทำได้เสมอ ดังนั้น **row level security (RLS)** บน database ยังคงเป็น boundary จริงที่ตัดสินว่า request หนึ่งอ่านหรือเขียนอะไรได้บ้าง
+`supabase.auth.signUp()`, `signInWithPassword()` และ `signOut()` แต่ละตัว resolve เป็น `{ data, error }` และขับเคลื่อน session ที่เก็บไว้; subscribe **`onAuthStateChange`** ครั้งเดียวส่งลำดับ event จริงที่พิสูจน์แล้ว — **`INITIAL_SESSION` → `SIGNED_IN` → `TOKEN_REFRESHED` → `SIGNED_OUT`** — โดยไม่ต้อง re-check session state เองที่ไหนเลย Session นั้นอยู่ใน `localStorage` บน browser แต่อยู่แค่ **in-memory ต่อ client instance** บน Node โดย default (พิสูจน์: client ตัวที่สอง process เดียวกันมองไม่เห็น session ของตัวแรก) flow **PKCE** default ถูกพิสูจน์ end to end — magic-link email จริง, redirect `?code=` จริง, `exchangeCodeForSession()` จริง — และ **`getClaims()`** ยืนยันแล้วว่ามีอยู่ใน version ที่ติดตั้ง การเช็ค `session` ก่อน render หน้าที่ป้องกันไว้เป็นความสะดวกด้าน **UX** จริง ไม่ใช่ security จริงเลย — client ที่ตั้งใจ bypass มันได้เสมอ ดังนั้น **row level security (RLS)** ยังเป็น boundary จริง และ server-side gate ต้องใช้ `getUser()`/`getClaims()` ไม่ใช่ `getSession()`
 </Callout>
+
+## อ่านโค้ดที่ AI สร้าง
+
+AI assistant ที่ถูกขอให้ "gate หน้า settings นี้ด้วย MFA" สร้างโค้ดนี้:
+
+<SpotTheBug lang="ts" code={`function SettingsPage() {
+  const [ready, setReady] = useState(false);
+  const [session, setSession] = useState<Session | null>(null);
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => {
+      setSession(data.session);
+      setReady(true);
+    });
+  }, []);
+
+  if (!ready) return <Spinner />;
+  if (!session) return <Navigate to="/login" />;
+
+  // "MFA-gated" because the JWT has an aal claim, right?
+  const isMfaVerified = session.user.app_metadata?.aal === 'aal2';
+  if (!isMfaVerified) return <Navigate to="/mfa-challenge" />;
+
+  return <RealSettingsForm />;
+}
+`}>
+สอง bug ที่ซ้อนกันอยู่ ข้อแรก `aal` เป็น claim ระดับบนสุดของ JWT ที่ decode ออกมาเอง (พิสูจน์ด้วยการ decode token จริงในบท Sessions and JWTs) — ไม่เคยถูก copy เข้าไปใน `session.user.app_metadata` เลย ดังนั้น `session.user.app_metadata?.aal` จะเป็น `undefined` เสมอ และ `undefined === 'aal2'` เป็น `false` เสมอ เช็คนี้ fail closed โดยบังเอิญ ไม่ใช่โดยตั้งใจ ซึ่งเป็นกับดักตอน maintain แม้ว่าวันนี้มันจะ "ปลอดภัย" อยู่ก็ตาม ข้อสอง และเป็นเรื่องพื้นฐานกว่า `getSession()` — พิสูจน์แล้วก่อนหน้าในบทนี้และในบท Sessions and JWTs ว่าไม่ verify signature เลย — เป็นเครื่องมือผิดสำหรับ MFA gate ฝั่ง client ตั้งแต่แรก ด้วยเหตุผลเดียวกับที่มันผิดสำหรับ security decision ฝั่ง server ใด ๆ: ไม่มีอะไรกัน visitor แก้ claim ใน session object ที่ cache ไว้ก่อนที่ component นี้จะอ่านมัน ทางแก้คือ `supabase.auth.mfa.getAuthenticatorAssuranceLevel()` API ที่สร้างมาเพื่อเช็คนี้โดยเฉพาะของบทนี้: `const { data } = await supabase.auth.mfa.getAuthenticatorAssuranceLevel(); if (data.nextLevel === 'aal2' && data.nextLevel !== data.currentLevel) { /* show the MFA challenge */ }` — และถึงแม้จะแก้แล้ว ก็ต้องจำกติกาของบทนี้ไว้: นี่ยังเป็นความสะดวกด้าน UX ฝั่ง client สำหรับ *แสดง* challenge เท่านั้น ไม่ใช่ตัวแทนของ RLS policy ที่รู้จัก MFA หรือเช็คฝั่ง server บนสิ่งที่หน้า settings เขียนจริง
+</SpotTheBug>
+
+## Mental Model
+
+ทุกอย่างในบทนี้คือไอเดียเดียวที่มองจากมุมต่างกัน: client เก็บ state ที่เปลี่ยนได้ *ชิ้นเดียว* — session — และทุก API ในนี้เป็นได้แค่ทางใดทางหนึ่ง: ทาง *เปลี่ยน* state นั้น (`signInWithPassword`, `signOut`, `exchangeCodeForSession`, token refresh) หรือทาง *สังเกต* มัน (`onAuthStateChange`, `getSession`, `getUser`, `getClaims`, `getAuthenticatorAssuranceLevel`) ลำดับ event ที่พิสูจน์แล้วในบทนี้ไม่ใช่รายละเอียด implementation ที่ต้องท่องจำ — มันคือผลลัพธ์โดยตรงของ state machine นั้น: สร้าง (`INITIAL_SESSION`), establish (`SIGNED_IN`), รักษาไว้ (`TOKEN_REFRESHED` อาจหลายครั้ง) และจบ (`SIGNED_OUT`) `exchangeCodeForSession` ของ PKCE ก็แค่ call ที่เปลี่ยน state ที่บังเอิญมาผ่าน URL แทนที่จะเป็นการ submit form และธีม "UX vs. security" ทั้งบทก็ย่อลงเหลือประโยคเดียว: อะไรก็ตามที่ state machine ฝั่ง client นี้รายงานเกี่ยวกับตัวเอง น่าเชื่อถือแค่เท่าที่สิ่งสุดท้ายที่ verify มันแบบ cryptographic เท่านั้น — ซึ่งไม่เคยเป็นตัว state machine เอง มีแค่ `getUser()`/`getClaims()` ฝั่ง server หรือ RLS บน database
+
+## Trade-off
+
+- **Subscribe `onAuthStateChange` ครั้งเดียวทำให้ UI state sync ได้ง่ายมาก** — แลกกับ callback ที่อาจ fire บ่อยกว่าที่คิด (`SIGNED_IN` ตอน tab กลับมา focus ไม่ใช่แค่ sign-in ใหม่จริง ๆ ตาม docs ของ SDK เอง) ดังนั้นโค้ดใน callback ต้อง idempotent และเบา
+- **Session แบบ in-memory บน Node เลี่ยงการแตะ disk เลยใน environment แบบ serverless/edge** — แลกกับ session ที่หายไปทันทีที่ process หรือ client instance ถูกทิ้ง ซึ่งเป็นเหตุผลที่ server จริงต้องการ cookie adapter ของ `@supabase/ssr` แทนที่จะพึ่ง default นี้
+- **PKCE ไม่เอา token ไปแปะตรง ๆ ใน URL เลย** (ต่างจาก implicit flow แบบเก่า) — แลกกับ network round trip เพิ่มอีกหนึ่งครั้ง (`exchangeCodeForSession`) ก่อนจะมี session พิสูจน์แล้วด้านบนว่าเป็น step จริงที่จำเป็น ไม่ใช่ optional
+- **MFA ยกระดับ assurance bar ให้ call ที่เช็คมัน** — แลกกับการไม่ทำอะไรให้ call ที่ไม่เช็ค: RLS policy หรือเช็คฝั่ง server ต้อง require `aal2` เอง (ผ่าน `auth.jwt()->>'aal'` หรือ JWT จริงของ request) MFA ถึงจะมีความหมายเกินกว่า UI ของ client เอง
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"event `SIGNED_IN` ของ onAuthStateChange fire แค่ตอน sign-in ใหม่จริง ๆ เท่านั้น"** แก้ด้วย docs ของ SDK เอง อ้างตรง ๆ ในบทนี้: มัน fire ตอน re-establish session ด้วย เช่น tab กลับมา focus — เช็ค payload `session.user` ไม่ใช่แค่ชื่อ event ถ้าสิ่งที่โค้ดต้องรู้จริง ๆ คือ "user ใหม่เพิ่ง sign-in"
+- **"session persist เหมือนกันไม่ว่า runtime ไหน"** พิสูจน์แล้วว่าผิด: browser default เป็น `localStorage`; Node default เป็น in-memory store scope กับ client instance เดียว พิสูจน์ที่นี่ด้วย client พี่น้องตัวที่สองใน process เดียวกันที่มองไม่เห็น session ของตัวแรกเลย
+- **"PKCE แปลว่า client ไม่ต้องการ network call เลยเพื่อ sign-in เสร็จ"** พิสูจน์แล้วว่าผิด end to end: การคลิก magic link จริง redirect มาพร้อม `?code=` และ network call `exchangeCodeForSession(code)` จริงต่างหากที่เปลี่ยน code นั้นเป็น session ที่ใช้ได้ — ข้าม call นั้นไป แค่ redirect เฉย ๆ ไม่ได้อะไรเลย
+- **"claim `aal` ของ JWT อยู่ใน session.user.app_metadata"** พิสูจน์แล้วว่าผิดจาก `SpotTheBug` ของบทนี้: `aal` เป็น claim ระดับบนสุดของ token เอง (decode ตรง ๆ ในบท Sessions and JWTs) ไม่เคย copy เข้า `app_metadata` เลย วิธีอ่านที่ถูกต้อง สร้างมาเพื่อสิ่งนี้โดยเฉพาะ คือ `supabase.auth.mfa.getAuthenticatorAssuranceLevel()`
 
 export const quizAuthClient = [
   {
-    q: 'การ subscribe onAuthStateChange แค่ครั้งเดียวช่วยให้ไม่ต้องทำอะไรเอง',
+    q: 'client ถูกสร้าง sign-in ทันที แล้วเรียก refreshSession() ด้วยมือ แล้ว sign-out — ทั้งหมด log ผ่าน onAuthStateChange subscription เดียว ลำดับ event จริงที่พิสูจน์แล้วคืออะไร',
     options: [
-      'ไม่ต้องเขียนโค้ด sign-in เลย',
-      'ไม่ต้องเช็กและ sync auth state เองซ้ำ ๆ หลัง sign-in, sign-out หรือ token refresh แต่ละครั้ง',
-      'ไม่ต้องเรียก signOut ตอน user ออกจากหน้า',
-      'ไม่ต้องเก็บ anon key ไว้ในแอป',
+      'SIGNED_IN, TOKEN_REFRESHED, SIGNED_OUT (ไม่มี INITIAL_SESSION เพราะ client ไม่เคยว่าง)',
+      'INITIAL_SESSION, SIGNED_IN, TOKEN_REFRESHED, SIGNED_OUT',
+      'INITIAL_SESSION, SIGNED_OUT, SIGNED_IN, TOKEN_REFRESHED',
+      'มีแค่ SIGNED_IN กับ SIGNED_OUT ที่ fire; refreshSession() ด้วยมือไม่ trigger event ใน callback',
     ],
     answer: 1,
+    explain: 'พิสูจน์สดกับ local stack: INITIAL_SESSION fire ครั้งเดียวทันทีหลังสร้าง (แม้ยังไม่มี session) แล้ว SIGNED_IN แล้ว TOKEN_REFRESHED (refreshSession() ด้วยมือ trigger event เดียวกับ automatic) แล้ว SIGNED_OUT',
   },
   {
-    q: 'ทำไมการเช็ก session ก่อน render หน้า protected ถึงเป็นแค่ UX convenience',
+    q: 'client supabase-js สองตัวที่เป็นอิสระถูกสร้างใน Node process เดียวกัน ด้วย URL และ anon key เดียวกัน ตัวแรก sign-in ตัวที่สองเห็น session นั้นผ่าน getSession() ไหม',
+    options: [
+      'เห็น เพราะ Node แชร์ session storage ข้าม client ใน process เดียวกันโดย default',
+      'ไม่เห็น — พิสูจน์ตรง ๆ: default storage บน Node เป็น in-memory scope ต่อ client instance ต่างจาก localStorage ที่แชร์กันของ browser',
+      'เห็น เฉพาะถ้า client ทั้งสองได้รับ options object ตัวเดียวกันเป๊ะ',
+      'เห็น แต่แค่ 60 วินาที เพราะมี shared cache TTL',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ด้วย client จริงสองตัว: getSession() ของ client ตัวที่สองที่เพิ่งสร้างใหม่ไม่คืน session เลย แม้ตัวแรกจะ sign-in ไปไม่กี่วินาทีก่อนใน process เดียวกัน',
+  },
+  {
+    q: 'ภายใต้ flow PKCE default magic-link email จริงส่งมอบอะไรจริง ๆ แล้วต้องทำอะไรต่อ',
+    options: [
+      'access กับ refresh token ตรง ๆ ใน URL fragment ไม่ต้องเรียกอะไรต่อ',
+      'link ที่พอคลิกแล้ว redirect ไป URL แบบ `?code=` — ต้องเรียก exchangeCodeForSession(code) ถึงจะ establish session ได้จริง',
+      'one-time password ที่ user พิมพ์เอง ไม่มี link เลย',
+      'session cookie ที่ authenticated ไว้แล้ว ถูกตั้งอัตโนมัติโดย email client',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ end to end กับ local stack ของคอร์สนี้: link ใน Mailpit email จริง redirect ไป URL ที่มี ?code=<uuid> จริง และมีแค่ exchangeCodeForSession(code) ที่เรียกต่อเท่านั้นที่ได้ session จริงมา',
+  },
+  {
+    q: 'ทำไมการเช็ค session ก่อน render หน้าที่ป้องกันไว้เป็นแค่ความสะดวกด้าน UX ไม่ใช่ security boundary จริง',
     options: [
       'เพราะ getSession() ถูก deprecate ใน supabase-js แล้ว',
-      'เพราะโค้ดฝั่ง client ถูก inspect หรือ bypass ได้โดยคนที่ตั้งใจ จึงเป็น security boundary จริงไม่ได้',
-      'เพราะ session ไม่มีวันหมดอายุ เลยไม่จำเป็นต้องเช็ก',
+      'เพราะโค้ดฝั่ง client และ session data ที่ cache ไว้ถูก inspect หรือ bypass ได้เสมอโดย visitor ที่ตั้งใจ จึงเป็น enforcement point จริงไม่ได้ — enforcement point จริงคือ row level security บน database',
+      'เพราะ session ไม่เคยหมดอายุเลยจึงไม่จำเป็นต้องเช็ค',
       'เพราะใช้ได้แค่กับ OAuth sign-in ไม่ใช่ password',
     ],
     answer: 1,
+    explain: 'getSession() ไม่ verify signature เลย (พิสูจน์ด้วย token ที่ถูก tamper ในบท Sessions and JWTs) และโค้ดฝั่ง client เองก็แก้ไขหรือ bypass ได้เสมอ — RLS ที่ Postgres บังคับใช้ฝั่ง server คือ boundary จริง',
   },
   {
-    q: 'อะไรคือตัวที่บังคับจริงว่า request หนึ่งอ่านหรือเขียน row ไหนได้บ้าง ไม่ว่า client จะเช็กอะไรก็ตาม',
+    q: 'component ที่ AI สร้างอ่าน session.user.app_metadata?.aal === \'aal2\' เพื่อตัดสินว่า MFA ผ่านหรือยัง จริง ๆ แล้วผิดตรงไหน',
     options: [
-      'callback ของ onAuthStateChange',
-      'row level security (RLS) ที่ Postgres บังคับใช้ฝั่ง server',
-      'ว่า browser tab กำลัง focus อยู่หรือไม่',
-      'ลำดับที่เรียก signUp กับ signInWithPassword',
+      'ไม่มีอะไรผิด นี่คือวิธีอ่าน AAL claim ตาม docs',
+      'aal เป็น claim ระดับบนสุดของ JWT ที่ decode เอง ไม่เคย copy เข้า app_metadata เลย เช็คนี้จึงเป็น undefined/false เสมอไม่ว่า assurance level จริงจะเป็นอะไร — call ที่ถูกต้องคือ auth.mfa.getAuthenticatorAssuranceLevel()',
+      'aal2 ควรเขียนเป็น "AAL2" ตัวพิมพ์ใหญ่',
+      'เช็ค MFA ฝั่ง client ไม่ได้เลยไม่ว่ากรณีไหน',
     ],
     answer: 1,
-  },
-  {
-    q: 'call อย่าง supabase.auth.signOut() resolve ออกมาเป็นรูปแบบไหน',
-    options: [
-      'throw exception ตอน fail แทนที่จะ return ค่า',
-      'object รูปแบบ { data, error } (หรือ { error } สำหรับ signOut) ที่ต้องเช็กเอง',
-      'boolean ธรรมดา true หรือ false',
-      'ไม่มีอะไรเลย resolve เป็น undefined เสมอ',
-    ],
-    answer: 1,
+    explain: 'พิสูจน์ด้วย SpotTheBug ของบทนี้: aal อยู่บน payload ของ token โดยตรง (แสดง decode ในบท Sessions and JWTs) ไม่ใช่ใน app_metadata — API ที่ถูกต้อง สร้างมาเพื่อสิ่งนี้ คือ getAuthenticatorAssuranceLevel()',
   },
 ];
 
