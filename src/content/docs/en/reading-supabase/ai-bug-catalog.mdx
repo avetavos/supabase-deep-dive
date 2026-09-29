@@ -1,0 +1,1049 @@
+---
+title: The AI bug catalog
+description: '27 bugs AI-generated Supabase code produces constantly — the code AI typically writes, why it is wrong, real output freshly captured against this module''s own local stack, and the fix.'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+Every snippet below was written to look exactly like the code an AI assistant actually produces — fluent SQL, plausible `supabase-js`, a realistic edge function — then run for real against this module's own namespace (`rd_` tables/functions, `rd-` buckets/functions, `rd-<name>@example.com` test users) on this course's one shared local stack, freshly today. The quoted output below is copied verbatim from those runs, not reconstructed from memory or carried over from an earlier lesson — even where a fact was already established in Phase 3, it was re-proven here, fresh, against this exact namespace. Grouped the same way as **[How to read Supabase code you did not write](/supabase/en/reading-supabase/)** and the **[Review Checklist](/supabase/en/reading-supabase/review-checklist/)** that follows this lesson.
+
+## Schema & migrations
+
+### 1. `uuid_generate_v4()` instead of `gen_random_uuid()`
+
+AI training data spans years of Supabase tutorials that predate `gen_random_uuid()` being built into core Postgres — a huge fraction of them still default to `uuid-ossp`'s `uuid_generate_v4()`, an extension that has to be installed and stays in the schema's `search_path` for the call to resolve at all.
+
+<SpotTheBug lang="sql" code={`create table public.widgets (
+  id uuid primary key default uuid_generate_v4(),
+  name text not null
+);`}>
+`uuid_generate_v4()` depends on the `uuid-ossp` extension being installed **and** its schema being on `search_path` — neither is guaranteed on a fresh project, a new schema, or a stripped-down CI database. `gen_random_uuid()` has been part of core Postgres since v13 (no extension, no schema dependency) and does the exact same job.
+</SpotTheBug>
+
+Proof — a schema with no extensions installed, exactly what a fresh, narrowly-scoped schema looks like:
+
+```sql
+-- @expect-error function uuid_generate_v4() does not exist
+create schema rd_no_ext;
+set search_path to rd_no_ext;
+select uuid_generate_v4();
+```
+
+```text
+ERROR:  function uuid_generate_v4() does not exist
+LINE 1: select uuid_generate_v4();
+               ^
+HINT:  No function matches the given name and argument types. You might need to add explicit type casts.
+```
+
+`gen_random_uuid()` needs nothing extra:
+
+```sql
+select gen_random_uuid() as core_builtin;
+--            core_builtin
+-- --------------------------------------
+--  60d48be5-b4bc-426b-8e75-2464ac05b273
+```
+
+**The fix:** default every primary key to `gen_random_uuid()`, not `uuid_generate_v4()` — same shape of output, zero extension dependency.
+
+**How to spot it in review:** grep any migration for `uuid_generate_v4()` — if `create extension "uuid-ossp"` is not in the same migration (or an earlier one that's still applied), the default will fail the moment this table is created against a database that hasn't happened to have that extension already.
+
+### 2. Missing `on delete cascade` on a profile FK
+
+A `profiles` table keyed to `auth.users(id)` is one of the most common patterns AI generates for a Supabase project — and it almost always leaves the foreign key's delete behavior at Postgres's real default, which is not "cascade," it's "block."
+
+<SpotTheBug lang="sql" code={`create table public.profiles (
+  id uuid primary key references auth.users(id),
+  display_name text not null
+);`}>
+No `on delete cascade` (or `on delete set null`) means the default `no action` applies: deleting the `auth.users` row this profile references — the normal way an account gets deleted, via `supabase.auth.admin.deleteUser()` — is blocked outright by a foreign key violation, not silently skipped. The account can never be deleted while its profile row exists.
+</SpotTheBug>
+
+Proof — deleting a user whose profile FK has no cascade:
+
+```sql
+-- @expect-error update or delete on table "users" violates foreign key constraint "rd_profiles_id_fkey" on table "rd_profiles"
+delete from auth.users where id = '9a640d7b-81ed-496c-93c0-b7a6e33198da';
+```
+
+```text
+ERROR:  update or delete on table "users" violates foreign key constraint "rd_profiles_id_fkey" on table "rd_profiles"
+DETAIL:  Key (id)=(9a640d7b-81ed-496c-93c0-b7a6e33198da) is still referenced from table "rd_profiles".
+```
+
+**The fix**, verified to actually cascade:
+
+```sql
+alter table public.profiles drop constraint profiles_id_fkey;
+alter table public.profiles add constraint profiles_id_fkey
+  foreign key (id) references auth.users(id) on delete cascade;
+-- delete from auth.users where id = '...' now succeeds, and the profile row
+-- disappears with it: DELETE 1 / bob_profiles_left = 0, confirmed live.
+```
+
+**How to spot it in review:** any `references auth.users(id)` (or any FK meant to own its parent's lifecycle) with no `on delete` clause — decide deliberately between `cascade` and `set null`, don't leave it at the implicit `no action`.
+
+### 3. `supabase gen types` drift — `tsc` passes, the real query fails
+
+The single most dangerous property of generated types: they describe the schema **at the moment they were generated**, not the schema right now. A column rename between then and now is invisible to `tsc` and very visible to Postgres.
+
+```ts
+// src/widgets.ts
+import { createClient } from '@supabase/supabase-js'
+import type { Database } from '../database.types'
+
+const supabase = createClient<Database>('http://127.0.0.1:55321', 'anon-key-placeholder')
+
+async function bumpQty(id: string) {
+  const { data, error } = await supabase.from('rd_widgets').select('id, qty').eq('id', id)
+  return { data, error }
+}
+```
+
+Proof — freshly captured, this exact sequence, on this module's own `rd_widgets` table:
+
+```text
+$ tsc --noEmit -p tsconfig.json          # BEFORE the rename -- types match live schema
+exit=0
+
+$ psql -c "alter table public.rd_widgets rename column qty to quantity;"
+ALTER TABLE
+
+$ tsc --noEmit -p tsconfig.json          # AFTER the rename -- same stale database.types.ts, still passes
+exit=0
+
+$ curl "$API_URL/rest/v1/rd_widgets?select=id,qty" -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY"
+{"code":"42703","details":null,"hint":null,"message":"column rd_widgets.qty does not exist"}
+```
+
+`tsc` never re-reads the database — it only reads `database.types.ts`, a file on disk that is correct exactly until the next schema change. The real, live query fails with a real Postgres `42703` the entire time `tsc` is reporting success.
+
+**The fix:** `supabase gen types typescript --local > database.types.ts` after **every** migration that touches a column name, before trusting `tsc`'s result means anything:
+
+```text
+$ supabase gen types typescript --local | grep -A4 rd_widgets
+      rd_widgets: {
+        Row: {
+          id: string
+          quantity: number
+        }
+```
+
+**How to spot it in review:** a PR that changes a column name but does not also regenerate and commit `database.types.ts` in the same PR — `tsc` passing is not evidence this was done.
+
+## RLS & roles
+
+### 4. A `select`-only policy, no `insert` policy
+
+The single most common RLS gap: a table gets a `select` policy (the first thing anyone tests — "can I read my own data back?") and nothing else, because a write was never tried during development.
+
+<SpotTheBug lang="sql" code={`alter table public.posts enable row level security;
+
+create policy posts_select on public.posts
+  for select using (true);
+-- no insert policy was ever written`}>
+With RLS enabled and only a `select` policy, every `insert` is evaluated against zero matching permissive policies — Postgres's RLS default is deny, not allow, so the write is rejected outright, not silently ignored.
+</SpotTheBug>
+
+Proof — Alice, a real authenticated user, tries to insert her own row:
+
+```bash
+# scripts/reading-supabase/ai-bug-catalog/04-missing-insert-policy.sh
+curl -s -w "\nHTTP=%{http_code}\n" -X POST "$API_URL/rest/v1/rd_posts" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ALICE_TOKEN" \
+  -H "Content-Type: application/json" -H "Prefer: return=representation" \
+  -d '{"user_id":"f8cd7f9e-6dd4-482a-888b-b92184c98d07","title":"alice second post","body":"x"}'
+```
+
+```text
+{"code":"42501","details":null,"hint":null,"message":"new row violates row-level security policy for table \"rd_posts\""}
+HTTP=403
+```
+
+**The fix:** one policy per command the table actually needs — `for select`, `for insert`, `for update`, `for delete` are independent grants, never implied by each other.
+
+**How to spot it in review:** count the commands the client code actually calls against a table, then count the policies on that table — they should match. `select policyname, cmd from pg_policies where tablename = 'posts'` answers this in one query, covered in **[Verification Tools](/supabase/en/reading-supabase/verification-tools/)**.
+
+### 5. `using (true)` on `update`, no explicit `with check`
+
+When `with check` is omitted on an `update` policy, Postgres reuses the `using` expression for it too — so a permissive `using (true)`, written to mean "anyone can update their own row, I'll filter in the app," actually means "anyone can update any row into any shape."
+
+<SpotTheBug lang="sql" code={`create policy posts_update on public.posts
+  for update using (true);
+-- no with check -- Postgres silently reuses using(true) for it too`}>
+This does not just let anyone update any row — it lets anyone reassign a row's ownership entirely, because `with check` (which validates the RESULT of the write) is exactly as permissive as `using` (which only filters which rows are visible to update in the first place). Stealing another user's row is one `PATCH` away.
+</SpotTheBug>
+
+Proof — Alice reassigns Bob's post to herself:
+
+```bash
+# scripts/reading-supabase/ai-bug-catalog/05-using-true-hijack.sh
+curl -s -w "\nHTTP=%{http_code}\n" -X PATCH "$API_URL/rest/v1/rd_posts?id=eq.282cdccb-21b8-4e5b-a9d3-0826c9b58d47" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ALICE_TOKEN" \
+  -H "Content-Type: application/json" -H "Prefer: return=representation" \
+  -d '{"user_id":"f8cd7f9e-6dd4-482a-888b-b92184c98d07","title":"stolen by alice"}'
+```
+
+```text
+[{"id":"282cdccb-21b8-4e5b-a9d3-0826c9b58d47","user_id":"f8cd7f9e-6dd4-482a-888b-b92184c98d07","title":"stolen by alice","body":"hello from bob","created_at":"2026-09-29T07:45:28.910907+00:00"}]
+HTTP=200
+```
+
+Confirmed server-side: Bob's post — same row `id` — now has `user_id` set to Alice.
+
+**The fix**, verified to deny the exact same attempt:
+
+```sql
+drop policy posts_update on public.posts;
+create policy posts_update on public.posts
+  for update
+  using ( user_id = (select auth.uid()) )
+  with check ( user_id = (select auth.uid()) );
+```
+
+```text
+-- same PATCH request, replayed against the fixed policy:
+[]
+HTTP=200
+```
+
+Notice the fix returns `200` with an **empty array**, not `403` — the row simply no longer matches Alice's `using` filter, so PostgREST reports "0 rows matched" rather than an authorization error. Confirmed unchanged server-side: the row is still Bob's.
+
+**How to spot it in review:** any `for update` (or `for all`) policy with a `using` clause and no `with check` — Postgres's own docs are explicit that `using` is reused for `with check` when omitted, and that is almost never the intended behavior for `update`.
+
+### 6. `auth.uid()` not wrapped in `(select ...)`
+
+`auth.uid()` is a `stable` function, not `immutable` — Postgres is free to call it once per row unless a query plan tells it the value cannot change during the scan. Wrapping the call in a subquery is what gives the planner that hint.
+
+<SpotTheBug lang="sql" code={`create policy posts_select on public.posts_perf
+  for select using ( user_id = auth.uid() );`}>
+Written this way, `auth.uid()` is evaluated as part of the row filter itself, over and over, once per row scanned — official Supabase guidance (`supabase.com/docs`) confirms wrapping it triggers an **InitPlan**, computed once and reused, instead. On a small table the difference is invisible; on a table with real row counts it is not.
+</SpotTheBug>
+
+Proof — the same filter, same 50,000-row table, same JWT claims, unwrapped vs wrapped, `explain analyze` on this Mac:
+
+```text
+-- unwrapped: auth.uid() re-evaluated via current_setting() in the Filter itself
+Seq Scan on rd_posts_perf  (actual time=6.582..6.582 rows=0 loops=1)
+  Filter: (user_id = (COALESCE(NULLIF(current_setting('request.jwt.claim.sub', true), ''), ...))::uuid)
+Execution Time: 32.899 ms
+
+-- wrapped in (select auth.uid()): computed ONCE as an InitPlan, then reused
+Seq Scan on rd_posts_perf  (actual time=0.014..2.342 rows=50000 loops=1)
+  Filter: (user_id = (InitPlan 1).col1)
+  InitPlan 1
+    ->  Result  (actual time=0.011..0.011 rows=1 loops=1)
+Execution Time: 3.296 ms
+```
+
+Roughly 10x on this exact table and this exact Mac — real numbers from this run, not a general benchmark claim.
+
+**The fix:** `using ( user_id = (select auth.uid()) )` — the parentheses around `auth.uid()` are the entire fix; nothing else about the policy changes.
+
+**How to spot it in review:** grep every policy for a bare `auth.uid()`, `auth.role()`, or `auth.jwt()` not wrapped in `(select ...)` — this is exactly what `supabase db lint`'s performance advisor flags, covered in **[Verification Tools](/supabase/en/reading-supabase/verification-tools/)**.
+
+### 7. `security definer` without `set search_path = ''`
+
+A `security definer` function runs with the privileges of whoever **created** it, not whoever calls it — the entire point of using one to safely bypass RLS for a specific, narrow job. Every unqualified table reference inside it is resolved using the **caller's** `search_path` unless the function pins its own.
+
+<SpotTheBug lang="sql" code={`create or replace function public.leak_secret()
+returns text
+language plpgsql
+security definer
+as $$
+declare v text;
+begin
+  select secret into v from rd_settings limit 1;
+  return v;
+end;
+$$;`}>
+No `set search_path`. A caller who can put a schema of their own ahead of `public` in their session's `search_path` — or simply has a schema they control anywhere earlier in it — makes this function's unqualified `rd_settings` resolve to **their** table instead of the real one, with all the elevated privilege `security definer` grants intact.
+</SpotTheBug>
+
+Proof — the caller's own session `search_path` decides which table the function reads, even though the function owner never granted that caller any access to the real table's schema:
+
+```sql
+create schema rd_evil;
+create table rd_evil.rd_settings (secret text);
+insert into rd_evil.rd_settings (secret) values ('FAKE-secret-planted-by-attacker');
+
+set search_path to rd_evil, public;
+select current_setting('search_path'), public.leak_secret();
+--   current_setting  |             leak_secret
+-- -----------------+---------------------------------
+--  rd_evil, public  | FAKE-secret-planted-by-attacker
+```
+
+The function's own owner never touched `rd_evil` — the caller's `search_path` alone redirected an unqualified `select ... from rd_settings` inside a `security definer` function to an attacker-controlled table.
+
+**The fix**, verified against the identical attacker `search_path`:
+
+```sql
+create or replace function public.leak_secret()
+returns text language plpgsql security definer
+set search_path = ''
+as $$
+declare v text;
+begin
+  select secret into v from public.rd_settings limit 1;  -- now fully schema-qualified
+  return v;
+end;
+$$;
+```
+
+```text
+set search_path to rd_evil, public;
+select current_setting('search_path'), public.leak_secret();
+--   current_setting  |     leak_secret
+-- -----------------+-------------------
+--  rd_evil, public  | REAL-secret-value
+```
+
+Same attacker `search_path`, same session — now reads the real table every time, because `set search_path = ''` forces every unqualified reference inside the function to fail unless explicitly schema-qualified, and this one now is.
+
+**How to spot it in review:** grep every `security definer` function for `set search_path` — its absence is the single highest-value thing to flag in any Supabase RPC review, exactly per Postgres's own documentation of the risk.
+
+### 8. RLS enabled, zero policies — silently empty for everyone
+
+Enabling RLS is not the same action as writing a policy, and Postgres does not treat "RLS on, no policies" as a misconfiguration worth an error — it is a **valid**, fully-deny state, indistinguishable at the HTTP layer from "there is genuinely no data here yet."
+
+<SpotTheBug lang="sql" code={`create table public.notes (id uuid primary key default gen_random_uuid(), body text not null);
+grant select, insert, update, delete on public.notes to anon, authenticated;
+alter table public.notes enable row level security;
+-- table shipped like this -- nobody ever got around to writing a policy`}>
+`enable row level security` with zero policies denies every row to every role except the table owner (who bypasses RLS entirely, by default, as a superuser) — `anon` and `authenticated` both see nothing, with no error at any layer, forever, until a policy is added.
+</SpotTheBug>
+
+Proof — real rows exist, confirmed as `postgres` (bypasses RLS as owner), then the identical query through the real Data API:
+
+```text
+select count(*) as real_row_count_as_superuser from public.rd_notes;
+--  real_row_count_as_superuser
+-- -----------------------------
+--                            3
+
+$ curl "$API_URL/rest/v1/rd_notes?select=*" -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY"
+[]
+HTTP=200
+```
+
+No `42501`, no `403`, no distinguishing signal anywhere in the response — a genuinely empty table and this exact one look identical from the client's side.
+
+**The fix:** write at least one policy per command the table needs before shipping — even a deliberately narrow one — and treat "RLS enabled, 0 policies, `select count(*) from pg_policies where tablename = 'x'`" as a real audit query, covered in **[Verification Tools](/supabase/en/reading-supabase/verification-tools/)**.
+
+**How to spot it in review:** any migration that runs `alter table ... enable row level security` with no `create policy` for the same table in the same or a nearby migration.
+
+## Auth & sessions
+
+### 9. `getSession()` trusted as a verified identity
+
+`getSession()` returns whatever is sitting in the client's own storage, decoded locally — it does not contact the Auth server, and it does not check the JWT's signature. `getUser()` (and the newer, equally verified `getClaims()`) always makes a real network call and rejects a tampered token outright.
+
+<SpotTheBug lang="ts" code={`// server-side "auth check" -- a common AI-generated pattern
+const { data: { session } } = await supabase.auth.getSession()
+if (session?.user.role === 'service_role') {
+  // grant elevated access based on a claim read from getSession()
+}`}>
+`getSession()` never verifies the JWT's signature — it only decodes the payload sitting in local storage. Anything that can write to that storage (a browser extension, an XSS bug, a hand-crafted value in a test harness) can forge any claim this check reads, including `role`.
+</SpotTheBug>
+
+Proof — a real session's JWT payload, tampered (forged `sub` and `role`, same now-invalid signature bytes reused verbatim), seeded directly into the client's storage:
+
+```text
+getSession() -- LOCAL decode only, no network call:
+  error: null
+  trusts forged sub: 00000000-0000-0000-0000-000000000000 (forged value accepted, no signature check)
+
+getUser() -- real network call to /auth/v1/user, verifies signature:
+  data.user: null
+  error: invalid JWT: unable to parse or verify signature, token signature is invalid: crypto/ecdsa: verification error status=403 code=bad_jwt
+```
+
+`getSession()` returned the forged claims with no complaint; `getUser()`, given the identical tampered token, rejected it with a real, specific signature-verification error.
+
+**The fix:** any server-side authorization decision reads `getUser()` or `getClaims()`, never `getSession()` — `getSession()` is for reading the *current* client-held session state (is anyone logged in at all, for UI purposes), not for verifying who the caller actually is.
+
+**How to spot it in review:** any authorization branch — a route guard, an RLS-adjacent server check, an admin gate — that reads `session.user` from `getSession()` instead of the verified result of `getUser()`/`getClaims()`.
+
+### 10. Refresh token reuse assumed to always fail loudly
+
+Every successful token refresh rotates the refresh token and invalidates the one just used — but a short, configurable grace window (`refresh_token_reuse_interval`, `10` seconds on this local stack) tolerates the **immediately-previous** token, specifically so a real network retry does not cost a session. AI-generated retry logic often assumes any reuse is instantly fatal, or the opposite — that reuse is always silently fine.
+
+```ts
+// naive retry logic -- assumes EVERY reuse either always fails or always succeeds
+async function refreshWithRetry(token: string) {
+  const res = await fetch(`${API_URL}/auth/v1/token?grant_type=refresh_token`, {
+    method: 'POST', headers, body: JSON.stringify({ refresh_token: token }),
+  })
+  // no branch at all for error_code === 'refresh_token_already_used'
+  return res.json()
+}
+```
+
+Proof — the real boundary, captured end to end: `token_1` rotated to `token_2` (11s later), `token_2` rotated to `token_3` (11s later), then `token_1` reused a third time, 11s after that (genuinely two generations stale, well past the grace window):
+
+```text
+token_1=7vksoo2qrecx
+token_2=elqusfeflhpq (rotation 1 ok)
+token_3=5kilbvem2ojg (rotation 2 ok)
+
+$ curl -X POST "$API_URL/auth/v1/token?grant_type=refresh_token" -d '{"refresh_token":"7vksoo2qrecx"}'
+{"code":400,"error_code":"refresh_token_already_used","msg":"Invalid Refresh Token: Already Used"}
+HTTP=400
+
+# meanwhile token_3 -- the real, current one -- still works fine:
+HTTP=200
+```
+
+A real, specific `refresh_token_already_used` — not a generic `401` — and the legitimate current token kept working in the same session throughout.
+
+**The fix:** on `refresh_token_already_used`, sign the user out and force a fresh login — this specific error means the token chain is genuinely broken (possibly a sign of a stolen, already-used-elsewhere refresh token), not a transient failure to retry.
+
+**How to spot it in review:** refresh-retry logic with no branch at all for `error_code === 'refresh_token_already_used'`, or logic that retries it in a loop assuming it is transient.
+
+### 11. A custom JWT claim assumed to exist without an Auth Hook
+
+AI-generated RLS policies and client code frequently reference a claim like `request.jwt.claims ->> 'user_role'` or `auth.jwt() ->> 'org_id'` as if Supabase adds it automatically. It does not — a claim only appears in the JWT if a **Customize Access Token Claims** Auth Hook was actually written and configured.
+
+<SpotTheBug lang="sql" code={`create policy org_scoped on public.documents
+  for select
+  using ( org_id = (auth.jwt() ->> 'org_id')::uuid );
+-- assumes 'org_id' is already a claim on every access token`}>
+Nothing in a default Supabase project puts `org_id` (or any custom field) into the JWT. Without a real Auth Hook function registered in `config.toml`'s `[auth.hook.custom_access_token]`, `auth.jwt() ->> 'org_id'` is `null` for every single request, and this policy denies every row to everyone, permanently.
+</SpotTheBug>
+
+Proof — a real, freshly issued session token for this exact project, decoded in full:
+
+```text
+{
+  "iss": "http://127.0.0.1:55321/auth/v1",
+  "sub": "f8cd7f9e-6dd4-482a-888b-b92184c98d07",
+  "aud": "authenticated",
+  "email": "rd-alice@example.com",
+  "role": "authenticated",
+  "aal": "aal1",
+  "amr": [{"method":"password","timestamp":1790667877}],
+  "session_id": "865380b2-eecf-4933-918f-d2c908218fad",
+  "is_anonymous": false
+}
+```
+
+No `org_id`, no `user_role`, no custom field of any kind — only the standard claims GoTrue issues by default.
+
+**The fix** (config change only — this course's shared local stack's `config.toml` is not edited per-lesson; stated honestly rather than staged): register a real hook and a real SQL function to populate the claim —
+
+```text
+# supabase/config.toml
+[auth.hook.custom_access_token]
+enabled = true
+uri = "pg-functions://postgres/public/custom_access_token_hook"
+```
+
+```sql
+-- sql/custom-access-token-hook.sql
+create or replace function public.custom_access_token_hook(event jsonb)
+returns jsonb language plpgsql as $$
+declare claims jsonb;
+begin
+  claims := event->'claims';
+  claims := jsonb_set(claims, '{org_id}', to_jsonb((select org_id from public.profiles where id = (event->>'user_id')::uuid)));
+  event := jsonb_set(event, '{claims}', claims);
+  return event;
+end;
+$$;
+```
+
+Per the [official Auth Hooks docs](https://supabase.com/docs/guides/auth/auth-hooks/customize-access-token-hook), this hook runs on every token issuance once registered, and GoTrue needs restarting to pick up a `config.toml` change — a real config change this shared stack's lesson does not apply, stated honestly rather than faked.
+
+**How to spot it in review:** any RLS policy or client code reading a claim from `auth.jwt()` that is not one of the standard GoTrue claims — cross-check against `config.toml`'s `[auth.hook.custom_access_token]` block before trusting the claim exists at all.
+
+## Client calls
+
+### 12. Destructuring `data` and skipping `error`
+
+`supabase-js` never throws on a database or API error by default — every call returns `{ data, error }`, and code that only reads `data` has deleted the one signal telling it the call actually failed.
+
+<SpotTheBug lang="ts" code={`const { data } = await supabase.from('posts').select('*')
+const titles = data.map((row) => row.title)`}>
+On any failure — wrong table name, missing grant, RLS denial, network error — `data` is `null`, not `[]`. `.map()` on `null` throws a generic `TypeError`, hiding the real, specific reason the call failed underneath a much less useful crash.
+</SpotTheBug>
+
+Proof:
+
+```text
+const { data } = await client.from('rd_table_that_does_not_exist').select('*')
+data: null
+data.map(...) crashed with: TypeError: Cannot read properties of null (reading 'map')
+
+// what the REAL error actually was, had it been checked:
+{ code: 'PGRST205', details: null, hint: null,
+  message: "Could not find the table 'public.rd_table_that_does_not_exist' in the schema cache" }
+```
+
+**The fix:** always destructure and check both — `const { data, error } = await ...; if (error) { /* handle it, with error.code */ }`.
+
+**How to spot it in review:** any `const { data }` (no `error`) destructure on a `supabase-js` call, followed by unguarded use of `data`.
+
+### 13. `.single()` with no `PGRST116` handling
+
+`.single()` asks PostgREST to coerce the result to exactly one JSON object — zero rows or more than one row are both treated as an error, with a real, specific code, not a silent `null` or an array.
+
+```ts
+// src/rd-13-single-no-handling.ts
+import { createClient } from '@supabase/supabase-js'
+
+const supabase = createClient('http://127.0.0.1:55321', 'anon-key-placeholder')
+const userId = '00000000-0000-0000-0000-000000000000'
+
+const { data } = await supabase.from('profiles').select('*').eq('id', userId).single()
+console.log(data.display_name) // assumes data is always the one row
+```
+
+Proof, both failure shapes, real and freshly captured:
+
+```text
+0 rows .single(): {"data":null,"error":{"code":"PGRST116","details":"The result contains 0 rows","hint":null,"message":"Cannot coerce the result to a single JSON object"}}
+2+ rows .single(): {"data":null,"error":{"code":"PGRST116","details":"The result contains 2 rows","hint":null,"message":"Cannot coerce the result to a single JSON object"}}
+```
+
+Both the "not found" case and the "query too broad, matched more than one" case report as the identical `PGRST116` — the `details` string is the only thing that tells them apart.
+
+**The fix:** check `error?.code === 'PGRST116'` explicitly and branch on `error.details` if the two cases need different handling; or use `.maybeSingle()` when zero rows is an expected, non-error outcome.
+
+**How to spot it in review:** any `.single()` call with no adjacent `error` check, especially on a filter that is not provably unique (not a primary-key `.eq()`).
+
+### 14. A fresh `createClient()` per request instead of a singleton
+
+Constructing a new `supabase-js` client per request or per component — instead of one shared instance — is easy to miss because it usually still *works*; the cost shows up as a real, documented warning, not a crash.
+
+<SpotTheBug lang="ts" code={`// inside a component, or a request handler -- called on every render/request
+export function getClient() {
+  return createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
+}`}>
+Each call constructs a brand new `GoTrueClient` bound to the same storage key. `supabase-js` detects this and warns explicitly, because concurrent instances writing to the same storage key can race each other during a token refresh — "undefined behavior," in the library's own words.
+</SpotTheBug>
+
+Proof — real console output, second `createClient()` call, same storage key, same process:
+
+```text
+GoTrueClient@sb-127-auth-token:1 (2.117.2) 2026-09-29T07:50:35.645Z Multiple GoTrueClient instances detected in the same browser context. It is not an error, but this should be avoided as it may produce undefined behavior when used concurrently under the same storage key.
+```
+
+**The fix:** construct one client at module scope (`export const supabase = createClient(...)`) and import that single instance everywhere — the standard pattern in every lesson of this course's own `client-development` module.
+
+**How to spot it in review:** `createClient(` appearing inside a component body, a request handler, or any function called more than once, instead of at module top-level.
+
+### 15. `global.headers.Authorization` frozen at construction
+
+Passing an `Authorization` header via the `global.headers` client option is a real, documented way to make requests as a specific user without the full session flow — but it is set **once**, at construction, and does not update when `auth.setSession()` is called later on the same client instance.
+
+<SpotTheBug lang="ts" code={`const supabase = createClient(URL, ANON_KEY, {
+  global: { headers: { Authorization: \`Bearer \${ANON_KEY}\` } },
+})
+// ...later, elsewhere in the same request lifecycle...
+await supabase.auth.setSession({ access_token, refresh_token })
+// assumes subsequent .from() calls now act as the signed-in user`}>
+`global.headers.Authorization` overrides whatever the SDK's own auth state would otherwise send — `setSession()` genuinely updates the client's internal session (`getUser()` reflects it correctly), but every PostgREST request still carries the frozen header from construction, not the new session's token.
+</SpotTheBug>
+
+Proof — a table with a row visible only to its owner via RLS, requested through a client whose `global.headers.Authorization` was frozen to the `anon` key at construction, immediately after a real `setSession()` for that row's actual owner:
+
+```text
+setSession(alice) resolved. client.auth.getUser(): rd-alice@example.com   <- SDK's own state IS alice
+
+rows visible through global.headers-frozen client: []                     <- but PostgREST still saw anon
+rows visible through a normal client (no global.headers): [{"user_id":"f8cd...","secret":"alice-only-secret"}]
+```
+
+Same `setSession()` call, same row, same RLS policy — the only difference is whether `global.headers` was set at construction. `getUser()` reporting the right identity does not mean requests are actually using it.
+
+**The fix:** do not combine `global.headers.Authorization` with `auth.setSession()` on the same client — pick one mechanism. If per-request auth is genuinely needed, construct a fresh client (or use `.auth.setSession()` alone, with no `global.headers` override).
+
+**How to spot it in review:** a client constructed with `global: { headers: { Authorization: ... } } }` anywhere near a later `setSession()`, `signInWithPassword()`, or any other call that assumes the client's request identity changed.
+
+## Edge functions
+
+### 16. A bare specifier import
+
+The single most common way AI-generated Edge Function code breaks: importing a package the way you would in a Node.js or Vite project. Deno has no `node_modules`-style bare-specifier resolution — every import is a relative path, a full URL, or a `jsr:`/`npm:` registry specifier.
+
+```ts
+// supabase/functions/rd-bare-import/index.ts — @expect-error worker fails to boot: bare specifiers are not resolvable in Deno
+import { createClient } from '@supabase/supabase-js'
+
+Deno.serve((_req) => {
+  const client = createClient('http://x', 'y')
+  return new Response(JSON.stringify({ ok: !!client }))
+})
+```
+
+Proof — deployed as-is under `supabase functions serve`, every request returns a real `503`, freshly captured against this module's own temporary function:
+
+```text
+$ curl "$FUNCTIONS_URL/rd-bare-import" -H "Authorization: Bearer $ANON_KEY" -H "apikey: $ANON_KEY"
+{"code":"BOOT_ERROR","message":"Worker failed to boot (please check logs)"}
+HTTP=503
+
+worker boot error: failed to bootstrap runtime: failed to create the graph: Relative import path "@supabase/supabase-js" not prefixed with / or ./ or ../
+  hint: If you want to use a JSR or npm package, try running `deno add jsr:@supabase/supabase-js` or `deno add npm:@supabase/supabase-js`
+    at file:///.../supabase/functions/rd-bare-import/index.ts:1:30
+```
+
+**The fix:**
+
+```ts
+// supabase/functions/rd-import-fixed/index.ts
+import { createClient } from 'jsr:@supabase/supabase-js@2'
+
+Deno.serve((_req) => {
+  const client = createClient('http://x', 'y')
+  return new Response(JSON.stringify({ ok: !!client }))
+})
+```
+
+**How to spot it in review:** any `import ... from '@scope/pkg'` or `'pkg'` inside `supabase/functions/**/index.ts` with no `jsr:`/`npm:`/relative prefix — `tsc` will not catch this (it is not even run against edge functions), only `deno check` catches it before deploy.
+
+### 17. An edge function initialized with `SUPABASE_ANON_KEY`, assumed to bypass RLS
+
+Server-side code "should" bypass RLS — that intuition is correct for `service_role`, and wrong for `anon`. An edge function is just another PostgREST caller; the key it hands `createClient()` decides which role it is.
+
+<SpotTheBug lang="ts" code={`// supabase/functions/rd-anon-rls/index.ts
+import { createClient } from 'jsr:@supabase/supabase-js@2'
+
+Deno.serve(async (_req) => {
+  const client = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_ANON_KEY')!,
+  )
+  const { data, error } = await client.from('secrets').select('*')
+  return new Response(JSON.stringify({ data, error }))
+})`}>
+"This runs on the server, so it must bypass RLS" is the exact assumption that fails here — `SUPABASE_ANON_KEY` inside an edge function is scoped identically to `SUPABASE_ANON_KEY` from any browser: RLS applies in full. Only `SUPABASE_SERVICE_ROLE_KEY` actually bypasses it.
+</SpotTheBug>
+
+Proof — an edge function reading a table whose only row is scoped to a specific user's `auth.uid()` via RLS, called with the real `ANON_KEY`:
+
+```text
+$ curl "$FUNCTIONS_URL/rd-anon-rls" -H "Authorization: Bearer $ANON_KEY" -H "apikey: $ANON_KEY"
+{"data":[],"error":null}
+HTTP=200
+```
+
+No error — `{data: [], error: null}` is exactly what an anon caller of the exact same table gets outside any edge function too. Running inside a function changed nothing about which rows are visible.
+
+**The fix:** use `SUPABASE_SERVICE_ROLE_KEY` specifically when the function's job requires bypassing RLS (an admin operation, a webhook receiver acting on behalf of the system) — and keep using the caller's own forwarded JWT (via `Authorization` header passthrough) when the function should act *as* the calling user, respecting RLS exactly as intended.
+
+**How to spot it in review:** which key `createClient()` receives inside an edge function, cross-referenced against whether the function's job actually requires bypassing RLS or should respect it.
+
+### 18. A secret in `supabase/functions/<name>/.env`, not `.env.local`
+
+The CLI's own scaffolded `.gitignore` under `supabase/` only excludes `.env.local` and `.env.*.local` (plus dotenvx's `.env.keys`) — a plain `.env` file sitting next to an edge function is not covered by it at all.
+
+```text
+# tools/probe/supabase/.gitignore (this exact CLI's own scaffold, verbatim)
+# Supabase
+.branches
+.temp
+
+# dotenvx
+.env.keys
+.env.local
+.env.*.local
+```
+
+A `supabase/functions/rd-secrets/.env` (no `.local` suffix — the exact filename a quick `supabase functions serve --env-file .env` invocation encourages) is not matched by any line in this file. `git add .` picks it up like any other tracked source file.
+
+**The fix:** name the local secrets file with the `.local` suffix this `.gitignore` actually protects (`.env.local`), or use `supabase secrets set` for anything deployed, never a committed file at all.
+
+**How to spot it in review:** `git status` (or `git log -p` on a suspect commit) for any file under `supabase/functions/**/.env` without a `.local` suffix — the CLI's default `.gitignore` will not have caught it.
+
+## Realtime
+
+### 19. Subscribing to a table never added to the `supabase_realtime` publication
+
+A `postgres_changes` subscription can be syntactically perfect, `SUBSCRIBED` status and all, and still never receive a single event — because the table it targets was never added to the publication Realtime actually watches.
+
+<SpotTheBug lang="ts" code={`supabase
+  .channel('items-changes')
+  .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'items' }, (payload) => {
+    console.log('new item:', payload.new)
+  })
+  .subscribe()`}>
+`CREATE TABLE` does not add a table to any publication — `supabase_realtime` is a specific, named publication that a table must be explicitly added to (`alter publication supabase_realtime add table public.items;`). Without that, this subscription reaches `SUBSCRIBED` with no error and then simply never fires, for any row, ever.
+</SpotTheBug>
+
+Proof — a real insert, before and after the table is added to the publication, same channel code both times:
+
+```text
+subscribe status: SUBSCRIBED
+table NOT in supabase_realtime publication -- event received? false
+
+$ psql -c "alter publication supabase_realtime add table public.rd_rt_items;"
+ALTER PUBLICATION
+
+subscribe status: SUBSCRIBED
+table IS in supabase_realtime publication -- event received: {"id":2,"label":"after-publication","created_at":"2026-09-29T07:54:14.388207+00:00"}
+```
+
+Identical client code, identical insert — the only difference is publication membership.
+
+**The fix:** `alter publication supabase_realtime add table public.<table>;` for every table any `postgres_changes` subscription targets — and treat `select * from pg_publication_tables where pubname = 'supabase_realtime'` as a real pre-flight check, covered in **[Verification Tools](/supabase/en/reading-supabase/verification-tools/)**.
+
+**How to spot it in review:** any `.on('postgres_changes', ...)` call, cross-checked against the migration history for a matching `alter publication supabase_realtime add table`.
+
+### 20. A private channel with no matching `realtime.messages` policy
+
+A channel marked `private: true` routes its authorization through Row Level Security on the real `realtime.messages` table — exactly like any other Postgres table, with the exact same consequence for a missing policy: the request is denied, not defaulted to allowed.
+
+<SpotTheBug lang="ts" code={`const channel = supabase.channel('room-42', { config: { private: true } })
+channel.subscribe((status) => console.log(status))
+// no policy was ever written on realtime.messages for this topic`}>
+No `create policy ... on realtime.messages ... using (realtime.topic() = 'room-42')` exists anywhere. RLS on `realtime.messages` denies by default, exactly like any other table with no policies — the subscription does not silently degrade to "public," it is rejected outright.
+</SpotTheBug>
+
+Proof — a real, authenticated client, subscribing to a private channel with no matching policy for its topic:
+
+```text
+private channel, NO matching realtime.messages policy for this topic: {"status":"CHANNEL_ERROR","err":"Unauthorized: You do not have permissions to read from this Channel topic: rd-private-demo"}
+```
+
+After adding the matching policy:
+
+```sql
+create policy rd_private_demo_read on realtime.messages for select
+  using ( realtime.topic() = 'rd-private-demo' );
+```
+
+```text
+private channel, WITH a matching realtime.messages policy for this topic: {"status":"SUBSCRIBED"}
+```
+
+Identical client code, identical topic — only the policy's presence changed the outcome.
+
+**The fix:** every private channel topic needs its own `select` (and, for broadcasting into it, `insert`) policy on `realtime.messages`, scoped with `realtime.topic() = '<exact topic>'` — the same RLS habits from the Schema & RLS group apply here without modification.
+
+**How to spot it in review:** any `channel(..., { config: { private: true } })`, cross-checked against `pg_policies` filtered to `schemaname = 'realtime'` for a policy whose `qual`/`with_check` actually matches that topic.
+
+### 21. `REPLICA IDENTITY` left at its default — `old` silently shrinks or disappears
+
+Realtime's `UPDATE`/`DELETE` payloads only carry a full previous row when the table's `REPLICA IDENTITY` is `FULL`. Left at Postgres's default (`d`, primary key only), the `old` payload is not "just the primary key" as many assume — for this course's own local stack, it was `null` entirely for the update path, until `FULL` was set.
+
+<SpotTheBug lang="ts" code={`.on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'items' }, (payload) => {
+  const previousLabel = payload.old.label  // assumes payload.old always has every column
+  console.log(\`changed from \${previousLabel} to \${payload.new.label}\`)
+})`}>
+`REPLICA IDENTITY DEFAULT` (Postgres's actual default) does not guarantee `payload.old` carries every column your code might read — on this exact stack, a plain `REPLICA IDENTITY DEFAULT` update event's `old` payload only had the primary key column, and reading `.label` off it returned `undefined`, not the previous value.
+</SpotTheBug>
+
+Proof — the identical `UPDATE`, same row, same subscription code, `REPLICA IDENTITY` toggled between runs:
+
+```text
+REPLICA IDENTITY DEFAULT -- payload.old: {"id":1}
+REPLICA IDENTITY FULL    -- payload.old: {"id":1,"label":"before-publication","created_at":"2026-09-29T07:54:04.090217+00:00"}
+```
+
+`relreplident` confirmed `d` (default) and `f` (full) respectively via `pg_class` immediately before each run.
+
+**The fix:** `alter table public.<table> replica identity full;` for any table whose Realtime consumers need the previous row's non-key columns — with the real, documented storage cost (Postgres logs the full old row to WAL on every update) weighed against that need.
+
+**How to spot it in review:** any `payload.old.<column>` read where `<column>` is not the primary key, cross-checked against `select relreplident from pg_class where oid = '<table>'::regclass` (`f` required, not `d`).
+
+## Storage
+
+### 22. A storage policy checking `bucket_id` but not the folder
+
+`storage.foldername(name)` splits an object's path into its folder segments — a policy that only checks `bucket_id` grants write access to every folder in the bucket, not just the caller's own, because nothing about `bucket_id` alone is scoped to a user at all.
+
+<SpotTheBug lang="sql" code={`create policy avatars_insert on storage.objects
+  for insert
+  with check ( bucket_id = 'avatars' );`}>
+This checks which **bucket** the object goes into, never which **folder** — every authenticated user can write to every other user's folder inside the same bucket, because `bucket_id = 'avatars'` is true for literally every object path in that bucket, regardless of whose folder it names.
+</SpotTheBug>
+
+Proof — Bob writes directly into Alice's folder, with only this bucket-scoped policy in place:
+
+```text
+$ curl -X POST "$API_URL/storage/v1/object/rd-bucket/f8cd7f9e-6dd4-482a-888b-b92184c98d07/hijacked-by-bob.txt" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $BOB_TOKEN" --data-binary "bob was here"
+{"Key":"rd-bucket/f8cd7f9e-6dd4-482a-888b-b92184c98d07/hijacked-by-bob.txt","Id":"ef40f8f2-550e-4700-ae32-edc2f40a53a5"}
+HTTP=200
+
+-- confirmed server-side:
+name: f8cd7f9e-6dd4-482a-888b-b92184c98d07/hijacked-by-bob.txt | owner: 9a640d7b-81ed-496c-93c0-b7a6e33198da  <- Bob's id, in Alice's folder
+```
+
+**The fix**, verified to deny the identical attempt:
+
+```sql
+create policy avatars_insert on storage.objects
+  for insert
+  with check (
+    bucket_id = 'avatars'
+    and (storage.foldername(name))[1] = (select auth.uid())::text
+  );
+```
+
+```text
+$ curl -X POST ".../rd-bucket/f8cd7f9e-.../hijacked-again.txt" -H "Authorization: Bearer $BOB_TOKEN" ...
+{"statusCode":"403","error":"Unauthorized","message":"new row violates row-level security policy","code":"AccessDenied"}
+HTTP=400
+```
+
+**How to spot it in review:** any storage policy on `storage.objects` whose `with check`/`using` mentions `bucket_id` but never `(storage.foldername(name))[1]` (or an equivalent per-user path scope).
+
+### 23. `upsert: true` with insert and update policies, but no `select` policy
+
+Storage's upsert path checks whether the object already exists **before** deciding to insert or update — that existence check is a `select` under the hood, and Row Level Security applies to it exactly like any other `select`.
+
+<SpotTheBug lang="ts" code={`// insert + update policies exist and are correctly scoped -- select was never added,
+// "select isn't needed, we're only ever writing" seemed reasonable
+await supabase.storage.from('avatars').upload(\`\${userId}/photo.jpg\`, file, { upsert: true })`}>
+"We only ever write, so we only need insert/update policies" is the exact assumption that breaks `upsert: true` specifically — its existence check requires `select`, and a missing `select` policy fails that check even when insert and update are both correctly scoped to the caller's own folder.
+</SpotTheBug>
+
+Proof — insert and update policies exist and are correctly scoped, no select policy, real `upsert: true` on a brand-new object:
+
+```text
+$ curl -X POST ".../rd-bucket2/f8cd.../note.txt" -H "x-upsert: true" -H "Authorization: Bearer $ALICE_TOKEN" ...
+{"statusCode":"403","error":"Unauthorized","message":"new row violates row-level security policy","code":"AccessDenied"}
+HTTP=400
+
+# control: the SAME upload, upsert:false (plain insert) -- succeeds, no select needed:
+{"Key":"rd-bucket2/f8cd.../note2.txt","Id":"470e125a-ae36-4040-8d69-4a77b834881b"}
+HTTP=200
+```
+
+Plain insert (`upsert: false`) succeeded with the exact same insert/update-only policy set — only the `upsert: true` path needs `select`.
+
+**The fix:** add the missing select policy, scoped identically to insert/update:
+
+```sql
+create policy avatars_select on storage.objects for select
+  using ( bucket_id = 'rd-bucket2' and (storage.foldername(name))[1] = (select auth.uid())::text );
+```
+
+```text
+# retry the ORIGINAL upsert:true call, now succeeds:
+{"Key":"rd-bucket2/f8cd.../note.txt","Id":"1d59e5d9-a4fa-4c7b-baa2-7bc2ad93647c"}
+HTTP=200
+```
+
+**How to spot it in review:** any `.upload(..., { upsert: true })` call, cross-checked against whether the target bucket's policies include `select` in addition to `insert`/`update` — insert-only or update-only policy sets are a real, common gap specifically on the upsert path.
+
+### 24. A signed URL treated as if it never expires
+
+`createSignedUrl()`'s `expiresIn` is enforced server-side as a real JWT expiry claim on the signed token embedded in the URL — not a client-side convention, and not indefinitely cacheable.
+
+```ts
+// src/rd-24-signed-url-cached.ts
+import { createClient } from '@supabase/supabase-js'
+
+const supabase = createClient('http://127.0.0.1:55321', 'anon-key-placeholder')
+const path = 'rd-bucket2/00000000-0000-0000-0000-000000000000/photo.jpg'
+
+const { data } = await supabase.storage.from('avatars').createSignedUrl(path, 60)
+// cached and reused far longer than 60 seconds by the calling code
+console.log(data?.signedUrl)
+```
+
+Proof — the identical signed URL, fetched immediately and again after its `expiresIn` window:
+
+```text
+$ curl -o /dev/null -w "HTTP=%{http_code}\n" "$API_URL/storage/v1/object/sign/rd-bucket2/...?token=..."   # immediately
+HTTP=200
+
+# 4s later, expiresIn was 2s:
+{"statusCode":"400","error":"InvalidJWT","message":"\"exp\" claim timestamp check failed","code":"InvalidJWT"}
+HTTP=400
+```
+
+**The fix:** treat `expiresIn` as a real deadline — request a fresh signed URL when it's needed, don't cache one past its window; size `expiresIn` to the actual use case (a single download link vs. an embedded, reusable image source need very different values).
+
+**How to spot it in review:** a signed URL stored in application state, a database column, or any cache with a TTL longer than the `expiresIn` it was created with.
+
+## Ops & pooling
+
+### 25. `service_role` shipped to a client
+
+The most consequential single leak in this catalog: `service_role` bypasses Row Level Security entirely — every policy every earlier group in this catalog is about becomes irrelevant the moment a request carries this key.
+
+```ts
+// a client-side bundle -- browser devtools can read this constant directly
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+```
+
+Proof — the identical query, `anon` vs `service_role`, against a table whose only row is RLS-scoped to one specific user:
+
+```text
+# anon key -- RLS enforced, sees nothing (no session/auth.uid()):
+[]
+HTTP=200
+
+# service_role key -- bypasses RLS entirely, sees every row regardless of owner:
+[{"user_id":"f8cd7f9e-6dd4-482a-888b-b92184c98d07","secret":"alice-only-secret"}]
+HTTP=200
+```
+
+No signature, no scope restriction distinguishes these two keys from the response shape alone — the difference is entirely about which key made the call, and there is no technical control (short of never sending it to a client at all) that stops a browser from reading a constant baked into its own bundle.
+
+**The fix:** `service_role` only ever runs server-side — an edge function, a backend process, a CI job — never in any code that ships to a browser or a mobile app bundle. If elevated access is genuinely needed from client code, write a narrowly-scoped RPC function instead, called with the caller's own `anon`/`authenticated` key.
+
+**How to spot it in review:** grep any client-side bundle, any file under a frontend framework's `src/`, or any public repo for `SERVICE_ROLE_KEY`/`SUPABASE_SERVICE_ROLE_KEY` — its mere presence outside a server-only context is the finding, independent of whether it was "used" yet.
+
+### 26. Named prepared statements through a transaction-mode pooler
+
+Supavisor's transaction mode hands a client a backend Postgres connection only for the duration of one transaction, then returns it to the pool — a later transaction from the same logical client can land on a completely different backend. A driver that prepares named statements by default (the `postgres` npm package does, unless told otherwise) can reference a statement that simply does not exist on whichever backend a later query happens to land on.
+
+```ts
+// broken by default: prepare defaults to true against a transaction-mode pooler
+import postgres from 'npm:postgres@3'
+const sql = postgres(Deno.env.get('PG_POOLER_URL')!)
+```
+
+Per the [official troubleshooting guide](https://github.com/supabase/supabase/blob/master/apps/docs/content/troubleshooting/disabling-prepared-statements-qL8lEL.mdx): *"although the direct connections and Supavisor in session mode support prepared statements, Supavisor in transaction mode does not."*
+
+<Callout title="Honest gap: not reproduced under this local, low-concurrency test">
+Forcing the actual `prepared statement "..." does not exist` error against this module's own local pooler did not reproduce it — a single client on a lightly loaded local pool kept landing on the same backend connection every time (confirmed via `pg_backend_pid()`, identical across a `PREPARE` in one transaction and an `EXECUTE` in a later, separate one). This matches an identical, independently-reached finding already recorded in this course's own **[Edge Functions and the Database](/supabase/en/edge-functions/edge-functions-and-the-database/)** lesson. The mechanism and the fix are real and doc-sourced above — reproducing the failure needs genuine concurrent connection churn this local, single-client test does not generate, stated honestly rather than staged.
+</Callout>
+
+**The fix:** `postgres(url, { prepare: false })` against any transaction-mode pooler connection string — matching Prisma's own documented `?pgbouncer=true` flag for the identical underlying reason.
+
+**How to spot it in review:** any `postgres()`/driver connection string pointed at a `:6543`-style transaction-mode pooler port with no `prepare: false` (or the driver's equivalent) set explicitly.
+
+### 27. `pg_net` treated as a synchronous call
+
+`pg_net`'s `net.http_get`/`net.http_post` return a request id **immediately** — the actual HTTP call happens on a background worker, and the response lands in `net._http_response` some (usually short, never guaranteed) time later.
+
+<SpotTheBug lang="sql" code={`select net.http_post('https://api.example.com/webhook', body := payload) as request_id \\gset
+-- immediately assumes the response is already available
+select status_code from net._http_response where id = :request_id;`}>
+`net.http_post` is fire-and-forget by design — it returns a request id, not a response. Reading `net._http_response` in the very next statement races the background worker that actually performs the HTTP call; the row is very often not there yet, and code that assumes it is treats "no row" as "no response ever came" instead of "hasn't arrived yet."
+</SpotTheBug>
+
+Proof — the identical request id, queried immediately and again after a short wait:
+
+```text
+select net.http_get('http://kong:8000/rest/v1/rd_profiles?select=id&limit=1', headers := ...) as request_id;
+--  request_id
+-- ------------
+--           5
+
+-- immediately after:
+select id, status_code, content from net._http_response where id = 5;
+ id | status_code | content
+----+-------------+---------
+(0 rows)
+
+-- ~2s later:
+ id | status_code |                     content
+----+-------------+-------------------------------------------------
+  5 |         200 | [{"id":"f8cd7f9e-6dd4-482a-888b-b92184c98d07"}]
+```
+
+Zero rows immediately after the call, a real `200` with a real body moments later — the exact same request id, the exact same table.
+
+**The fix:** poll `net._http_response` (with a real timeout and backoff) for a fire-and-forget webhook whose result matters, or use `net.http_collect_response()` where a bounded wait is acceptable — never assume the response row exists in the same transaction, or even the same statement, that issued the request.
+
+**How to spot it in review:** any `select ... from net._http_response where id = <the id just returned>` with no wait, no retry loop, and no handling for "the row is not there yet" as a distinct case from "the request failed."
+
+## Mental Model
+
+```text
+Eight groups, one shared failure shape:
+
+Schema & migrations -> a stale assumption (extension, FK behavior, generated types) that
+                        compiles and runs cleanly until the ONE moment it doesn't
+RLS & roles          -> syntactically perfect SQL that grants the wrong thing, silently
+Auth & sessions      -> a value that LOOKS like verified identity but was only decoded
+Client calls         -> {data, error} is real, and skipping error deletes the only signal
+Edge functions       -> Deno, not Node -- and which of 3 keys initializes the client
+Realtime             -> a prerequisite (publication, replica identity, a policy) nothing
+                        else in the code enforces or even mentions
+Storage              -> RLS on storage.objects, same habits as any other table, plus two
+                        upsert/folder-specific gotchas nothing else warns about
+Ops & pooling         -> which key, whether prepare:false, whether a call is actually async
+
+Across all 27: Postgres, PostgREST, tsc, and deno check validate syntax and types.
+None of them validate intent. "It compiled" and "it ran once without an error" answer
+almost none of these -- the single most common failure IS a clean 200 with no data.
+```
+
+## Common Misconceptions
+
+- **"If a query returns `200`, it did what I meant it to do."** Disproven repeatedly: RLS-enabled-zero-policies, a table missing from `supabase_realtime`, and `service_role` masking a broken policy all return a clean, error-free `200` — success at the transport layer says nothing about correctness.
+- **"Server-side code always bypasses RLS."** True for `service_role`, false for `anon` — and an edge function using `SUPABASE_ANON_KEY` is scoped identically to a browser using the same key, proven directly in entry 17.
+- **"A compiler or linter would catch this if it were really a problem."** `tsc` and `deno check` both validate types and module resolution, never intent — `using (true)` with no `with check`, a `security definer` function with no `search_path`, and a table with zero RLS policies are all syntactically perfect to every tool in this stack.
+- **"AI-generated Supabase code just needs a newer training cutoff."** The problem is not staleness alone: `uuid_generate_v4()`, `using (true)`, and a bare edge-function import are all real, current, syntactically valid patterns that simply do not mean what a lot of training data implies they mean in this specific stack.
+
+<Callout title="The one-line takeaway">
+27 patterns, one recurring shape: Postgres, PostgREST, `tsc`, and `deno check` all validate syntax and types, never intent — and the single most common failure in this catalog is code that returns real data with `service_role` and a clean, error-free, empty result with anyone else.
+</Callout>
+
+export const quizAiBugCatalog = [
+  {
+    q: "Why does entry 5's fix return HTTP 200 with an empty array, rather than 403, when Alice retries the same row-hijack PATCH against the corrected policy?",
+    options: [
+      "Because the fix disabled RLS entirely",
+      "Because the corrected using clause now filters the row out of what Alice can even see for update -- PostgREST reports \"0 rows matched\" as a successful request with no matching rows, not an authorization error",
+      "Because PostgREST always returns 200 regardless of RLS",
+      "Because the row was deleted",
+    ],
+    answer: 1,
+    explain: "Proved directly: the same PATCH request against the fixed using(user_id = (select auth.uid())) policy returns [] with HTTP 200 -- the row genuinely is not visible to Alice for an update operation anymore, which PostgREST reports as zero rows affected, not a 403.",
+  },
+  {
+    q: "```text\nsetSession(alice) resolved. client.auth.getUser(): rd-alice@example.com\nrows visible through global.headers-frozen client: []\n```\nGiven this real output from entry 15, why does `getUser()` correctly report Alice's identity while the actual data request still returns nothing?",
+    options: [
+      "getUser() is broken and returned the wrong result",
+      "getUser() reads the SDK's own internal session state (correctly updated by setSession), while the actual PostgREST request still carries the Authorization header frozen into global.headers at client construction -- two independent code paths that diverged",
+      "The row was deleted between the two calls",
+      "global.headers only affects storage, not the database",
+    ],
+    answer: 1,
+    explain: "Proved directly: a normal client (no global.headers override) given the identical setSession() call returns the real row -- the frozen header, not setSession() itself, is what caused the empty result.",
+  },
+  {
+    q: "Why does this catalog treat a missing select policy on a storage bucket as a real bug specifically for upsert:true uploads, even when insert and update policies are both correctly scoped?",
+    options: [
+      "upsert:true always fails regardless of policies",
+      "Storage's upsert path performs an existence check (a SELECT) before deciding whether to insert or update, and RLS applies to that check exactly like any other select -- proved: the identical upload with upsert:false (no existence check needed) succeeds with the same policy set",
+      "select policies are required for all storage operations, not just upsert",
+      "This is a bug in Supabase's Storage API, not a policy gap",
+    ],
+    answer: 1,
+    explain: "Proved directly in entry 23: the exact same object path, upsert:true fails 403 with only insert+update policies; upsert:false (plain insert) succeeds with the identical policy set; adding a matching select policy fixes the upsert:true case.",
+  },
+  {
+    q: "Entry 7's security definer proof changes which single setting between the broken and fixed function -- what is it, and why does an attacker's own search_path matter even though they were never granted access to the real table's schema?",
+    options: [
+      "The function's return type",
+      "set search_path = '' -- without it, an unqualified table reference inside a security definer function resolves using the CALLER's session search_path at call time, not the function owner's, so an attacker who can set their own search_path can redirect it to their own table",
+      "The language the function is written in",
+      "Whether the function is marked stable or volatile",
+    ],
+    answer: 1,
+    explain: "Proved directly: the identical function body, called under an attacker search_path of 'rd_evil, public', returns the attacker's planted fake secret without search_path='' and the real one with it -- the caller's own search_path, not any grant, decided which table the unqualified reference resolved to.",
+  },
+  {
+    q: "Why does entry 26 present its prepared-statement bug with an explicit 'not reproduced locally' callout instead of a live failing proof, and why is that still a legitimate catalog entry?",
+    options: [
+      "Because the bug does not actually exist",
+      "Because forcing Supavisor transaction-mode's backend-reassignment failure needs genuine concurrent connection churn that a single low-concurrency local client did not generate -- the mechanism and fix are still real and doc-sourced, and this course's own harness rule requires saying so honestly rather than staging a fake failure",
+      "Because prepared statements are deprecated",
+      "Because the local stack does not have a pooler at all",
+    ],
+    answer: 1,
+    explain: "Stated directly in entry 26: pg_backend_pid() stayed identical across a PREPARE and a later EXECUTE in this exact low-concurrency test, matching this course's own independently-reached finding in Edge Functions and the Database -- honest non-reproduction, with the mechanism quoted from Supabase's own troubleshooting docs, over a staged result.",
+  },
+];
+
+<Quiz client:visible id="reading-supabase/ai-bug-catalog" questions={quizAiBugCatalog} />
+
+<ProgressTracker client:visible id="reading-supabase/ai-bug-catalog" />

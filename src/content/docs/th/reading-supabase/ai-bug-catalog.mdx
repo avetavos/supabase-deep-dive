@@ -1,0 +1,1049 @@
+---
+title: AI bug catalog
+description: 'บั๊ก 27 แบบที่โค้ด Supabase ซึ่ง AI สร้างมักพลาดซ้ำ ๆ -- โค้ดที่ AI มักเขียน เหตุผลว่าทำไมผิด ผลลัพธ์จริงที่จับสด ๆ กับ local stack ของโมดูลนี้เอง และวิธีแก้'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+ทุกตัวอย่างด้านล่างถูกเขียนให้เหมือนโค้ดที่ AI assistant สร้างจริง ๆ -- SQL ที่คล่องปาก, `supabase-js` ที่ดูน่าเชื่อถือ, edge function ที่สมจริง -- แล้วรันจริงกับ namespace ของโมดูลนี้เอง (table/function ที่ขึ้นต้น `rd_`, bucket/function ที่ขึ้นต้น `rd-`, test user `rd-<name>@example.com`) บน local stack ที่คอร์สนี้แชร์กันตัวเดียว สด ๆ วันนี้ ผลลัพธ์ที่ quote ด้านล่างคัดลอกมาตรง ๆ จากการรันจริงเหล่านั้น ไม่ได้สร้างขึ้นจากความจำหรือยกมาจากบทก่อนหน้า -- แม้แต่ข้อเท็จจริงที่พิสูจน์ไว้แล้วใน Phase 3 ก็ถูกพิสูจน์ซ้ำที่นี่ สด ๆ กับ namespace นี้โดยเฉพาะ จัดกลุ่มแบบเดียวกับ **[How to read Supabase code you did not write](/supabase/th/reading-supabase/)** และ **[Review Checklist](/supabase/th/reading-supabase/review-checklist/)** ที่ตามมาหลังบทนี้
+
+## Schema & migrations
+
+### 1. `uuid_generate_v4()` แทนที่จะเป็น `gen_random_uuid()`
+
+training data ของ AI ครอบคลุม tutorial Supabase หลายปีที่มาก่อน `gen_random_uuid()` จะถูกฝังเข้า core Postgres -- สัดส่วนใหญ่ยังคงใช้ `uuid_generate_v4()` ของ extension `uuid-ossp` เป็น default ซึ่งต้องถูกติดตั้งและอยู่ใน `search_path` ของ schema ถึงจะ resolve ได้
+
+<SpotTheBug lang="sql" code={`create table public.widgets (
+  id uuid primary key default uuid_generate_v4(),
+  name text not null
+);`}>
+`uuid_generate_v4()` ต้องพึ่ง extension `uuid-ossp` ที่ถูกติดตั้งแล้ว **และ** schema ของมันอยู่ใน `search_path` -- ไม่มีอะไรรับประกันทั้งสองอย่างนี้บนโปรเจกต์ใหม่, schema ใหม่ หรือ database CI ที่ตัดทอนแล้ว `gen_random_uuid()` เป็นส่วนหนึ่งของ core Postgres มาตั้งแต่ v13 (ไม่ต้องมี extension ไม่ต้องพึ่ง schema) และทำงานแบบเดียวกันเป๊ะ
+</SpotTheBug>
+
+พิสูจน์ -- schema ที่ไม่มี extension ติดตั้งเลย ตรงกับ schema แคบ ๆ ที่สร้างใหม่จริง:
+
+```sql
+-- @expect-error function uuid_generate_v4() does not exist
+create schema rd_no_ext;
+set search_path to rd_no_ext;
+select uuid_generate_v4();
+```
+
+```text
+ERROR:  function uuid_generate_v4() does not exist
+LINE 1: select uuid_generate_v4();
+               ^
+HINT:  No function matches the given name and argument types. You might need to add explicit type casts.
+```
+
+`gen_random_uuid()` ไม่ต้องการอะไรเพิ่ม:
+
+```sql
+select gen_random_uuid() as core_builtin;
+--            core_builtin
+-- --------------------------------------
+--  60d48be5-b4bc-426b-8e75-2464ac05b273
+```
+
+**วิธีแก้:** ตั้ง default ของทุก primary key เป็น `gen_random_uuid()` ไม่ใช่ `uuid_generate_v4()` -- output รูปแบบเดียวกันเป๊ะ แต่ไม่ต้องพึ่ง extension เลย
+
+**วิธีสังเกตตอน review:** grep ทุก migration หา `uuid_generate_v4()` -- ถ้า `create extension "uuid-ossp"` ไม่อยู่ใน migration เดียวกัน (หรือ migration ก่อนหน้าที่ยัง apply อยู่) default นี้จะพังทันทีที่ table ถูกสร้างกับ database ที่ไม่ได้มี extension นี้อยู่แล้วพอดี
+
+### 2. ไม่มี `on delete cascade` บน FK ของ profile
+
+table `profiles` ที่ key ไปยัง `auth.users(id)` เป็น pattern ที่ AI สร้างให้กับโปรเจกต์ Supabase บ่อยที่สุดแบบหนึ่ง -- และแทบทุกครั้งจะทิ้ง delete behavior ของ foreign key ไว้ที่ default จริงของ Postgres ซึ่งไม่ใช่ "cascade" แต่คือ "block"
+
+<SpotTheBug lang="sql" code={`create table public.profiles (
+  id uuid primary key references auth.users(id),
+  display_name text not null
+);`}>
+ไม่มี `on delete cascade` (หรือ `on delete set null`) หมายความว่า default `no action` มีผล: การลบ row ของ `auth.users` ที่ profile นี้อ้างถึง -- วิธีปกติที่ account จะถูกลบ ผ่าน `supabase.auth.admin.deleteUser()` -- ถูกบล็อกตรง ๆ ด้วย foreign key violation ไม่ใช่ถูกข้ามแบบเงียบ ๆ account นี้จะไม่มีวันถูกลบได้ตราบใดที่ row profile ของมันยังอยู่
+</SpotTheBug>
+
+พิสูจน์ -- ลบ user ที่ FK ของ profile ไม่มี cascade:
+
+```sql
+-- @expect-error update or delete on table "users" violates foreign key constraint "rd_profiles_id_fkey" on table "rd_profiles"
+delete from auth.users where id = '9a640d7b-81ed-496c-93c0-b7a6e33198da';
+```
+
+```text
+ERROR:  update or delete on table "users" violates foreign key constraint "rd_profiles_id_fkey" on table "rd_profiles"
+DETAIL:  Key (id)=(9a640d7b-81ed-496c-93c0-b7a6e33198da) is still referenced from table "rd_profiles".
+```
+
+**วิธีแก้** ที่ยืนยันแล้วว่า cascade จริง:
+
+```sql
+alter table public.profiles drop constraint profiles_id_fkey;
+alter table public.profiles add constraint profiles_id_fkey
+  foreign key (id) references auth.users(id) on delete cascade;
+-- delete from auth.users where id = '...' now succeeds, and the profile row
+-- disappears with it: DELETE 1 / bob_profiles_left = 0, confirmed live.
+```
+
+**วิธีสังเกตตอน review:** `references auth.users(id)` ใด ๆ (หรือ FK ไหนก็ตามที่ควรเป็นเจ้าของ lifecycle ของ parent) ที่ไม่มี `on delete` clause -- ให้ตัดสินใจให้ชัดระหว่าง `cascade` กับ `set null` อย่าปล่อยไว้ที่ `no action` แบบ implicit
+
+### 3. `supabase gen types` drift -- `tsc` ผ่าน แต่ query จริงพัง
+
+คุณสมบัติที่อันตรายที่สุดของ generated types: มันอธิบาย schema **ณ ตอนที่ถูก generate** ไม่ใช่ schema ตอนนี้ การเปลี่ยนชื่อ column ระหว่างตอนนั้นกับตอนนี้ `tsc` มองไม่เห็นเลย แต่ Postgres เห็นชัดมาก
+
+```ts
+// src/widgets.ts
+import { createClient } from '@supabase/supabase-js'
+import type { Database } from '../database.types'
+
+const supabase = createClient<Database>('http://127.0.0.1:55321', 'anon-key-placeholder')
+
+async function bumpQty(id: string) {
+  const { data, error } = await supabase.from('rd_widgets').select('id, qty').eq('id', id)
+  return { data, error }
+}
+```
+
+พิสูจน์ -- จับสดตามลำดับนี้เป๊ะ บน table `rd_widgets` ของโมดูลนี้เอง:
+
+```text
+$ tsc --noEmit -p tsconfig.json          # ก่อน rename -- type ตรงกับ schema จริง
+exit=0
+
+$ psql -c "alter table public.rd_widgets rename column qty to quantity;"
+ALTER TABLE
+
+$ tsc --noEmit -p tsconfig.json          # หลัง rename -- database.types.ts เดิมที่ยังไม่ regenerate ผ่านเหมือนเดิม
+exit=0
+
+$ curl "$API_URL/rest/v1/rd_widgets?select=id,qty" -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY"
+{"code":"42703","details":null,"hint":null,"message":"column rd_widgets.qty does not exist"}
+```
+
+`tsc` ไม่เคยอ่าน database ใหม่เลย -- มันอ่านแค่ `database.types.ts` ไฟล์บน disk ที่ถูกต้องพอดีจนกว่าจะมี schema change ครั้งถัดไป query จริงพังด้วย Postgres `42703` จริงตลอดเวลาที่ `tsc` รายงานว่าสำเร็จ
+
+**วิธีแก้:** `supabase gen types typescript --local > database.types.ts` หลัง migration ที่แก้ชื่อ column **ทุกครั้ง** ก่อนจะเชื่อว่าผล `tsc` มีความหมายอะไร:
+
+```text
+$ supabase gen types typescript --local | grep -A4 rd_widgets
+      rd_widgets: {
+        Row: {
+          id: string
+          quantity: number
+        }
+```
+
+**วิธีสังเกตตอน review:** PR ที่เปลี่ยนชื่อ column แต่ไม่ regenerate และ commit `database.types.ts` ใน PR เดียวกัน -- `tsc` ผ่านไม่ใช่หลักฐานว่าทำแล้ว
+
+## RLS & roles
+
+### 4. policy แค่ `select` ไม่มี policy `insert`
+
+ช่องว่าง RLS ที่พบบ่อยที่สุด: table ได้ policy `select` (สิ่งแรกที่ทุกคนทดสอบ -- "อ่านข้อมูลของตัวเองกลับมาได้ไหม?") แล้วไม่มีอะไรอีกเลย เพราะไม่เคยลอง write ระหว่างพัฒนา
+
+<SpotTheBug lang="sql" code={`alter table public.posts enable row level security;
+
+create policy posts_select on public.posts
+  for select using (true);
+-- no insert policy was ever written`}>
+เมื่อเปิด RLS แล้วมีแค่ policy `select` ทุก `insert` จะถูกประเมินกับ policy แบบ permissive ที่ตรงกันศูนย์ตัว -- default ของ RLS ใน Postgres คือปฏิเสธ ไม่ใช่อนุญาต ดังนั้นการเขียนจะถูกปฏิเสธตรง ๆ ไม่ใช่ถูกเพิกเฉยแบบเงียบ ๆ
+</SpotTheBug>
+
+พิสูจน์ -- Alice user ที่ authenticate จริง ลอง insert row ของตัวเอง:
+
+```bash
+# scripts/reading-supabase/ai-bug-catalog/04-missing-insert-policy.sh
+curl -s -w "\nHTTP=%{http_code}\n" -X POST "$API_URL/rest/v1/rd_posts" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ALICE_TOKEN" \
+  -H "Content-Type: application/json" -H "Prefer: return=representation" \
+  -d '{"user_id":"f8cd7f9e-6dd4-482a-888b-b92184c98d07","title":"alice second post","body":"x"}'
+```
+
+```text
+{"code":"42501","details":null,"hint":null,"message":"new row violates row-level security policy for table \"rd_posts\""}
+HTTP=403
+```
+
+**วิธีแก้:** หนึ่ง policy ต่อคำสั่งที่ table นั้นต้องการจริง -- `for select`, `for insert`, `for update`, `for delete` เป็น grant ที่เป็นอิสระต่อกัน ไม่มีตัวไหนโยงมาจากตัวอื่นเอง
+
+**วิธีสังเกตตอน review:** นับคำสั่งที่โค้ด client เรียกกับ table นั้นจริง แล้วนับ policy บน table นั้น -- ต้องเท่ากัน `select policyname, cmd from pg_policies where tablename = 'posts'` ตอบคำถามนี้ได้ในคำสั่งเดียว มีอยู่ใน **[Verification Tools](/supabase/th/reading-supabase/verification-tools/)**
+
+### 5. `using (true)` บน `update` ไม่มี `with check` ชัดเจน
+
+เมื่อ `with check` ถูกละไว้บน policy `update` Postgres จะใช้ expression `using` ซ้ำสำหรับมันด้วย -- ดังนั้น `using (true)` แบบ permissive ที่ตั้งใจให้หมายถึง "ใครก็ตามอัปเดต row ของตัวเองได้ เดี๋ยวไป filter ในแอปเอง" กลับหมายถึง "ใครก็ตามอัปเดต row ไหนก็ได้ให้กลายเป็นรูปร่างอะไรก็ได้"
+
+<SpotTheBug lang="sql" code={`create policy posts_update on public.posts
+  for update using (true);
+-- no with check -- Postgres silently reuses using(true) for it too`}>
+สิ่งนี้ไม่ได้แค่ให้ใครก็ตามอัปเดต row ไหนก็ได้ -- มันให้ใครก็ตามเปลี่ยนเจ้าของ row ได้ทั้งหมด เพราะ `with check` (ที่ validate ผลลัพธ์ของการเขียน) ตอนนี้ permissive พอ ๆ กับ `using` (ที่แค่กรองว่า row ไหนมองเห็นได้สำหรับการ update) การขโมย row ของคนอื่นห่างแค่ `PATCH` เดียว
+</SpotTheBug>
+
+พิสูจน์ -- Alice โอน post ของ Bob มาเป็นของตัวเอง:
+
+```bash
+# scripts/reading-supabase/ai-bug-catalog/05-using-true-hijack.sh
+curl -s -w "\nHTTP=%{http_code}\n" -X PATCH "$API_URL/rest/v1/rd_posts?id=eq.282cdccb-21b8-4e5b-a9d3-0826c9b58d47" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ALICE_TOKEN" \
+  -H "Content-Type: application/json" -H "Prefer: return=representation" \
+  -d '{"user_id":"f8cd7f9e-6dd4-482a-888b-b92184c98d07","title":"stolen by alice"}'
+```
+
+```text
+[{"id":"282cdccb-21b8-4e5b-a9d3-0826c9b58d47","user_id":"f8cd7f9e-6dd4-482a-888b-b92184c98d07","title":"stolen by alice","body":"hello from bob","created_at":"2026-09-29T07:45:28.910907+00:00"}]
+HTTP=200
+```
+
+ยืนยันฝั่ง server: post ของ Bob -- `id` เดิมของ row -- ตอนนี้ `user_id` ถูกตั้งเป็น Alice แล้ว
+
+**วิธีแก้** ที่ยืนยันแล้วว่าปฏิเสธความพยายามเดิม:
+
+```sql
+drop policy posts_update on public.posts;
+create policy posts_update on public.posts
+  for update
+  using ( user_id = (select auth.uid()) )
+  with check ( user_id = (select auth.uid()) );
+```
+
+```text
+-- ยิง PATCH request เดิมซ้ำ กับ policy ที่แก้แล้ว:
+[]
+HTTP=200
+```
+
+สังเกตว่าฉบับแก้คืน `200` พร้อม **array ว่าง** ไม่ใช่ `403` -- row นั้นแค่ไม่ตรงกับ filter `using` ของ Alice อีกต่อไป ดังนั้น PostgREST รายงานว่า "ตรง 0 row" แทนที่จะเป็น authorization error ยืนยันฝั่ง server แล้วว่า row ไม่เปลี่ยน ยังเป็นของ Bob เหมือนเดิม
+
+**วิธีสังเกตตอน review:** policy `for update` (หรือ `for all`) ใด ๆ ที่มี clause `using` แต่ไม่มี `with check` -- เอกสารของ Postgres เองบอกชัดว่า `using` ถูกใช้ซ้ำสำหรับ `with check` เมื่อละไว้ และแทบไม่เคยเป็นพฤติกรรมที่ตั้งใจสำหรับ `update`
+
+### 6. `auth.uid()` ไม่ถูก wrap ด้วย `(select ...)`
+
+`auth.uid()` เป็นฟังก์ชัน `stable` ไม่ใช่ `immutable` -- Postgres มีอิสระที่จะเรียกมันครั้งละ row เว้นแต่ query plan จะรู้ว่าค่านั้นไม่เปลี่ยนระหว่าง scan การ wrap การเรียกด้วย subquery คือสิ่งที่ให้ hint นั้นกับ planner
+
+<SpotTheBug lang="sql" code={`create policy posts_select on public.posts_perf
+  for select using ( user_id = auth.uid() );`}>
+เขียนแบบนี้ `auth.uid()` ถูกประเมินเป็นส่วนหนึ่งของ row filter เอง ซ้ำแล้วซ้ำเล่า ครั้งละ row ที่ scan -- คำแนะนำอย่างเป็นทางการของ Supabase (`supabase.com/docs`) ยืนยันว่าการ wrap มันทำให้เกิด **InitPlan** ที่คำนวณครั้งเดียวแล้วนำกลับมาใช้ซ้ำแทน บน table เล็ก ๆ ความต่างมองไม่เห็น แต่บน table ที่มี row จำนวนจริงมองเห็นชัดมาก
+</SpotTheBug>
+
+พิสูจน์ -- filter เดียวกัน table 50,000 row เดียวกัน JWT claim เดียวกัน ไม่ wrap เทียบกับ wrap `explain analyze` บน Mac เครื่องนี้:
+
+```text
+-- ไม่ wrap: auth.uid() ถูกประเมินซ้ำผ่าน current_setting() อยู่ใน Filter เอง
+Seq Scan on rd_posts_perf  (actual time=6.582..6.582 rows=0 loops=1)
+  Filter: (user_id = (COALESCE(NULLIF(current_setting('request.jwt.claim.sub', true), ''), ...))::uuid)
+Execution Time: 32.899 ms
+
+-- wrap ด้วย (select auth.uid()): คำนวณครั้งเดียวเป็น InitPlan แล้วนำกลับมาใช้ซ้ำ
+Seq Scan on rd_posts_perf  (actual time=0.014..2.342 rows=50000 loops=1)
+  Filter: (user_id = (InitPlan 1).col1)
+  InitPlan 1
+    ->  Result  (actual time=0.011..0.011 rows=1 loops=1)
+Execution Time: 3.296 ms
+```
+
+ประมาณ 10 เท่าบน table เดียวกันเป๊ะและ Mac เครื่องนี้เป๊ะ -- ตัวเลขจริงจากการรันนี้ ไม่ใช่ benchmark ทั่วไป
+
+**วิธีแก้:** `using ( user_id = (select auth.uid()) )` -- วงเล็บรอบ `auth.uid()` คือวิธีแก้ทั้งหมด ไม่มีอะไรอื่นในตัว policy เปลี่ยนเลย
+
+**วิธีสังเกตตอน review:** grep ทุก policy หา `auth.uid()`, `auth.role()`, หรือ `auth.jwt()` เปล่า ๆ ที่ไม่ถูก wrap ด้วย `(select ...)` -- นี่คือสิ่งที่ performance advisor ของ `supabase db lint` flag พอดี มีอยู่ใน **[Verification Tools](/supabase/th/reading-supabase/verification-tools/)**
+
+### 7. `security definer` ไม่มี `set search_path = ''`
+
+ฟังก์ชัน `security definer` รันด้วยสิทธิ์ของผู้ที่ **สร้าง** มัน ไม่ใช่ผู้เรียก -- นี่คือจุดประสงค์ทั้งหมดของการใช้มันเพื่อข้าม RLS อย่างปลอดภัยสำหรับงานที่แคบและเฉพาะเจาะจง การอ้างอิง table แบบไม่ qualify schema ทุกจุดข้างในถูก resolve โดยใช้ `search_path` ของ **ผู้เรียก** เว้นแต่ฟังก์ชันจะ pin ของตัวเอง
+
+<SpotTheBug lang="sql" code={`create or replace function public.leak_secret()
+returns text
+language plpgsql
+security definer
+as $$
+declare v text;
+begin
+  select secret into v from rd_settings limit 1;
+  return v;
+end;
+$$;`}>
+ไม่มี `set search_path` ผู้เรียกที่สามารถวาง schema ของตัวเองไว้ก่อน `public` ใน `search_path` ของ session -- หรือแค่มี schema ที่ตัวเองคุมอยู่ที่ไหนก่อนหน้าในนั้น -- ทำให้ `rd_settings` แบบไม่ qualify ของฟังก์ชันนี้ resolve ไปที่ table ของ**ตัวเอง**แทนที่จะเป็นตัวจริง พร้อมสิทธิ์ที่ยกระดับของ `security definer` ยังคงอยู่ครบ
+</SpotTheBug>
+
+พิสูจน์ -- `search_path` ของ session ผู้เรียกเองเป็นตัวตัดสินว่าฟังก์ชันอ่าน table ไหน แม้เจ้าของฟังก์ชันจะไม่เคยให้สิทธิ์ผู้เรียกคนนั้นเข้าถึง schema ของ table จริงเลย:
+
+```sql
+create schema rd_evil;
+create table rd_evil.rd_settings (secret text);
+insert into rd_evil.rd_settings (secret) values ('FAKE-secret-planted-by-attacker');
+
+set search_path to rd_evil, public;
+select current_setting('search_path'), public.leak_secret();
+--   current_setting  |             leak_secret
+-- -----------------+---------------------------------
+--  rd_evil, public  | FAKE-secret-planted-by-attacker
+```
+
+เจ้าของฟังก์ชันไม่เคยแตะ `rd_evil` เลย -- แค่ `search_path` ของผู้เรียกอย่างเดียวก็เบี่ยง `select ... from rd_settings` แบบไม่ qualify schema ข้างในฟังก์ชัน `security definer` ไปยัง table ที่ attacker คุมอยู่ได้
+
+**วิธีแก้** ที่ยืนยันแล้วกับ `search_path` ของ attacker เดิมเป๊ะ:
+
+```sql
+create or replace function public.leak_secret()
+returns text language plpgsql security definer
+set search_path = ''
+as $$
+declare v text;
+begin
+  select secret into v from public.rd_settings limit 1;  -- now fully schema-qualified
+  return v;
+end;
+$$;
+```
+
+```text
+set search_path to rd_evil, public;
+select current_setting('search_path'), public.leak_secret();
+--   current_setting  |     leak_secret
+-- -----------------+-------------------
+--  rd_evil, public  | REAL-secret-value
+```
+
+`search_path` ของ attacker เดิม session เดิม -- ตอนนี้อ่าน table จริงทุกครั้ง เพราะ `set search_path = ''` บังคับให้ทุกการอ้างอิงแบบไม่ qualify ข้างในฟังก์ชันล้มเหลวเว้นแต่จะ qualify schema ชัดเจน ซึ่งตอนนี้ทำแล้ว
+
+**วิธีสังเกตตอน review:** grep ทุกฟังก์ชัน `security definer` หา `set search_path` -- การไม่มีมันคือสิ่งที่มีค่าที่สุดที่ควร flag ใน review ของ RPC function ของ Supabase ใด ๆ ตรงตามที่เอกสารของ Postgres เองบอกไว้เรื่องความเสี่ยงนี้
+
+### 8. เปิด RLS แล้วไม่มี policy เลย -- ว่างเปล่าแบบเงียบสำหรับทุกคน
+
+การเปิด RLS ไม่ใช่การกระทำเดียวกับการเขียน policy และ Postgres ไม่ถือว่า "RLS เปิด ไม่มี policy" เป็นการตั้งค่าผิดที่ควร error -- มันคือสถานะ **ปฏิเสธเต็มรูปแบบที่ถูกต้อง** แยกไม่ออกที่ชั้น HTTP จาก "ยังไม่มีข้อมูลอยู่จริง ๆ ตอนนี้"
+
+<SpotTheBug lang="sql" code={`create table public.notes (id uuid primary key default gen_random_uuid(), body text not null);
+grant select, insert, update, delete on public.notes to anon, authenticated;
+alter table public.notes enable row level security;
+-- table shipped like this -- nobody ever got around to writing a policy`}>
+`enable row level security` โดยไม่มี policy เลยปฏิเสธทุก row ให้ทุก role ยกเว้นเจ้าของ table (ที่ข้าม RLS โดย default ในฐานะ superuser) -- ทั้ง `anon` และ `authenticated` เห็นอะไรไม่ได้เลย โดยไม่มี error จากชั้นไหนเลย ตลอดไป จนกว่าจะมีการเพิ่ม policy
+</SpotTheBug>
+
+พิสูจน์ -- มี row จริงอยู่ ยืนยันในฐานะ `postgres` (ข้าม RLS ในฐานะเจ้าของ) แล้ว query เดียวกันเป๊ะผ่าน Data API จริง:
+
+```text
+select count(*) as real_row_count_as_superuser from public.rd_notes;
+--  real_row_count_as_superuser
+-- -----------------------------
+--                            3
+
+$ curl "$API_URL/rest/v1/rd_notes?select=*" -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY"
+[]
+HTTP=200
+```
+
+ไม่มี `42501`, ไม่มี `403`, ไม่มีสัญญาณแยกความต่างที่ไหนเลยใน response -- table ที่ว่างเปล่าจริง ๆ กับอันนี้ดูเหมือนกันเป๊ะจากฝั่ง client
+
+**วิธีแก้:** เขียน policy อย่างน้อยหนึ่งตัวต่อคำสั่งที่ table ต้องการก่อน ship -- แม้จะเป็นตัวที่แคบโดยตั้งใจก็ตาม -- และถือว่า "RLS เปิด, 0 policy, `select count(*) from pg_policies where tablename = 'x'`" เป็น audit query จริง มีอยู่ใน **[Verification Tools](/supabase/th/reading-supabase/verification-tools/)**
+
+**วิธีสังเกตตอน review:** migration ใด ๆ ที่รัน `alter table ... enable row level security` โดยไม่มี `create policy` สำหรับ table เดียวกันใน migration เดียวกันหรือใกล้เคียง
+
+## Auth & sessions
+
+### 9. เชื่อ `getSession()` ว่าเป็น identity ที่ verify แล้ว
+
+`getSession()` คืนสิ่งที่นั่งอยู่ใน storage ของ client เอง decode ในเครื่อง -- ไม่ติดต่อ Auth server และไม่เช็ค signature ของ JWT `getUser()` (และ `getClaims()` ที่ใหม่กว่าและ verify เท่ากัน) เรียกผ่าน network จริงเสมอและปฏิเสธ token ที่ถูกแก้ไขทันที
+
+<SpotTheBug lang="ts" code={`// server-side "auth check" -- a common AI-generated pattern
+const { data: { session } } = await supabase.auth.getSession()
+if (session?.user.role === 'service_role') {
+  // grant elevated access based on a claim read from getSession()
+}`}>
+`getSession()` ไม่เคย verify signature ของ JWT เลย -- แค่ decode payload ที่นั่งอยู่ใน local storage อะไรก็ตามที่เขียนลง storage นั้นได้ (browser extension, XSS bug, ค่าที่สร้างด้วยมือใน test harness) ปลอม claim ที่ check นี้อ่านได้ทุกตัว รวมถึง `role`
+</SpotTheBug>
+
+พิสูจน์ -- payload ของ JWT ของ session จริง ถูกแก้ (`sub` กับ `role` ถูกปลอม signature เดิมที่ใช้ไม่ได้แล้วถูกใช้ซ้ำเป๊ะ) ใส่เข้าไปใน storage ของ client ตรง ๆ:
+
+```text
+getSession() -- decode ในเครื่องเท่านั้น ไม่มีการเรียก network:
+  error: null
+  เชื่อ sub ที่ปลอม: 00000000-0000-0000-0000-000000000000 (ค่าที่ปลอมถูกยอมรับ ไม่มีการเช็ค signature)
+
+getUser() -- เรียก network จริงไปยัง /auth/v1/user, verify signature:
+  data.user: null
+  error: invalid JWT: unable to parse or verify signature, token signature is invalid: crypto/ecdsa: verification error status=403 code=bad_jwt
+```
+
+`getSession()` คืน claim ที่ปลอมมาโดยไม่บ่นอะไรเลย `getUser()` เมื่อได้รับ token ที่ถูกแก้เดียวกันเป๊ะ ปฏิเสธด้วย error การ verify signature ที่จริงและเฉพาะเจาะจง
+
+**วิธีแก้:** การตัดสินใจเรื่อง authorization ฝั่ง server ใด ๆ อ่านจาก `getUser()` หรือ `getClaims()` ไม่ใช่ `getSession()` เลย -- `getSession()` มีไว้อ่านสถานะ session ปัจจุบันที่ client ถืออยู่ (มีใคร login อยู่หรือเปล่า สำหรับจุดประสงค์ UI) ไม่ใช่เพื่อ verify ว่าผู้เรียกคือใครจริง ๆ
+
+**วิธีสังเกตตอน review:** branch การ authorization ใด ๆ -- route guard, server check ที่เกี่ยวกับ RLS, admin gate -- ที่อ่าน `session.user` จาก `getSession()` แทนที่จะเป็นผลลัพธ์ที่ verify แล้วจาก `getUser()`/`getClaims()`
+
+### 10. สมมติว่าการ reuse refresh token fail เสียงดังเสมอ
+
+ทุกครั้งที่ refresh token สำเร็จจะ rotate refresh token และทำให้ตัวที่ใช้ไปแล้ว invalid -- แต่มี grace window สั้น ๆ ที่ปรับได้ (`refresh_token_reuse_interval`, `10` วินาทีบน local stack นี้) ที่ยอม token **รุ่นก่อนหน้าทันที** โดยเฉพาะเพื่อให้การ retry network จริงไม่เสีย session ไป retry logic ที่ AI สร้างมักสมมติว่าการ reuse ใด ๆ fail ทันที หรือตรงข้ามกัน -- ว่า reuse โอเคเสมอแบบเงียบ ๆ
+
+```ts
+// naive retry logic -- assumes EVERY reuse either always fails or always succeeds
+async function refreshWithRetry(token: string) {
+  const res = await fetch(`${API_URL}/auth/v1/token?grant_type=refresh_token`, {
+    method: 'POST', headers, body: JSON.stringify({ refresh_token: token }),
+  })
+  // no branch at all for error_code === 'refresh_token_already_used'
+  return res.json()
+}
+```
+
+พิสูจน์ -- ขอบเขตจริง จับตั้งแต่ต้นจนจบ: `token_1` rotate เป็น `token_2` (11 วินาทีหลังจากนั้น), `token_2` rotate เป็น `token_3` (อีก 11 วินาที), แล้ว `token_1` ถูก reuse ครั้งที่สาม อีก 11 วินาทีหลังจากนั้น (เก่าไปสองรุ่นจริง ๆ เลยผ่าน grace window ไปแล้วแน่นอน):
+
+```text
+token_1=7vksoo2qrecx
+token_2=elqusfeflhpq (rotation 1 ok)
+token_3=5kilbvem2ojg (rotation 2 ok)
+
+$ curl -X POST "$API_URL/auth/v1/token?grant_type=refresh_token" -d '{"refresh_token":"7vksoo2qrecx"}'
+{"code":400,"error_code":"refresh_token_already_used","msg":"Invalid Refresh Token: Already Used"}
+HTTP=400
+
+# ในขณะเดียวกัน token_3 -- ตัวที่ใช้งานได้จริงตอนนี้ -- ยังทำงานได้ปกติ:
+HTTP=200
+```
+
+`refresh_token_already_used` ที่จริงและเฉพาะเจาะจง -- ไม่ใช่ `401` ทั่วไป -- และ token ปัจจุบันที่ถูกต้องยังทำงานได้ต่อใน session เดียวกันตลอด
+
+**วิธีแก้:** เมื่อเจอ `refresh_token_already_used` ให้ sign out user แล้วบังคับ login ใหม่ -- error นี้เฉพาะเจาะจงหมายความว่า token chain พังจริง ๆ (อาจเป็นสัญญาณว่า refresh token ถูกขโมยแล้วถูกใช้ที่อื่นไปแล้ว) ไม่ใช่ความล้มเหลวชั่วคราวที่ควร retry
+
+**วิธีสังเกตตอน review:** refresh-retry logic ที่ไม่มี branch เลยสำหรับ `error_code === 'refresh_token_already_used'` หรือ logic ที่ retry มันเป็น loop โดยสมมติว่าเป็นแค่ปัญหาชั่วคราว
+
+### 11. สมมติว่า custom JWT claim มีอยู่โดยไม่มี Auth Hook
+
+RLS policy และโค้ด client ที่ AI สร้างมักอ้างอิง claim อย่าง `request.jwt.claims ->> 'user_role'` หรือ `auth.jwt() ->> 'org_id'` ราวกับ Supabase เพิ่มให้อัตโนมัติ มันไม่ทำ -- claim จะปรากฏใน JWT ก็ต่อเมื่อ Auth Hook แบบ **Customize Access Token Claims** ถูกเขียนและตั้งค่าไว้จริงเท่านั้น
+
+<SpotTheBug lang="sql" code={`create policy org_scoped on public.documents
+  for select
+  using ( org_id = (auth.jwt() ->> 'org_id')::uuid );
+-- assumes 'org_id' is already a claim on every access token`}>
+ไม่มีอะไรในโปรเจกต์ Supabase แบบ default ใส่ `org_id` (หรือ field ที่กำหนดเอง) ลงใน JWT เลย ถ้าไม่มีฟังก์ชัน Auth Hook จริงที่ลงทะเบียนไว้ใน `[auth.hook.custom_access_token]` ของ `config.toml` `auth.jwt() ->> 'org_id'` จะเป็น `null` สำหรับทุก request เลย ทำให้ policy นี้ปฏิเสธทุก row ให้ทุกคนตลอดไป
+</SpotTheBug>
+
+พิสูจน์ -- session token จริงที่เพิ่ง issue สำหรับโปรเจกต์นี้เป๊ะ decode เต็ม:
+
+```text
+{
+  "iss": "http://127.0.0.1:55321/auth/v1",
+  "sub": "f8cd7f9e-6dd4-482a-888b-b92184c98d07",
+  "aud": "authenticated",
+  "email": "rd-alice@example.com",
+  "role": "authenticated",
+  "aal": "aal1",
+  "amr": [{"method":"password","timestamp":1790667877}],
+  "session_id": "865380b2-eecf-4933-918f-d2c908218fad",
+  "is_anonymous": false
+}
+```
+
+ไม่มี `org_id`, ไม่มี `user_role`, ไม่มี field ที่กำหนดเองเลยสักตัว -- มีแค่ claim มาตรฐานที่ GoTrue issue ให้โดย default เท่านั้น
+
+**วิธีแก้** (เป็นการเปลี่ยน config เท่านั้น -- `config.toml` ของ local stack ที่แชร์กันของคอร์สนี้ไม่ได้ถูกแก้ต่อบท ระบุตรง ๆ แทนที่จะปลอมผล): ลงทะเบียน hook จริงและฟังก์ชัน SQL จริงเพื่อเติม claim --
+
+```text
+# supabase/config.toml
+[auth.hook.custom_access_token]
+enabled = true
+uri = "pg-functions://postgres/public/custom_access_token_hook"
+```
+
+```sql
+-- sql/custom-access-token-hook.sql
+create or replace function public.custom_access_token_hook(event jsonb)
+returns jsonb language plpgsql as $$
+declare claims jsonb;
+begin
+  claims := event->'claims';
+  claims := jsonb_set(claims, '{org_id}', to_jsonb((select org_id from public.profiles where id = (event->>'user_id')::uuid)));
+  event := jsonb_set(event, '{claims}', claims);
+  return event;
+end;
+$$;
+```
+
+ตามเอกสาร [official Auth Hooks docs](https://supabase.com/docs/guides/auth/auth-hooks/customize-access-token-hook) hook นี้รันทุกครั้งที่มีการ issue token เมื่อลงทะเบียนแล้ว และ GoTrue ต้อง restart ถึงจะรับการเปลี่ยน `config.toml` -- การเปลี่ยน config จริงที่บทนี้บน shared stack นี้ไม่ได้ apply ระบุตรง ๆ แทนที่จะปลอมผล
+
+**วิธีสังเกตตอน review:** RLS policy หรือโค้ด client ใด ๆ ที่อ่าน claim จาก `auth.jwt()` ที่ไม่ใช่ claim มาตรฐานของ GoTrue -- เช็คไขว้กับ block `[auth.hook.custom_access_token]` ใน `config.toml` ก่อนเชื่อว่า claim นั้นมีอยู่จริง
+
+## Client calls
+
+### 12. destructure `data` แล้วข้าม `error`
+
+`supabase-js` ไม่เคย throw เมื่อ database หรือ API error โดย default -- ทุก call คืน `{ data, error }` และโค้ดที่อ่านแค่ `data` ได้ลบสัญญาณเดียวที่บอกว่า call ล้มเหลวจริงไปแล้ว
+
+<SpotTheBug lang="ts" code={`const { data } = await supabase.from('posts').select('*')
+const titles = data.map((row) => row.title)`}>
+เมื่อล้มเหลว -- ชื่อ table ผิด, grant หาย, RLS ปฏิเสธ, network error -- `data` เป็น `null` ไม่ใช่ `[]` `.map()` บน `null` throw `TypeError` ทั่วไป ซ่อนเหตุผลจริงและเฉพาะเจาะจงที่ call ล้มเหลวไว้ใต้ crash ที่มีประโยชน์น้อยกว่ามาก
+</SpotTheBug>
+
+พิสูจน์:
+
+```text
+const { data } = await client.from('rd_table_that_does_not_exist').select('*')
+data: null
+data.map(...) crashed with: TypeError: Cannot read properties of null (reading 'map')
+
+// error จริงที่เกิดขึ้น ถ้าถูกเช็ค:
+{ code: 'PGRST205', details: null, hint: null,
+  message: "Could not find the table 'public.rd_table_that_does_not_exist' in the schema cache" }
+```
+
+**วิธีแก้:** destructure และเช็คทั้งสองตัวเสมอ -- `const { data, error } = await ...; if (error) { /* จัดการ ด้วย error.code */ }`
+
+**วิธีสังเกตตอน review:** `const { data }` ใด ๆ (ไม่มี `error`) ที่ destructure จาก call ของ `supabase-js` แล้วใช้ `data` ต่อโดยไม่มีการ guard
+
+### 13. `.single()` โดยไม่จัดการ `PGRST116`
+
+`.single()` ขอให้ PostgREST บังคับผลลัพธ์เป็น JSON object เดียวเป๊ะ -- 0 row หรือมากกว่า 1 row ถูกถือเป็น error ทั้งคู่ พร้อม code ที่จริงและเฉพาะเจาะจง ไม่ใช่ `null` หรือ array เงียบ ๆ
+
+```ts
+// src/rd-13-single-no-handling.ts
+import { createClient } from '@supabase/supabase-js'
+
+const supabase = createClient('http://127.0.0.1:55321', 'anon-key-placeholder')
+const userId = '00000000-0000-0000-0000-000000000000'
+
+const { data } = await supabase.from('profiles').select('*').eq('id', userId).single()
+console.log(data.display_name) // assumes data is always the one row
+```
+
+พิสูจน์ ทั้งสองรูปแบบความล้มเหลว จริงและจับสด:
+
+```text
+0 rows .single(): {"data":null,"error":{"code":"PGRST116","details":"The result contains 0 rows","hint":null,"message":"Cannot coerce the result to a single JSON object"}}
+2+ rows .single(): {"data":null,"error":{"code":"PGRST116","details":"The result contains 2 rows","hint":null,"message":"Cannot coerce the result to a single JSON object"}}
+```
+
+ทั้งกรณี "ไม่พบ" และกรณี "query กว้างเกินไป ตรงมากกว่าหนึ่ง" รายงานเป็น `PGRST116` เหมือนกันเป๊ะ -- มีแค่ string `details` เท่านั้นที่บอกความต่าง
+
+**วิธีแก้:** เช็ค `error?.code === 'PGRST116'` ตรง ๆ แล้ว branch ตาม `error.details` ถ้าสองกรณีนี้ต้องการการจัดการต่างกัน หรือใช้ `.maybeSingle()` เมื่อ 0 row เป็นผลลัพธ์ที่คาดหวังไว้อยู่แล้วไม่ใช่ error
+
+**วิธีสังเกตตอน review:** `.single()` ใด ๆ ที่ไม่มีการเช็ค `error` ข้าง ๆ โดยเฉพาะบน filter ที่พิสูจน์ไม่ได้ว่า unique (ไม่ใช่ `.eq()` บน primary key)
+
+### 14. `createClient()` ใหม่ต่อ request แทนที่จะเป็น singleton
+
+การสร้าง client `supabase-js` ใหม่ต่อ request หรือต่อ component -- แทนที่จะเป็น instance เดียวที่ใช้ร่วมกัน -- สังเกตยากเพราะปกติมันยัง *ทำงาน* ต้นทุนของมันปรากฏเป็นคำเตือนจริงที่มีเอกสารรองรับ ไม่ใช่การ crash
+
+<SpotTheBug lang="ts" code={`// inside a component, or a request handler -- called on every render/request
+export function getClient() {
+  return createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
+}`}>
+แต่ละ call สร้าง `GoTrueClient` ใหม่ที่ bind กับ storage key เดียวกัน `supabase-js` ตรวจจับสิ่งนี้และเตือนตรง ๆ เพราะ instance หลายตัวที่เขียน storage key เดียวกันพร้อมกันสามารถแข่งกันระหว่างการ refresh token ได้ -- "undefined behavior" ตามคำของ library เอง
+</SpotTheBug>
+
+พิสูจน์ -- console output จริง การเรียก `createClient()` ครั้งที่สอง storage key เดียวกัน process เดียวกัน:
+
+```text
+GoTrueClient@sb-127-auth-token:1 (2.117.2) 2026-09-29T07:50:35.645Z Multiple GoTrueClient instances detected in the same browser context. It is not an error, but this should be avoided as it may produce undefined behavior when used concurrently under the same storage key.
+```
+
+**วิธีแก้:** สร้าง client เดียวที่ module scope (`export const supabase = createClient(...)`) แล้ว import instance เดียวนั้นทุกที่ -- pattern มาตรฐานในทุกบทของโมดูล `client-development` ของคอร์สนี้เอง
+
+**วิธีสังเกตตอน review:** `createClient(` ที่อยู่ข้างใน body ของ component, request handler หรือฟังก์ชันใด ๆ ที่ถูกเรียกมากกว่าหนึ่งครั้ง แทนที่จะอยู่ที่ module top-level
+
+### 15. `global.headers.Authorization` ถูก freeze ตอนสร้าง client
+
+การส่ง header `Authorization` ผ่าน option `global.headers` เป็นวิธีจริงที่มีเอกสารรองรับสำหรับการยิง request ในนามของ user เฉพาะโดยไม่ต้องผ่าน session flow เต็มรูปแบบ -- แต่มันถูกตั้ง**ครั้งเดียว** ตอนสร้าง และไม่อัปเดตเมื่อ `auth.setSession()` ถูกเรียกทีหลังบน client instance เดียวกัน
+
+<SpotTheBug lang="ts" code={`const supabase = createClient(URL, ANON_KEY, {
+  global: { headers: { Authorization: \`Bearer \${ANON_KEY}\` } },
+})
+// ...later, elsewhere in the same request lifecycle...
+await supabase.auth.setSession({ access_token, refresh_token })
+// assumes subsequent .from() calls now act as the signed-in user`}>
+`global.headers.Authorization` ทับ header ที่ auth state ของ SDK เองจะส่งไปแทน -- `setSession()` อัปเดต session ภายในของ client จริง (`getUser()` สะท้อนถูกต้อง) แต่ทุก request ของ PostgREST ยังส่ง header ที่ freeze ไว้ตอนสร้างอยู่ ไม่ใช่ token ของ session ใหม่
+</SpotTheBug>
+
+พิสูจน์ -- table ที่มี row มองเห็นได้เฉพาะเจ้าของผ่าน RLS ถูก request ผ่าน client ที่ `global.headers.Authorization` ถูก freeze เป็น `anon` key ตอนสร้าง ทันทีหลังจากเรียก `setSession()` จริงสำหรับเจ้าของ row นั้น:
+
+```text
+setSession(alice) resolved. client.auth.getUser(): rd-alice@example.com   <- สถานะของ SDK เองคือ alice
+
+rows visible through global.headers-frozen client: []                     <- แต่ PostgREST ยังเห็น anon อยู่
+rows visible through a normal client (no global.headers): [{"user_id":"f8cd...","secret":"alice-only-secret"}]
+```
+
+`setSession()` call เดียวกัน row เดียวกัน RLS policy เดียวกัน -- ต่างกันแค่ว่า `global.headers` ถูกตั้งตอนสร้างหรือไม่ `getUser()` รายงาน identity ถูกไม่ได้แปลว่า request จริงใช้มันด้วย
+
+**วิธีแก้:** อย่าผสม `global.headers.Authorization` กับ `auth.setSession()` บน client เดียวกัน เลือกใช้อย่างใดอย่างหนึ่ง ถ้าจำเป็นต้อง auth ต่อ request จริง ให้สร้าง client ใหม่ (หรือใช้ `.auth.setSession()` อย่างเดียว ไม่มี `global.headers` override)
+
+**วิธีสังเกตตอน review:** client ที่สร้างด้วย `global: { headers: { Authorization: ... } } }` อยู่ใกล้ ๆ `setSession()`, `signInWithPassword()` หรือ call อื่นที่สมมติว่า identity ของ request ของ client เปลี่ยนไปแล้ว
+
+## Edge functions
+
+### 16. import แบบ bare specifier
+
+วิธีที่พบบ่อยที่สุดที่โค้ด Edge Function ที่ AI สร้างพัง: import package แบบเดียวกับที่ใช้ในโปรเจกต์ Node.js หรือ Vite Deno ไม่มี bare-specifier resolution แบบ `node_modules` เลย -- ทุก import ต้องเป็น relative path, URL เต็ม หรือ registry specifier `jsr:`/`npm:`
+
+```ts
+// supabase/functions/rd-bare-import/index.ts — @expect-error worker fails to boot: bare specifiers are not resolvable in Deno
+import { createClient } from '@supabase/supabase-js'
+
+Deno.serve((_req) => {
+  const client = createClient('http://x', 'y')
+  return new Response(JSON.stringify({ ok: !!client }))
+})
+```
+
+พิสูจน์ -- deploy ตามนี้เป๊ะภายใต้ `supabase functions serve` ทุก request คืน `503` จริง จับสดกับ function ชั่วคราวของโมดูลนี้เอง:
+
+```text
+$ curl "$FUNCTIONS_URL/rd-bare-import" -H "Authorization: Bearer $ANON_KEY" -H "apikey: $ANON_KEY"
+{"code":"BOOT_ERROR","message":"Worker failed to boot (please check logs)"}
+HTTP=503
+
+worker boot error: failed to bootstrap runtime: failed to create the graph: Relative import path "@supabase/supabase-js" not prefixed with / or ./ or ../
+  hint: If you want to use a JSR or npm package, try running `deno add jsr:@supabase/supabase-js` or `deno add npm:@supabase/supabase-js`
+    at file:///.../supabase/functions/rd-bare-import/index.ts:1:30
+```
+
+**วิธีแก้:**
+
+```ts
+// supabase/functions/rd-import-fixed/index.ts
+import { createClient } from 'jsr:@supabase/supabase-js@2'
+
+Deno.serve((_req) => {
+  const client = createClient('http://x', 'y')
+  return new Response(JSON.stringify({ ok: !!client }))
+})
+```
+
+**วิธีสังเกตตอน review:** `import ... from '@scope/pkg'` หรือ `'pkg'` ใด ๆ ข้างใน `supabase/functions/**/index.ts` ที่ไม่มี prefix `jsr:`/`npm:`/relative -- `tsc` จับไม่ได้เลย (ไม่ได้ถูกรันกับ edge function ด้วยซ้ำ) มีแค่ `deno check` เท่านั้นที่จับได้ก่อน deploy
+
+### 17. edge function ที่ init ด้วย `SUPABASE_ANON_KEY` สมมติว่าข้าม RLS
+
+โค้ดฝั่ง server "ควร" ข้าม RLS -- สัญชาตญาณนั้นถูกต้องสำหรับ `service_role` และผิดสำหรับ `anon` edge function ก็เป็นแค่ผู้เรียก PostgREST อีกคนหนึ่ง key ที่มันส่งให้ `createClient()` เป็นตัวตัดสินว่ามันเป็น role ไหน
+
+<SpotTheBug lang="ts" code={`// supabase/functions/rd-anon-rls/index.ts
+import { createClient } from 'jsr:@supabase/supabase-js@2'
+
+Deno.serve(async (_req) => {
+  const client = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_ANON_KEY')!,
+  )
+  const { data, error } = await client.from('secrets').select('*')
+  return new Response(JSON.stringify({ data, error }))
+})`}>
+"อันนี้รันบน server ต้องข้าม RLS แน่ ๆ" คือสมมติฐานที่พังตรงนี้พอดี -- `SUPABASE_ANON_KEY` ข้างใน edge function ถูก scope เหมือนกันเป๊ะกับ `SUPABASE_ANON_KEY` จาก browser: RLS มีผลเต็มรูปแบบ มีแค่ `SUPABASE_SERVICE_ROLE_KEY` เท่านั้นที่ข้าม RLS จริง
+</SpotTheBug>
+
+พิสูจน์ -- edge function อ่าน table ที่มี row เดียวถูก scope ด้วย `auth.uid()` ของ user เฉพาะผ่าน RLS เรียกด้วย `ANON_KEY` จริง:
+
+```text
+$ curl "$FUNCTIONS_URL/rd-anon-rls" -H "Authorization: Bearer $ANON_KEY" -H "apikey: $ANON_KEY"
+{"data":[],"error":null}
+HTTP=200
+```
+
+ไม่มี error -- `{data: [], error: null}` คือสิ่งที่ anon caller ของ table เดียวกันเป๊ะได้รับนอก edge function เช่นกัน การรันข้างใน function ไม่ได้เปลี่ยนอะไรเลยเกี่ยวกับ row ที่มองเห็นได้
+
+**วิธีแก้:** ใช้ `SUPABASE_SERVICE_ROLE_KEY` เฉพาะเมื่องานของ function ต้องข้าม RLS จริง (งาน admin, webhook receiver ที่ทำแทนระบบ) -- และใช้ JWT ของผู้เรียกเองต่อ (ผ่านการส่ง header `Authorization` ต่อ) เมื่อ function ควรทำงาน*ในนามของ*ผู้เรียกโดยเคารพ RLS ตามที่ตั้งใจไว้จริง
+
+**วิธีสังเกตตอน review:** key ไหนที่ `createClient()` ได้รับข้างใน edge function เช็คไขว้กับว่างานของ function นั้นต้องข้าม RLS จริงหรือควรเคารพมัน
+
+### 18. secret ใน `supabase/functions/<name>/.env` ไม่ใช่ `.env.local`
+
+`.gitignore` ที่ scaffold มาจาก CLI เองภายใต้ `supabase/` กันไว้แค่ `.env.local` กับ `.env.*.local` (บวก `.env.keys` ของ dotenvx) -- ไฟล์ `.env` ธรรมดาที่วางข้าง edge function ไม่ถูกครอบคลุมเลย
+
+```text
+# tools/probe/supabase/.gitignore (ของ CLI ตัวนี้เป๊ะ ตามจริง)
+# Supabase
+.branches
+.temp
+
+# dotenvx
+.env.keys
+.env.local
+.env.*.local
+```
+
+`supabase/functions/rd-secrets/.env` (ไม่มี suffix `.local` -- ชื่อไฟล์ที่การเรียก `supabase functions serve --env-file .env` แบบเร็ว ๆ ชวนให้ใช้พอดี) ไม่ตรงกับบรรทัดไหนในไฟล์นี้เลย `git add .` เก็บมันเหมือนไฟล์ source ที่ track ปกติทุกอย่าง
+
+**วิธีแก้:** ตั้งชื่อไฟล์ secret ในเครื่องด้วย suffix `.local` ที่ `.gitignore` นี้ป้องกันจริง (`.env.local`) หรือใช้ `supabase secrets set` สำหรับสิ่งที่ deploy จริง ไม่ใช่ไฟล์ที่ commit เลย
+
+**วิธีสังเกตตอน review:** `git status` (หรือ `git log -p` บน commit ที่น่าสงสัย) หาไฟล์ใด ๆ ภายใต้ `supabase/functions/**/.env` ที่ไม่มี suffix `.local` -- `.gitignore` default ของ CLI จะไม่จับมันเลย
+
+## Realtime
+
+### 19. subscribe table ที่ไม่เคยถูกเพิ่มเข้า publication `supabase_realtime`
+
+`postgres_changes` subscription สามารถถูกต้องตามไวยากรณ์เป๊ะ status `SUBSCRIBED` ครบ แล้วไม่เคยได้รับ event เลยแม้แต่ตัวเดียว -- เพราะ table ที่มันเล็งไปหาไม่เคยถูกเพิ่มเข้า publication ที่ Realtime เฝ้าดูจริง
+
+<SpotTheBug lang="ts" code={`supabase
+  .channel('items-changes')
+  .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'items' }, (payload) => {
+    console.log('new item:', payload.new)
+  })
+  .subscribe()`}>
+`CREATE TABLE` ไม่ได้เพิ่ม table เข้า publication ไหนเลย -- `supabase_realtime` เป็น publication ที่ตั้งชื่อไว้เฉพาะที่ table ต้องถูกเพิ่มเข้าไปตรง ๆ (`alter publication supabase_realtime add table public.items;`) ถ้าไม่ทำ subscription นี้จะถึง `SUBSCRIBED` โดยไม่มี error แล้วก็ไม่เคยยิง event เลย ไม่ว่า row ไหน ไม่ว่าเมื่อไหร่
+</SpotTheBug>
+
+พิสูจน์ -- insert จริง ก่อนและหลัง table ถูกเพิ่มเข้า publication โค้ด channel เดียวกันเป๊ะทั้งสองครั้ง:
+
+```text
+subscribe status: SUBSCRIBED
+table NOT in supabase_realtime publication -- event received? false
+
+$ psql -c "alter publication supabase_realtime add table public.rd_rt_items;"
+ALTER PUBLICATION
+
+subscribe status: SUBSCRIBED
+table IS in supabase_realtime publication -- event received: {"id":2,"label":"after-publication","created_at":"2026-09-29T07:54:14.388207+00:00"}
+```
+
+โค้ด client เหมือนกันเป๊ะ insert เหมือนกันเป๊ะ -- ต่างกันแค่การเป็นสมาชิกของ publication
+
+**วิธีแก้:** `alter publication supabase_realtime add table public.<table>;` สำหรับทุก table ที่ `postgres_changes` subscription ใด ๆ เล็งไปหา -- และถือว่า `select * from pg_publication_tables where pubname = 'supabase_realtime'` เป็น pre-flight check จริง มีอยู่ใน **[Verification Tools](/supabase/th/reading-supabase/verification-tools/)**
+
+**วิธีสังเกตตอน review:** `.on('postgres_changes', ...)` ใด ๆ เช็คไขว้กับประวัติ migration หา `alter publication supabase_realtime add table` ที่ตรงกัน
+
+### 20. private channel ไม่มี policy ที่ตรงกันบน `realtime.messages`
+
+channel ที่ตั้ง `private: true` ส่งการ authorization ผ่าน Row Level Security บน table `realtime.messages` จริง -- เหมือน table อื่นของ Postgres ทุกประการ พร้อมผลลัพธ์เดียวกันเป๊ะสำหรับ policy ที่หายไป: request ถูกปฏิเสธ ไม่ใช่ default เป็นอนุญาต
+
+<SpotTheBug lang="ts" code={`const channel = supabase.channel('room-42', { config: { private: true } })
+channel.subscribe((status) => console.log(status))
+// no policy was ever written on realtime.messages for this topic`}>
+ไม่มี `create policy ... on realtime.messages ... using (realtime.topic() = 'room-42')` อยู่ที่ไหนเลย RLS บน `realtime.messages` ปฏิเสธโดย default เหมือน table อื่นที่ไม่มี policy ทุกประการ -- subscription ไม่ได้ลดระดับลงเป็น "public" แบบเงียบ ๆ มันถูกปฏิเสธตรง ๆ
+</SpotTheBug>
+
+พิสูจน์ -- client ที่ authenticate จริง subscribe ไปยัง private channel ที่ไม่มี policy ตรงกับ topic ของมัน:
+
+```text
+private channel, NO matching realtime.messages policy for this topic: {"status":"CHANNEL_ERROR","err":"Unauthorized: You do not have permissions to read from this Channel topic: rd-private-demo"}
+```
+
+หลังเพิ่ม policy ที่ตรงกัน:
+
+```sql
+create policy rd_private_demo_read on realtime.messages for select
+  using ( realtime.topic() = 'rd-private-demo' );
+```
+
+```text
+private channel, WITH a matching realtime.messages policy for this topic: {"status":"SUBSCRIBED"}
+```
+
+โค้ด client เหมือนกันเป๊ะ topic เหมือนกันเป๊ะ -- มีแค่การมีอยู่ของ policy เท่านั้นที่เปลี่ยนผลลัพธ์
+
+**วิธีแก้:** ทุก private channel topic ต้องมี policy `select` ของตัวเอง (และสำหรับการ broadcast เข้าไป ต้องมี `insert` ด้วย) บน `realtime.messages` scope ด้วย `realtime.topic() = '<topic เป๊ะ>'` -- นิสัยการทำ RLS แบบเดียวกับกลุ่ม Schema & RLS ใช้ได้ที่นี่โดยไม่ต้องปรับอะไรเลย
+
+**วิธีสังเกตตอน review:** `channel(..., { config: { private: true } })` ใด ๆ เช็คไขว้กับ `pg_policies` ที่กรอง `schemaname = 'realtime'` หา policy ที่ `qual`/`with_check` ตรงกับ topic นั้นจริง
+
+### 21. `REPLICA IDENTITY` ถูกทิ้งไว้ที่ default -- `old` หดหรือหายไปแบบเงียบ
+
+payload `UPDATE`/`DELETE` ของ Realtime มี row ก่อนหน้าเต็มรูปแบบก็ต่อเมื่อ `REPLICA IDENTITY` ของ table เป็น `FULL` เท่านั้น เมื่อทิ้งไว้ที่ default ของ Postgres (`d`, primary key เท่านั้น) payload `old` ไม่ใช่แค่ "primary key เท่านั้น" อย่างที่หลายคนสมมติ -- บน local stack ของคอร์สนี้เอง มันเป็น `null` ทั้งหมดสำหรับ path update จนกว่าจะตั้ง `FULL`
+
+<SpotTheBug lang="ts" code={`.on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'items' }, (payload) => {
+  const previousLabel = payload.old.label  // assumes payload.old always has every column
+  console.log(\`changed from \${previousLabel} to \${payload.new.label}\`)
+})`}>
+`REPLICA IDENTITY DEFAULT` (default จริงของ Postgres) ไม่ได้รับประกันว่า `payload.old` มีทุก column ที่โค้ดอาจอ่าน -- บน stack นี้เป๊ะ event update ที่ `REPLICA IDENTITY DEFAULT` ธรรมดา payload `old` มีแค่ column primary key เท่านั้น การอ่าน `.label` จากมันคืน `undefined` ไม่ใช่ค่าก่อนหน้า
+</SpotTheBug>
+
+พิสูจน์ -- `UPDATE` เดียวกันเป๊ะ row เดียวกัน โค้ด subscription เดียวกัน สลับ `REPLICA IDENTITY` ระหว่างการรัน:
+
+```text
+REPLICA IDENTITY DEFAULT -- payload.old: {"id":1}
+REPLICA IDENTITY FULL    -- payload.old: {"id":1,"label":"before-publication","created_at":"2026-09-29T07:54:04.090217+00:00"}
+```
+
+`relreplident` ยืนยันแล้วว่าเป็น `d` (default) และ `f` (full) ตามลำดับ ผ่าน `pg_class` ทันทีก่อนแต่ละการรัน
+
+**วิธีแก้:** `alter table public.<table> replica identity full;` สำหรับ table ใด ๆ ที่ consumer ของ Realtime ต้องการ column ที่ไม่ใช่ key ของ row ก่อนหน้า -- ชั่งกับต้นทุนที่มีเอกสารรองรับจริง (Postgres log row เดิมเต็ม ๆ ลง WAL ทุกครั้งที่ update) เทียบกับความจำเป็นนั้น
+
+**วิธีสังเกตตอน review:** `payload.old.<column>` ใด ๆ ที่ `<column>` ไม่ใช่ primary key เช็คไขว้กับ `select relreplident from pg_class where oid = '<table>'::regclass` (ต้องเป็น `f` ไม่ใช่ `d`)
+
+## Storage
+
+### 22. policy ของ storage เช็ค `bucket_id` แต่ไม่เช็ค folder
+
+`storage.foldername(name)` แยก path ของ object ออกเป็นส่วน folder -- policy ที่เช็คแค่ `bucket_id` ให้สิทธิ์เขียนกับทุก folder ใน bucket ไม่ใช่แค่ของผู้เรียกเอง เพราะไม่มีอะไรใน `bucket_id` อย่างเดียวที่ scope ตาม user เลย
+
+<SpotTheBug lang="sql" code={`create policy avatars_insert on storage.objects
+  for insert
+  with check ( bucket_id = 'avatars' );`}>
+สิ่งนี้เช็คว่า object ไปเข้า **bucket** ไหน ไม่เคยเช็คว่า **folder** ไหนเลย -- authenticated user ทุกคนเขียนเข้า folder ของคนอื่นใน bucket เดียวกันได้ เพราะ `bucket_id = 'avatars'` เป็นจริงสำหรับ object path ทุกตัวใน bucket นั้น ไม่ว่าจะเป็น folder ของใคร
+</SpotTheBug>
+
+พิสูจน์ -- Bob เขียนตรงเข้า folder ของ Alice โดยมีแค่ policy ที่ scope ตาม bucket นี้:
+
+```text
+$ curl -X POST "$API_URL/storage/v1/object/rd-bucket/f8cd7f9e-6dd4-482a-888b-b92184c98d07/hijacked-by-bob.txt" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $BOB_TOKEN" --data-binary "bob was here"
+{"Key":"rd-bucket/f8cd7f9e-6dd4-482a-888b-b92184c98d07/hijacked-by-bob.txt","Id":"ef40f8f2-550e-4700-ae32-edc2f40a53a5"}
+HTTP=200
+
+-- ยืนยันฝั่ง server:
+name: f8cd7f9e-6dd4-482a-888b-b92184c98d07/hijacked-by-bob.txt | owner: 9a640d7b-81ed-496c-93c0-b7a6e33198da  <- id ของ Bob ใน folder ของ Alice
+```
+
+**วิธีแก้** ที่ยืนยันแล้วว่าปฏิเสธความพยายามเดิม:
+
+```sql
+create policy avatars_insert on storage.objects
+  for insert
+  with check (
+    bucket_id = 'avatars'
+    and (storage.foldername(name))[1] = (select auth.uid())::text
+  );
+```
+
+```text
+$ curl -X POST ".../rd-bucket/f8cd7f9e-.../hijacked-again.txt" -H "Authorization: Bearer $BOB_TOKEN" ...
+{"statusCode":"403","error":"Unauthorized","message":"new row violates row-level security policy","code":"AccessDenied"}
+HTTP=400
+```
+
+**วิธีสังเกตตอน review:** policy ของ storage บน `storage.objects` ใด ๆ ที่ `with check`/`using` พูดถึง `bucket_id` แต่ไม่เคยพูดถึง `(storage.foldername(name))[1]` (หรือ scope ตาม path ต่อ user ที่เทียบเท่า)
+
+### 23. `upsert: true` มี policy insert กับ update แต่ไม่มี `select`
+
+path upsert ของ storage เช็คว่า object มีอยู่แล้วหรือยัง**ก่อน**ตัดสินใจว่าจะ insert หรือ update -- การเช็คการมีอยู่นั้นคือ `select` ข้างใต้ และ Row Level Security มีผลกับมันเหมือน `select` อื่นทุกประการ
+
+<SpotTheBug lang="ts" code={`// insert + update policies exist and are correctly scoped -- select was never added,
+// "select isn't needed, we're only ever writing" seemed reasonable
+await supabase.storage.from('avatars').upload(\`\${userId}/photo.jpg\`, file, { upsert: true })`}>
+"เราเขียนอย่างเดียว เลยต้องการแค่ policy insert/update" คือสมมติฐานที่พัง `upsert: true` พอดี -- การเช็คการมีอยู่ของมันต้องใช้ `select` และ policy select ที่หายไปทำให้การเช็คนั้นล้มเหลว แม้ insert กับ update จะ scope ถูกต้องแล้วก็ตาม
+</SpotTheBug>
+
+พิสูจน์ -- มี policy insert กับ update scope ถูกต้อง ไม่มี policy select `upsert: true` จริงบน object ใหม่:
+
+```text
+$ curl -X POST ".../rd-bucket2/f8cd.../note.txt" -H "x-upsert: true" -H "Authorization: Bearer $ALICE_TOKEN" ...
+{"statusCode":"403","error":"Unauthorized","message":"new row violates row-level security policy","code":"AccessDenied"}
+HTTP=400
+
+# control: upload เดียวกัน upsert:false (insert ธรรมดา) -- สำเร็จ ไม่ต้องมี select เลย:
+{"Key":"rd-bucket2/f8cd.../note2.txt","Id":"470e125a-ae36-4040-8d69-4a77b834881b"}
+HTTP=200
+```
+
+insert ธรรมดา (`upsert: false`) สำเร็จด้วย policy set insert/update-only เดียวกันเป๊ะ -- มีแค่ path `upsert: true` เท่านั้นที่ต้องการ `select`
+
+**วิธีแก้:** เพิ่ม policy select ที่หายไป scope เหมือนกับ insert/update:
+
+```sql
+create policy avatars_select on storage.objects for select
+  using ( bucket_id = 'rd-bucket2' and (storage.foldername(name))[1] = (select auth.uid())::text );
+```
+
+```text
+# retry call upsert:true ตัวเดิม ตอนนี้สำเร็จ:
+{"Key":"rd-bucket2/f8cd.../note.txt","Id":"1d59e5d9-a4fa-4c7b-baa2-7bc2ad93647c"}
+HTTP=200
+```
+
+**วิธีสังเกตตอน review:** `.upload(..., { upsert: true })` ใด ๆ เช็คไขว้กับว่า policy ของ bucket เป้าหมายมี `select` เพิ่มจาก `insert`/`update` หรือไม่ -- policy set ที่มีแค่ insert หรือแค่ update เป็นช่องว่างจริงที่พบบ่อยเฉพาะบน path upsert
+
+### 24. signed URL ที่ถูกใช้ราวกับไม่เคยหมดอายุ
+
+`expiresIn` ของ `createSignedUrl()` ถูกบังคับใช้ฝั่ง server จริงในฐานะ JWT expiry claim จริงที่ฝังอยู่ใน token ที่อยู่ใน URL ที่ signed -- ไม่ใช่ convention ฝั่ง client และไม่ใช่สิ่งที่ cache ได้ไม่มีกำหนด
+
+```ts
+// src/rd-24-signed-url-cached.ts
+import { createClient } from '@supabase/supabase-js'
+
+const supabase = createClient('http://127.0.0.1:55321', 'anon-key-placeholder')
+const path = 'rd-bucket2/00000000-0000-0000-0000-000000000000/photo.jpg'
+
+const { data } = await supabase.storage.from('avatars').createSignedUrl(path, 60)
+// cached and reused far longer than 60 seconds by the calling code
+console.log(data?.signedUrl)
+```
+
+พิสูจน์ -- signed URL เดียวกันเป๊ะ fetch ทันทีและอีกครั้งหลังหมดหน้าต่าง `expiresIn`:
+
+```text
+$ curl -o /dev/null -w "HTTP=%{http_code}\n" "$API_URL/storage/v1/object/sign/rd-bucket2/...?token=..."   # ทันที
+HTTP=200
+
+# 4 วินาทีต่อมา expiresIn ตั้งไว้ที่ 2 วินาที:
+{"statusCode":"400","error":"InvalidJWT","message":"\"exp\" claim timestamp check failed","code":"InvalidJWT"}
+HTTP=400
+```
+
+**วิธีแก้:** ถือว่า `expiresIn` เป็น deadline จริง -- ขอ signed URL ใหม่เมื่อต้องการ อย่า cache ไว้เกินหน้าต่างของมัน ตั้งขนาด `expiresIn` ให้ตรงกับ use case จริง (ลิงก์ download ครั้งเดียวกับ image source ที่ฝังไว้ใช้ซ้ำได้ต้องการค่าต่างกันมาก)
+
+**วิธีสังเกตตอน review:** signed URL ที่เก็บไว้ใน application state, column ของ database หรือ cache ใด ๆ ที่มี TTL นานกว่า `expiresIn` ที่มันถูกสร้างมาด้วย
+
+## Ops & pooling
+
+### 25. `service_role` ถูกส่งไปยัง client
+
+การรั่วไหลที่ร้ายแรงที่สุดในเดี่ยวใน catalog นี้: `service_role` ข้าม Row Level Security ไปทั้งหมด -- ทุก policy ที่ทุกกลุ่มก่อนหน้าใน catalog นี้พูดถึงกลายเป็นไม่มีความหมายทันทีที่ request มี key นี้ติดไปด้วย
+
+```ts
+// a client-side bundle -- browser devtools can read this constant directly
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+```
+
+พิสูจน์ -- query เดียวกันเป๊ะ `anon` เทียบ `service_role` กับ table ที่มี row เดียวถูก scope ด้วย RLS ให้ user เฉพาะคนหนึ่ง:
+
+```text
+# anon key -- RLS บังคับใช้ ไม่เห็นอะไรเลย (ไม่มี session/auth.uid()):
+[]
+HTTP=200
+
+# service_role key -- ข้าม RLS ไปทั้งหมด เห็นทุก row ไม่ว่าเจ้าของจะเป็นใคร:
+[{"user_id":"f8cd7f9e-6dd4-482a-888b-b92184c98d07","secret":"alice-only-secret"}]
+HTTP=200
+```
+
+ไม่มี signature ไม่มีข้อจำกัด scope ใด ๆ ที่แยกสอง key นี้ออกจากกันได้จาก response เพียงอย่างเดียว -- ความต่างอยู่ที่ว่า key ไหนเรียกทั้งหมด และไม่มี technical control ใด ๆ (นอกจากไม่ส่งมันไปยัง client เลย) ที่หยุด browser จากการอ่าน constant ที่ฝังอยู่ใน bundle ของตัวเองได้
+
+**วิธีแก้:** `service_role` รันฝั่ง server เท่านั้นเสมอ -- edge function, process ฝั่ง backend, CI job -- ไม่เคยอยู่ในโค้ดที่ ship ไปยัง browser หรือ mobile app bundle เลย ถ้าต้องการสิทธิ์ที่ยกระดับจากโค้ด client จริง ๆ ให้เขียน RPC function ที่ scope แคบแทน เรียกด้วย key `anon`/`authenticated` ของผู้เรียกเอง
+
+**วิธีสังเกตตอน review:** grep bundle ฝั่ง client ใด ๆ, ไฟล์ใต้ `src/` ของ frontend framework ใด ๆ หรือ public repo ใด ๆ หา `SERVICE_ROLE_KEY`/`SUPABASE_SERVICE_ROLE_KEY` -- การมีอยู่ของมันเองนอก context ที่เป็น server-only คือสิ่งที่ต้อง flag ไม่ว่าจะ "ถูกใช้" แล้วหรือยัง
+
+### 26. named prepared statement ผ่าน pooler โหมด transaction
+
+โหมด transaction ของ Supavisor ให้ client ถือ connection ของ Postgres backend แค่ตลอดระยะเวลาของ 1 transaction แล้วคืนกลับ pool -- transaction ถัดไปจาก client logic เดียวกันอาจไปตกที่ backend คนละตัวเลย driver ที่ prepare named statement โดย default (package `postgres` ของ npm ทำแบบนี้ เว้นแต่จะบอกไม่ให้ทำ) สามารถอ้างอิง statement ที่ไม่มีอยู่จริงบน backend ที่ query ถัดไปดันไปตกลงได้
+
+```ts
+// broken by default: prepare defaults to true against a transaction-mode pooler
+import postgres from 'npm:postgres@3'
+const sql = postgres(Deno.env.get('PG_POOLER_URL')!)
+```
+
+ตาม [official troubleshooting guide](https://github.com/supabase/supabase/blob/master/apps/docs/content/troubleshooting/disabling-prepared-statements-qL8lEL.mdx): *"although the direct connections and Supavisor in session mode support prepared statements, Supavisor in transaction mode does not."*
+
+<Callout title="ช่องว่างที่ยอมรับตรง ๆ: reproduce บน local ไม่ได้">
+การพยายามบังคับให้เกิด error `prepared statement "..." does not exist` จริงกับ pooler ในเครื่องของโมดูลนี้เองไม่สำเร็จ -- client ตัวเดียวบน pool ที่โหลดเบา ๆ ในเครื่องไปตกที่ backend connection เดิมทุกครั้ง (ยืนยันผ่าน `pg_backend_pid()` เหมือนกันเป๊ะระหว่าง `PREPARE` ใน transaction หนึ่งกับ `EXECUTE` ใน transaction ถัดไปที่แยกกัน) ตรงกับข้อสรุปที่บันทึกไว้แล้วอย่างอิสระในบท **[Edge Functions and the Database](/supabase/th/edge-functions/edge-functions-and-the-database/)** ของคอร์สนี้เอง กลไกกับวิธีแก้ข้างบนจริงและมีเอกสารรองรับ -- การ reproduce ความล้มเหลวต้องการ connection churn แบบ concurrent จริง ที่ test แบบ client เดียวในเครื่องนี้ไม่สร้างให้ ระบุตรง ๆ แทนที่จะปลอมผล
+</Callout>
+
+**วิธีแก้:** `postgres(url, { prepare: false })` กับ connection string ของ pooler โหมด transaction ใด ๆ -- ตรงกับ flag `?pgbouncer=true` ที่มีเอกสารรองรับของ Prisma เองด้วยเหตุผลเดียวกันข้างใต้
+
+**วิธีสังเกตตอน review:** `postgres()`/connection string ของ driver ใด ๆ ที่ชี้ไปที่พอร์ต pooler โหมด transaction แบบ `:6543` โดยไม่มี `prepare: false` (หรือ option เทียบเท่าของ driver) ตั้งไว้ชัดเจน
+
+### 27. `pg_net` ถูกใช้ราวกับเป็น call แบบ synchronous
+
+`net.http_get`/`net.http_post` ของ `pg_net` คืน request id **ทันที** -- การเรียก HTTP จริงเกิดขึ้นบน background worker และ response ไปถึง `net._http_response` หลังจากนั้น (ปกติเร็ว แต่ไม่มีการรับประกันเลย)
+
+<SpotTheBug lang="sql" code={`select net.http_post('https://api.example.com/webhook', body := payload) as request_id \\gset
+-- immediately assumes the response is already available
+select status_code from net._http_response where id = :request_id;`}>
+`net.http_post` เป็น fire-and-forget โดยออกแบบมาแบบนั้น -- มันคืน request id ไม่ใช่ response การอ่าน `net._http_response` ใน statement ถัดไปทันทีแข่งกับ background worker ที่กำลังจะทำ HTTP call จริง row นั้นมักจะยังไม่มาถึงบ่อยมาก และโค้ดที่สมมติว่ามันมาแล้วปฏิบัติต่อ "ไม่มี row" เป็น "ไม่มี response มาเลย" แทนที่จะเป็น "ยังมาไม่ถึง"
+</SpotTheBug>
+
+พิสูจน์ -- request id เดียวกันเป๊ะ query ทันทีและอีกครั้งหลังรอสั้น ๆ:
+
+```text
+select net.http_get('http://kong:8000/rest/v1/rd_profiles?select=id&limit=1', headers := ...) as request_id;
+--  request_id
+-- ------------
+--           5
+
+-- ทันทีหลังจากนั้น:
+select id, status_code, content from net._http_response where id = 5;
+ id | status_code | content
+----+-------------+---------
+(0 rows)
+
+-- ~2 วินาทีต่อมา:
+ id | status_code |                     content
+----+-------------+-------------------------------------------------
+  5 |         200 | [{"id":"f8cd7f9e-6dd4-482a-888b-b92184c98d07"}]
+```
+
+0 row ทันทีหลัง call, `200` จริงพร้อม body จริงในอีกไม่นานหลังจากนั้น -- request id เดียวกันเป๊ะ table เดียวกันเป๊ะ
+
+**วิธีแก้:** poll `net._http_response` (พร้อม timeout กับ backoff จริง) สำหรับ webhook แบบ fire-and-forget ที่ผลลัพธ์สำคัญ หรือใช้ `net.http_collect_response()` เมื่อการรอแบบมีขอบเขตยอมรับได้ -- อย่าสมมติว่า response row มีอยู่ใน transaction เดียวกัน หรือแม้แต่ statement เดียวกัน กับที่ยิง request
+
+**วิธีสังเกตตอน review:** `select ... from net._http_response where id = <id ที่เพิ่งคืนมา>` ใด ๆ ที่ไม่มีการรอ ไม่มี retry loop และไม่มีการจัดการ "row ยังไม่มาถึง" เป็นกรณีแยกจาก "request ล้มเหลว"
+
+## Mental Model
+
+```text
+Eight groups, one shared failure shape:
+
+Schema & migrations -> a stale assumption (extension, FK behavior, generated types) that
+                        compiles and runs cleanly until the ONE moment it doesn't
+RLS & roles          -> syntactically perfect SQL that grants the wrong thing, silently
+Auth & sessions      -> a value that LOOKS like verified identity but was only decoded
+Client calls         -> {data, error} is real, and skipping error deletes the only signal
+Edge functions       -> Deno, not Node -- and which of 3 keys initializes the client
+Realtime             -> a prerequisite (publication, replica identity, a policy) nothing
+                        else in the code enforces or even mentions
+Storage              -> RLS on storage.objects, same habits as any other table, plus two
+                        upsert/folder-specific gotchas nothing else warns about
+Ops & pooling         -> which key, whether prepare:false, whether a call is actually async
+
+Across all 27: Postgres, PostgREST, tsc, and deno check validate syntax and types.
+None of them validate intent. "It compiled" and "it ran once without an error" answer
+almost none of these -- the single most common failure IS a clean 200 with no data.
+```
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"ถ้า query คืน `200` มันทำในสิ่งที่ฉันตั้งใจจริง"** พิสูจน์แล้วว่าไม่จริงซ้ำแล้วซ้ำเล่า: RLS-enabled-zero-policies, table ที่หายไปจาก `supabase_realtime`, และ `service_role` ที่บัง policy ที่พังไว้ทั้งหมดคืน `200` ที่สะอาดไม่มี error -- ความสำเร็จที่ชั้น transport ไม่ได้บอกอะไรเกี่ยวกับความถูกต้องเลย
+- **"โค้ดฝั่ง server ข้าม RLS เสมอ"** จริงสำหรับ `service_role` ผิดสำหรับ `anon` -- และ edge function ที่ใช้ `SUPABASE_ANON_KEY` ถูก scope เหมือนกันเป๊ะกับ browser ที่ใช้ key เดียวกัน พิสูจน์ตรง ๆ ใน entry 17
+- **"compiler หรือ linter จะจับได้ถ้ามันเป็นปัญหาจริง"** `tsc` กับ `deno check` ทั้งคู่ validate type กับ module resolution ไม่เคย validate เจตนาเลย -- `using (true)` ที่ไม่มี `with check`, ฟังก์ชัน `security definer` ที่ไม่มี `search_path`, และ table ที่มี 0 RLS policy ล้วนถูกต้องตามไวยากรณ์เป๊ะสำหรับทุก tool ใน stack นี้
+- **"โค้ด Supabase ที่ AI เขียนแค่ต้องการ training cutoff ที่ใหม่กว่า"** ปัญหาไม่ใช่แค่ความล้าสมัย: `uuid_generate_v4()`, `using (true)`, และ import แบบ bare ใน edge function ล้วนเป็น pattern ที่จริง เป็นปัจจุบัน และถูกต้องตามไวยากรณ์ ที่แค่ไม่ได้มีความหมายตามที่ training data จำนวนมากบอกใน stack นี้โดยเฉพาะ
+
+<Callout title="สรุปในบรรทัดเดียว">
+27 รูปแบบ รูปร่างที่กลับมาซ้ำหนึ่งอัน: Postgres, PostgREST, `tsc`, และ `deno check` ทุกตัวตรวจแค่ syntax กับ type ไม่เคยตรวจเจตนา และความล้มเหลวที่พบบ่อยที่สุดใน catalog นี้คือโค้ดที่คืนข้อมูลจริงด้วย `service_role` แล้วคืนผลลัพธ์ที่สะอาด ไม่มี error ว่างเปล่ากับทุกคนที่ไม่ใช่ `service_role`
+</Callout>
+
+export const quizAiBugCatalog = [
+  {
+    q: "จาก entry 5: ทำไมฉบับแก้ถึงคืน HTTP 200 พร้อม array ว่าง แทนที่จะเป็น 403 เมื่อ Alice ลอง PATCH ขโมย row เดิมซ้ำกับ policy ที่แก้แล้ว?",
+    options: [
+      "Because the fix disabled RLS entirely",
+      "Because the corrected using clause now filters the row out of what Alice can even see for update -- PostgREST reports \"0 rows matched\" as a successful request with no matching rows, not an authorization error",
+      "Because PostgREST always returns 200 regardless of RLS",
+      "Because the row was deleted",
+    ],
+    answer: 1,
+    explain: "พิสูจน์ตรง ๆ: PATCH request เดียวกันกับ policy ที่แก้แล้ว using(user_id = (select auth.uid())) คืน [] พร้อม HTTP 200 -- row นั้นไม่มองเห็นได้สำหรับ Alice ในการ update อีกต่อไปจริง ๆ ซึ่ง PostgREST รายงานเป็น 0 row ถูกผลกระทบ ไม่ใช่ 403",
+  },
+  {
+    q: "```text\nsetSession(alice) resolved. client.auth.getUser(): rd-alice@example.com\nrows visible through global.headers-frozen client: []\n```\nจาก output จริงนี้ของ entry 15 ทำไม `getUser()` ถึงรายงาน identity ของ Alice ถูกต้อง ในขณะที่ request ข้อมูลจริงยังคืนค่าว่างเปล่าอยู่?",
+    options: [
+      "getUser() is broken and returned the wrong result",
+      "getUser() reads the SDK's own internal session state (correctly updated by setSession), while the actual PostgREST request still carries the Authorization header frozen into global.headers at client construction -- two independent code paths that diverged",
+      "The row was deleted between the two calls",
+      "global.headers only affects storage, not the database",
+    ],
+    answer: 1,
+    explain: "พิสูจน์ตรง ๆ: client ธรรมดา (ไม่มี global.headers override) ที่ได้รับ setSession() call เดียวกันเป๊ะ คืน row จริงกลับมา -- header ที่ถูก freeze ไม่ใช่ setSession() เอง คือสาเหตุของผลลัพธ์ที่ว่างเปล่า",
+  },
+  {
+    q: "ทำไม catalog นี้ถึงถือว่า policy select ที่หายไปบน storage bucket เป็นบั๊กจริง เจาะจงสำหรับการ upload แบบ upsert:true แม้ policy insert กับ update จะ scope ถูกต้องแล้วก็ตาม?",
+    options: [
+      "upsert:true always fails regardless of policies",
+      "Storage's upsert path performs an existence check (a SELECT) before deciding whether to insert or update, and RLS applies to that check exactly like any other select -- proved: the identical upload with upsert:false (no existence check needed) succeeds with the same policy set",
+      "select policies are required for all storage operations, not just upsert",
+      "This is a bug in Supabase's Storage API, not a policy gap",
+    ],
+    answer: 1,
+    explain: "พิสูจน์ตรง ๆ ใน entry 23: path object เดียวกันเป๊ะ upsert:true พัง 403 เมื่อมีแค่ policy insert+update; upsert:false (insert ธรรมดา) สำเร็จด้วย policy set เดียวกันเป๊ะ; การเพิ่ม policy select ที่ตรงกันแก้กรณี upsert:true ได้",
+  },
+  {
+    q: "การพิสูจน์ security definer ของ entry 7 เปลี่ยน setting เดียวระหว่างฟังก์ชันที่พังกับที่แก้แล้ว -- คืออะไร และทำไม search_path ของ attacker เองถึงสำคัญ ทั้งที่ไม่เคยถูกให้สิทธิ์เข้าถึง schema ของ table จริงเลย?",
+    options: [
+      "The function's return type",
+      "set search_path = '' -- without it, an unqualified table reference inside a security definer function resolves using the CALLER's session search_path at call time, not the function owner's, so an attacker who can set their own search_path can redirect it to their own table",
+      "The language the function is written in",
+      "Whether the function is marked stable or volatile",
+    ],
+    answer: 1,
+    explain: "พิสูจน์ตรง ๆ: function body เดียวกันเป๊ะ เรียกภายใต้ search_path ของ attacker เป็น 'rd_evil, public' คืน fake secret ที่ attacker วางไว้โดยไม่มี search_path='' และคืนของจริงเมื่อมี -- search_path ของผู้เรียกเอง ไม่ใช่ grant ใด ๆ เป็นตัวตัดสินว่าการอ้างอิงแบบไม่ qualify resolve ไปที่ table ไหน",
+  },
+  {
+    q: "ทำไม entry 26 ถึงนำเสนอบั๊กเรื่อง prepared-statement ด้วย callout ที่บอกตรง ๆ ว่า 'reproduce ในเครื่องไม่ได้' แทนที่จะเป็นการพิสูจน์ความล้มเหลวแบบสด และทำไมมันยังเป็น catalog entry ที่ชอบธรรมอยู่?",
+    options: [
+      "Because the bug does not actually exist",
+      "Because forcing Supavisor transaction-mode's backend-reassignment failure needs genuine concurrent connection churn that a single low-concurrency local client did not generate -- the mechanism and fix are still real and doc-sourced, and this course's own harness rule requires saying so honestly rather than staging a fake failure",
+      "Because prepared statements are deprecated",
+      "Because the local stack does not have a pooler at all",
+    ],
+    answer: 1,
+    explain: "ระบุตรง ๆ ใน entry 26: pg_backend_pid() เหมือนกันเป๊ะระหว่าง PREPARE กับ EXECUTE ที่ตามมาใน test ความหนาแน่นต่ำเดียวกันนี้ ตรงกับข้อสรุปที่บทนี้บันทึกไว้แยกต่างหากใน Edge Functions and the Database -- การยอมรับตรง ๆ ว่า reproduce ไม่ได้ พร้อม quote กลไกจากเอกสาร troubleshooting ของ Supabase เอง ดีกว่าผลลัพธ์ที่จัดฉาก",
+  },
+];
+
+<Quiz client:visible id="reading-supabase/ai-bug-catalog" questions={quizAiBugCatalog} />
+
+<ProgressTracker client:visible id="reading-supabase/ai-bug-catalog" />
