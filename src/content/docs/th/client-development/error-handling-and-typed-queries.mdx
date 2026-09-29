@@ -1,6 +1,6 @@
 ---
 title: 'Error Handling and Typed Queries'
-description: 'shape ของ PostgrestError ที่ query ที่ fail ทุกอันคืนกลับมา ทำไม match บน error.code ดีกว่า parse error.message และ generated Database type จับ insert ที่ผิดได้ตั้งแต่ compile time'
+description: 'ผลลัพธ์จริงของ supabase gen types query embedded resource แบบ typed bug ที่พิสูจน์แล้วว่า schema drift ทำให้ tsc ผ่านแต่พังตอน runtime ค่า error.code จริงสี่แบบที่พบบ่อย และ error class จริงข้าม Auth, Storage, Functions'
 sidebar:
   order: 3
 ---
@@ -8,15 +8,16 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
 
-ทุก call ของ `supabase-js` resolve เป็น `{ data, error }` แทนที่จะ throw ดังนั้น pattern มาตรฐานคือเช็ก `error` ก่อน — พอเช็กแล้ว TypeScript จะ narrow type ของ `data` ให้เอง และถ้า `error` เป็น `PostgrestError` ควร branch ตาม `code` ที่ stable แทนที่จะดู `message` ที่เป็นข้อความอ่านง่าย
+ทุก call ของ `supabase-js` resolve เป็น `{ data, error }` ไม่ throw ดังนั้น pattern มาตรฐานคือเช็ค `error` ก่อน — พอจัดการแล้ว TypeScript จะ narrow `data` ให้เอง และ `Database` type ที่ generate ไว้อธิบาย schema แค่ *ณ ตอนที่ generate* เท่านั้น ซึ่งบทนี้พิสูจน์ว่ามัน drift หลุด sync จาก database จริงได้เงียบ ๆ
 
-## เช็ก `error` ก่อนเชื่อ `data`
+## เช็ค `error` ก่อนเชื่อ `data`
 
-pattern นี้เห็นมาแล้วในบทก่อน ตอนนี้จะพูดให้เป็นทางการ ไม่มี call ไหนของ `supabase-js` throw ตอน request fail จะ resolve ตามปกติเสมอ โดยผลลัพธ์ถูกแบ่งเป็น `data` กับ `error`
+ไม่มี call ไหนของ `supabase-js` throw ตอน request fail เลย มัน resolve ปกติเสมอ แยกผลลัพธ์เป็น `data` กับ `error`:
 
 ```typescript
 const { data, error } = await supabase
@@ -33,123 +34,399 @@ if (error) {
 }
 ```
 
-เพราะไม่มีอะไรถูก throw request ที่ fail แล้วลืมเช็ก ก็แค่ดูเหมือน `data` เป็น `null` เฉย ๆ ไม่มี stack trace มาบังคับให้สังเกต การเช็ก `error` ก่อนไม่ใช่แค่ best practice แต่เป็นวิธีเดียวที่บอกได้ชัดว่าสำเร็จหรือ fail และยังเป็นสิ่งที่ทำให้ TypeScript narrow type ของ `data` ได้ด้วย ใน branch `else` (หรือหลัง early `return` ตอน error) `data` จะถูกรู้ว่าไม่ใช่ null แน่นอน
+เพราะไม่มีอะไร throw request ที่ fail ที่ลืมเช็คก็แค่ทำให้ `data` เป็น `null` เฉย ๆ — ไม่มี stack trace บังคับให้สังเกต การเช็ค `error` ก่อนไม่ใช่แค่ good practice แต่เป็นวิธีเดียวที่บอก success กับ failure ออกจากกันได้แน่นอน และยังเป็นสิ่งที่ทำให้ TypeScript narrow type ของ `data` ได้ด้วย
 
-## shape ของ `PostgrestError`
+## `supabase gen types typescript --local` ผลลัพธ์จริง
 
-ตอน `error` มีค่า จะเป็น `PostgrestError` ที่มี field น่ารู้สี่ตัว
+จาก schema local จริงของคอร์สนี้ ตัดให้เหลือแค่สอง table ที่บทนี้ใช้:
 
-- **`message`** — คำอธิบายที่คนอ่านเข้าใจได้ว่าเกิดอะไรขึ้น
-- **`code`** — code ที่ stable ไม่ว่าจะเป็น Postgres error code (เช่น `23505` สำหรับ unique-constraint violation) หรือ code เฉพาะของ PostgREST
-- **`details`** — context เพิ่มเติมจาก Postgres ถ้ามี
-- **`hint`** — คำแนะนำวิธีแก้ ถ้า Postgres หรือ PostgREST เสนอมาให้ได้
+```bash
+# scripts/cli-gen-types.sh
+supabase gen types typescript --workdir tools/probe --local
+```
 
-กฎที่ใช้จริงคือ match บน `error.code` สำหรับการตัดสินใจแบบ programmatic ไม่ใช่ `error.message` ข้อความ message มีไว้ให้คนอ่าน และอาจเปลี่ยนคำระหว่าง version ส่วน code คือสัญญาที่ stable ที่ branch ตามได้อย่างปลอดภัย
+```text
+      cli_widgets: {
+        Row: {
+          created_at: string
+          id: string
+          owner: string
+          price: number
+          title: string
+        }
+        Insert: {
+          created_at?: string
+          id?: string
+          owner?: string
+          price: number
+          title: string
+        }
+        Update: {
+          created_at?: string
+          id?: string
+          owner?: string
+          price?: number
+          title?: string
+        }
+        Relationships: []
+      }
+      cli_widget_notes: {
+        Row: {
+          id: string
+          note: string
+          widget_id: string
+        }
+        ...
+        Relationships: [
+          {
+            foreignKeyName: "cli_widget_notes_widget_id_fkey"
+            columns: ["widget_id"]
+            referencedRelation: "cli_widgets"
+            referencedColumns: ["id"]
+          }
+        ]
+      }
+```
+
+Generate จาก schema จริงเบื้องหลังบทนี้: `create table public.cli_widgets (id uuid primary key default gen_random_uuid(), owner uuid not null default auth.uid() references auth.users(id), title text not null unique, price integer not null, created_at timestamptz not null default now())` บวก table ลูก `cli_widget_notes` ที่มี foreign key ย้อนกลับไป — array `Relationships` คือวิธีที่ generator บันทึก foreign key นั้น และมันคือสิ่งที่ทำให้ query embedded-resource ด้านล่าง type-safe
+
+```sql
+-- supabase/migrations/20260929000000_cli_widgets.sql
+create table public.cli_widgets (
+  id uuid primary key default gen_random_uuid(),
+  owner uuid not null default auth.uid() references auth.users(id),
+  title text not null unique,
+  price integer not null,
+  created_at timestamptz not null default now()
+);
+alter table public.cli_widgets enable row level security;
+create policy "cli_widgets_select_all" on public.cli_widgets for select to anon, authenticated using (true);
+create policy "cli_widgets_insert_own" on public.cli_widgets for insert to authenticated with check (owner = auth.uid());
+
+create table public.cli_widget_notes (
+  id uuid primary key default gen_random_uuid(),
+  widget_id uuid not null references public.cli_widgets(id) on delete cascade,
+  note text not null
+);
+alter table public.cli_widget_notes enable row level security;
+create policy "cli_widget_notes_select_all" on public.cli_widget_notes for select to anon, authenticated using (true);
+create policy "cli_widget_notes_insert_authenticated" on public.cli_widget_notes for insert to authenticated with check (true);
+```
+
+## Query embedded-resource แบบ typed
+
+`createClient<Database>()` (บทที่แล้ว) เช็คทุก call `.from()` กับ `Database` type ที่ generate ไว้ — รวมถึง string `select()` ที่ embed table ที่เกี่ยวข้องด้วยชื่อ ซึ่ง PostgREST resolve ผ่าน foreign key ข้างบน แล้ว query builder ก็ type มันเป็น nested array ให้อัตโนมัติ:
+
+```ts
+// src/cli-widgets-embedded-select.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+const API_URL = process.env.SUPABASE_URL!;
+const ANON_KEY = process.env.SUPABASE_ANON_KEY!;
+const admin = createClient(API_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+
+const email = 'cli-client-dev-widgets@example.com';
+const password = 'cli-pw-widgets-12345';
+let user = (await admin.auth.admin.listUsers()).data.users.find((u) => u.email === email);
+if (!user) user = (await admin.auth.admin.createUser({ email, password, email_confirm: true })).data.user!;
+
+const client = createClient(API_URL, ANON_KEY);
+await client.auth.signInWithPassword({ email, password });
+await admin.from('cli_widgets').delete().eq('title', 'cli-widget-alpha'); // idempotent re-run
+
+const { data: widget } = await client.from('cli_widgets').insert({ title: 'cli-widget-alpha', price_usd: 100 }).select().single();
+await client.from('cli_widget_notes').insert({ widget_id: widget!.id, note: 'first note' });
+await client.from('cli_widget_notes').insert({ widget_id: widget!.id, note: 'second note' });
+
+const { data: embedded, error } = await client
+  .from('cli_widgets')
+  .select('title, price_usd, cli_widget_notes(note)') // Tables<'cli_widget_notes'>[] inferred via the foreign key
+  .eq('id', widget!.id)
+  .single();
+console.log('embedded select error =', error?.code ?? null);
+console.log('embedded select data =', JSON.stringify(embedded));
+
+await admin.from('cli_widgets').delete().eq('title', 'cli-widget-alpha');
+```
+
+```text
+embedded select error = null
+embedded select data = {"title":"cli-widget-alpha","price_usd":100,"cli_widget_notes":[{"note":"first note"},{"note":"second note"}]}
+```
+
+หมายเหตุเรื่องลำดับ: migration ของบทนี้เองรันตามลำดับในเอกสาร ดังนั้นตอนที่ script `// @run` ตัวไหนของบทนี้รันจริง การเปลี่ยนชื่อ column ใน section ถัดไปเกิดขึ้นจริงไปแล้ว — ทุกการพิสูจน์ที่รันได้จากตรงนี้ไปเล็งไปที่ชื่อ column จริงบน live database คือ `price_usd` section ถัดไป ("stale type") ตั้งใจใช้ชื่อ `price` เดิมใน type ที่เขียนเองต่อไป เป็นตัวแทนของไฟล์ `database.types.ts` ที่ไม่มีใคร regenerate — ความไม่ตรงกันนั้น ไม่ใช่การตั้งชื่อใน section นี้ คือประเด็นทั้งหมดของสิ่งที่ตามมา
+
+`embedded.cli_widget_notes` ถูก infer เป็น `{ note: string }[]` — array เพราะ foreign key วิ่งไปอีกทาง (หลาย note อ้าง widget เดียว) — โดยไม่ต้องพิมพ์ type เองเลย กลับด้าน embed (select จาก `cli_widget_notes` แล้ว embed `cli_widgets(...)`) shape ที่ infer ได้จะกลายเป็น object เดี่ยว nested ไม่ใช่ array ตาม foreign key ทิศทางตรงข้าม
+
+## Type drift พิสูจน์ทั้งสองด้าน
+
+`Database` type ที่ generate ไว้เป็นแค่ **snapshot** ไม่มีอะไรมาเช็คมันกับ live schema อัตโนมัติเลย — พิสูจน์ทั้งสองด้านว่าเกิดอะไรขึ้นเมื่อเปลี่ยนชื่อ column แล้วไม่ regenerate type:
+
+**ด้านที่ 1: type เก่ายัง compile ผ่านสะอาด** snapshot ที่เก็บไว้เองของ `Database['public']['Tables']['cli_widgets']` ตรงเป๊ะกับที่ `gen types` สร้างข้างบน *ก่อน* การเปลี่ยนชื่อ column ด้านล่าง:
+
+```ts
+// src/cli-widgets-stale-type.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+type StaleWidgetsRow = { id: string; owner: string; title: string; price: number; created_at: string };
+type StaleDatabase = {
+  public: { Tables: { cli_widgets: { Row: StaleWidgetsRow; Insert: Partial<StaleWidgetsRow>; Update: Partial<StaleWidgetsRow> } } };
+};
+
+const stale = createClient<StaleDatabase>(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!);
+const { data, error } = await stale.from('cli_widgets').select('id, title, price');
+console.log('compiles clean, but runtime error.code =', error?.code, '| message =', error?.message);
+console.log('data =', data);
+```
+
+compile ไฟล์นี้ด้วย `tsc` เดี่ยว ๆ (`node_modules/.bin/tsc -p .` — program เดียวกับที่ harness ของคอร์สนี้ type-check ทุก fence `src/*.ts`) รายงาน **error ศูนย์ตัว** แต่ migration ข้างล่างเปลี่ยนชื่อ `price` เป็น `price_usd` จริง:
+
+```sql
+-- supabase/migrations/20260929000001_cli_widgets_rename_price.sql
+alter table public.cli_widgets rename column price to price_usd;
+```
+
+รัน script ที่ compile สะอาดตัวเดิมเป๊ะ กับ table ที่เปลี่ยนชื่อไปแล้วจริง ๆ:
+
+```text
+compiles clean, but runtime error.code = 42703 | message = column cli_widgets.price does not exist
+data = null
+```
+
+`42703` จริงของ Postgres (`undefined_column`) ทะลุผ่าน PostgREST มาตรง ๆ — **`tsc` ไม่เจออะไรผิดเลย แต่ query ยังพังอยู่ดี** type เก่าอธิบาย schema ที่ไม่มีอยู่แล้ว
+
+**ด้านที่ 2: regenerate type เปลี่ยนข้อผิดพลาดเดียวกันให้กลายเป็น compile error ก่อนที่อะไรจะรันด้วยซ้ำ** รัน `supabase gen types typescript --local` ใหม่ ตอนนี้รายงาน `price_usd` ไม่ใช่ `price` แล้ว เขียน query และการอ่าน property เดิมเป๊ะกับ type ใหม่นี้:
+
+```ts
+// @expect-error TS2339: Property 'price' does not exist on type 'never' — the regenerated type catches the same stale-column mistake proved above
+import { createClient } from '@supabase/supabase-js';
+
+type FreshWidgetsRow = { id: string; owner: string; title: string; price_usd: number; created_at: string };
+type FreshDatabase = {
+  public: { Tables: { cli_widgets: { Row: FreshWidgetsRow; Insert: Partial<FreshWidgetsRow>; Update: Partial<FreshWidgetsRow> } } };
+};
+
+const fresh = createClient<FreshDatabase>('http://x', 'x');
+const { data, error } = await fresh.from('cli_widgets').select('id, title, price').single(); // same typo as before
+if (error) throw error;
+console.log(data.price);
+```
+
+```text
+error TS2339: Property 'price' does not exist on type 'never'.
+```
+
+diagnostic จริงจาก `tsc` — ควรพูดให้ชัดว่า *อะไร* ถูกเช็คจริง ๆ: string `.select('...')` ของ `postgrest-js` ไม่ถูก validate กับ schema ที่ระดับ type เองใน version นี้ แต่ **shape ของข้อมูลที่มันคืนมา** ถูก derive จากมัน และ shape นั้นแหละที่การอ่าน property ใด ๆ ถูกเช็คด้วย — `price` ไม่เคยเป็นส่วนหนึ่งของ `Row` ของ `cli_widgets` ภายใต้ type ใหม่ ดังนั้น `data.price` จึงกลายเป็น compile error (`never` เพราะ builder จับคู่ column ชื่อ `price` ใน select string กับ `Row` type ใหม่ไม่ได้เลย) แทนที่จะเป็น `undefined` เงียบ ๆ ตอน runtime นี่คือเวอร์ชันรูปธรรมของ "regenerate type หลังทุก migration" — ข้ามมันไปไม่ได้ทำให้ TypeScript จับ mistake นั้นได้ทีหลัง มันทำให้ TypeScript จับไม่ได้เลยต่างหาก และการพิสูจน์ก่อนหน้านี้โชว์แล้วว่า "ทีหลัง" หน้าตาเป็นแบบไหน: `42703` จริงบน production
+
+## `error.code` พิสูจน์กับ failure จริงสี่แบบ
+
+`error.code` คือ identifier ที่เสถียร — เป็น Postgres error code จริงหรือ code เฉพาะของ PostgREST — และคือสิ่งที่โค้ดควร branch ไม่เคยใช้ text ของ `error.message` ค่าจริงสี่ค่า จาก request จริงสี่แบบกับ `cli_widgets`:
+
+```ts
+// src/cli-widgets-error-codes.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+const API_URL = process.env.SUPABASE_URL!;
+const admin = createClient(API_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+
+const email = 'cli-client-dev-widgets-errors@example.com';
+const password = 'cli-pw-widgets-errors-12345';
+let user = (await admin.auth.admin.listUsers()).data.users.find((u) => u.email === email);
+if (!user) user = (await admin.auth.admin.createUser({ email, password, email_confirm: true })).data.user!;
+
+const client = createClient(API_URL, process.env.SUPABASE_ANON_KEY!);
+await client.auth.signInWithPassword({ email, password });
+await admin.from('cli_widgets').delete().eq('title', 'cli-widget-errors-demo'); // idempotent re-run
+
+await client.from('cli_widgets').insert({ title: 'cli-widget-errors-demo', price_usd: 50 });
+
+const { error: dupErr } = await client.from('cli_widgets').insert({ title: 'cli-widget-errors-demo', price_usd: 1 });
+console.log('duplicate insert -> error.code =', dupErr?.code, '|', dupErr?.message);
+
+const otherUid = crypto.randomUUID();
+const { error: rlsErr } = await client.from('cli_widgets').insert({ title: 'cli-widget-errors-spoof', price_usd: 1, owner: otherUid });
+console.log('spoofed-owner insert -> error.code =', rlsErr?.code, '|', rlsErr?.message);
+
+const { error: zeroErr } = await client.from('cli_widgets').select().eq('title', 'cli-widget-does-not-exist').single();
+console.log('.single() with 0 rows -> error.code =', zeroErr?.code, '|', zeroErr?.message);
+
+const { data: maybeData, error: maybeErr } = await client.from('cli_widgets').select().eq('title', 'cli-widget-does-not-exist').maybeSingle();
+console.log('.maybeSingle() with 0 rows -> error =', maybeErr, '| data =', maybeData);
+
+await admin.from('cli_widgets').delete().eq('title', 'cli-widget-errors-demo');
+```
+
+```text
+duplicate insert -> error.code = 23505 | duplicate key value violates unique constraint "cli_widgets_title_key"
+spoofed-owner insert -> error.code = 42501 | new row violates row-level security policy for table "cli_widgets"
+.single() with 0 rows -> error.code = PGRST116 | Cannot coerce the result to a single JSON object
+.maybeSingle() with 0 rows -> error = null | data = null
+```
+
+`23505` (`unique_violation`) และ `42501` (`insufficient_privilege` โค้ดที่ Postgres ใช้เมื่อ RLS policy ปฏิเสธ) ทั้งคู่เป็น Postgres error code ธรรมดา ส่งผ่านมาไม่เปลี่ยน `PGRST116` เป็น code เฉพาะของ PostgREST เอง เฉพาะ `.single()`: มันเรียกร้อง **แค่แถวเดียวเป๊ะ** แล้วเปลี่ยนอะไรก็ตามที่ไม่ใช่นั้น — ศูนย์แถวหรือมากกว่าหนึ่งแถว — เป็น error นี้ `.maybeSingle()` มีไว้เพื่อกรณี "ศูนย์แถวคือผลลัพธ์ที่ valid และคาดหวังได้" โดยเฉพาะ: คาดหวังแถวเดียวเหมือนกัน แต่ศูนย์แถว resolve เป็น `{ data: null, error: null }` แทนที่จะเป็น error ในขณะที่มากกว่าหนึ่งแถวยังเป็น error อยู่ไม่ว่าจะใช้ method ไหน
 
 ```typescript
-const { error } = await supabase
-  .from('profiles')
-  .insert({ id: userId, username: 'ada' });
-
 if (error) {
   if (error.code === '23505') {
-    // Postgres unique_violation — a stable code, unlike the message text
-    showError('That username is taken.');
+    showError('That title is taken.');
+  } else if (error.code === '42501') {
+    showError('You do not have permission to do that.');
+  } else if (error.code === 'PGRST116') {
+    showError('Not found.');
   } else {
     showError('Something went wrong, please try again.');
   }
 }
 ```
 
-## Generated type จับ query ที่ผิดได้ก่อนรันจริง
+## `AuthError`, `StorageError` และ `FunctionsHttpError`: ชื่อ class จริง
 
-เอา `Database` type จากบทก่อนไปใส่ให้ `createClient<Database>()` แปลว่าทุก `.select()`, `.insert()` และ `.update()` จะถูกเช็กกับ schema จริงตอน compile time
+sub-client สามตัวที่ต่างกัน throw หรือคืน error base class คนละตัว — ยืนยันที่นี่ด้วยการ import ตรงจาก package ที่ติดตั้งจริงแต่ละตัว (`@supabase/auth-js@2.117.2`, `@supabase/storage-js@2.117.2`, `@supabase/functions-js@2.117.2`) ไม่ใช่เดาจากความจำ:
 
-```typescript
-import { createClient } from '@supabase/supabase-js';
-import type { Database } from './database.types';
+```text
+node -e "console.log(Object.keys(require('@supabase/auth-js')).filter(k => /Error/.test(k)))"
+[ 'AuthError', 'AuthApiError', 'AuthUnknownError', 'AuthSessionMissingError',
+  'AuthInvalidTokenResponseError', 'AuthInvalidCredentialsError', 'AuthWeakPasswordError',
+  'AuthInvalidJwtError', 'AuthRetryableFetchError', ... ]
 
-const supabase = createClient<Database>(
-  process.env.SUPABASE_URL!,
-  process.env.SUPABASE_ANON_KEY!
-);
+node -e "console.log(Object.keys(require('@supabase/storage-js')).filter(k => /Error/.test(k)))"
+[ 'StorageApiError', 'StorageError', 'StorageUnknownError', 'StorageVectorsApiError', ... ]
 
-type ProfileInsert = Database['public']['Tables']['profiles']['Insert'];
+node -e "console.log(Object.keys(require('@supabase/functions-js')).filter(k => /Error/.test(k)))"
+[ 'FunctionsError', 'FunctionsFetchError', 'FunctionsHttpError', 'FunctionsRelayError' ]
+```
 
-async function createProfile(profile: ProfileInsert) {
+call ของ `supabase.auth.*` reject/คืน `AuthError` (ในทางปฏิบัติมักเป็น `AuthApiError`); call ของ `supabase.storage.*` คืน `StorageError` (ในทางปฏิบัติมักเป็น `StorageApiError`); `supabase.functions.invoke()` reject ด้วย `FunctionsHttpError` เฉพาะตอน response ไม่ใช่ 2xx (แยกจาก `FunctionsFetchError` สำหรับ failure ระดับ network และ `FunctionsRelayError` สำหรับ gateway ของ Functions เองที่ relay request ไม่สำเร็จ) — สาม shape ที่ต่างกันจริงสำหรับสาม service ที่ต่างกันจริง ไม่มีตัวไหนเป็น `PostgrestError` ที่บทนี้เน้นเป็นหลัก branch ด้วย `error instanceof FunctionsHttpError` (แทนที่จะ duck-type บน `.message`) เป็นวิธีที่เชื่อถือได้ในการแยก "function รันแล้วคืน error response" จาก "function เข้าไม่ถึงเลย"
+
+## กลยุทธ์ retry: อะไร retry จริง อะไรไม่เคย
+
+อ่าน source ของ `@supabase/postgrest-js@2.117.2` ที่ติดตั้งจริงตรง ๆ แทนที่จะเดา: มี retry mechanism ในตัวจริง และมันแคบกว่าที่ชื่อบอก
+
+```text
+# tools/probe/node_modules/@supabase/postgrest-js/dist/index.cjs (installed 2.117.2, read directly)
+const DEFAULT_MAX_RETRIES = 3;
+const getRetryDelay = (attemptIndex) => Math.min(1e3 * 2 ** attemptIndex, 3e4); // 1s, 2s, 4s, ... capped at 30s
+const RETRYABLE_STATUS_CODES = [520, 503]; // 520 = Cloudflare transient; 503 = PostgREST schema cache not yet loaded
+const RETRYABLE_METHODS = ["GET", "HEAD", "OPTIONS"];
+```
+
+สามข้อที่ควรพูดให้ชัด อ่านตรงจาก source ทั้งหมด: retry ถูกจำกัดที่ **3 ครั้ง** ด้วย **exponential backoff** (1s, 2s, 4s จำกัดที่ 30s); มีแค่ **สอง status code ที่ transient เฉพาะเจาะจง** ที่ trigger retry ไม่ใช่ทุก 5xx; และมีแค่ **method อ่านที่ idempotent** (`GET`/`HEAD`/`OPTIONS`) เท่านั้นที่ retry อัตโนมัติ — `.insert()`/`.update()`/`.delete()` (`POST`/`PATCH`/`DELETE`) **ไม่เคย** ถูก retry อัตโนมัติโดย layer นี้ เพราะ retry การเขียนที่อาจสำเร็จไปแล้วเสี่ยงต่อ side effect ซ้ำซ้อน service อีกสองตัวในคอร์สนี้จัดการ retry ต่างกันไปเลย: Realtime reconnect WebSocket อัตโนมัติเมื่อเจอ `CHANNEL_ERROR` (config ได้ผ่าน `realtime: { params: { reconnectAfterMs } } }` ตาม reference example ปัจจุบันของ SDK เอง) และ error-codes reference ของ Storage เองบันทึกไว้ว่า response `503 SlowDown` เป็นสัญญาณให้ back off แล้ว retry เอง — ไม่มี retry อัตโนมัติสร้างไว้ใน Storage client เลยสำหรับกรณีนี้ กติกาข้อเดียวที่ใช้ได้ทุกที่: อย่าสร้าง retry loop ของตัวเองครอบ call เขียนโดยไม่มี idempotency key หรือ guard เทียบเท่า ด้วยเหตุผลเดียวกับที่ retry logic ในตัวของ REST layer เองกันการเขียนออกไปโดยตั้งใจ
+
+<Mermaid title="เช็ค error, branch บน error.code แล้วรักษา generated type ให้ตรงความจริงเสมอ" code={typedQueriesDiagram} />
+
+export const typedQueriesDiagram = `flowchart LR
+  call[".from('cli_widgets').insert(row)"] --> result["{ data, error }"]
+  result --> check{"error present?"}
+  check -->|"yes"| code{"error.code"}
+  code -->|"23505"| unique["Unique violation"]
+  code -->|"42501"| rls["RLS rejection"]
+  code -->|"PGRST116"| single["single() got 0 or 2+ rows"]
+  check -->|"no"| typed["Use typed data safely"]
+  drift[("Schema changes")] -->|"gen types NOT re-run"| stale["tsc passes, runtime 42703"]
+  drift -->|"gen types re-run"| caught["tsc catches it, no runtime surprise"]`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+ทุก call ของ `supabase-js` resolve เป็น **`{ data, error }`** ไม่ throw — เช็ค `error` ก่อน แล้ว branch บน **`error.code`** ที่เสถียร (`23505` unique violation, `42501` RLS rejection, `PGRST116` จาก `.single()` เมื่อ 0 หรือ 2+ แถว — พิสูจน์ด้วยค่าจริงทั้งหมดข้างบน; `.maybeSingle()` เปลี่ยนกรณี 0-แถวให้เป็น `{ data: null, error: null }` แทน) แทนที่จะใช้ text ของ `error.message` `AuthError`, `StorageError` และ `FunctionsHttpError` เป็นสาม class จริงที่ต่างกันสำหรับสาม service ที่ต่างกัน — ยืนยันด้วยการ import ตรงจาก package ที่ติดตั้งแต่ละตัว `Database` type ที่ generate ไว้เป็นแค่ **snapshot**: พิสูจน์ทั้งสองด้าน — type เก่าที่ไม่ regenerate ยัง compile ผ่านสะอาด ขณะที่ column ที่เปลี่ยนชื่อ throw `42703` จริงตอน runtime และการ regenerate เปลี่ยน mistake เดียวกันเป๊ะให้กลายเป็น compile error ของ `tsc` จริงแทน retry ในตัวของ `postgrest-js` เป็นของจริงแต่แคบ: 3 ครั้ง, exponential backoff, มีแค่ status `520`/`503` และมีแค่ method อ่านที่ idempotent `GET`/`HEAD`/`OPTIONS` — การเขียนไม่เคยถูก auto-retry เลย
+</Callout>
+
+## อ่านโค้ดที่ AI สร้าง
+
+AI assistant ที่ถูกขอให้ "handle กรณีที่ widget ไม่มีอยู่จริง" สร้างโค้ดนี้:
+
+<SpotTheBug lang="ts" code={`async function getWidgetByTitle(title: string) {
   const { data, error } = await supabase
-    .from('profiles')
-    .insert(profile)
-    .select()
+    .from('cli_widgets')
+    .select('id, title, price_usd')
+    .eq('title', title)
     .single();
 
   if (error) {
-    if (error.code === '23505') {
-      throw new Error('That username is taken.');
-    }
-    throw error;
+    // "not found" is the only realistic error here, right?
+    return null;
   }
 
   return data;
 }
-```
+`}>
+โค้ดนี้ปฏิบัติต่อ error ทุกแบบจาก `.single()` ว่าเป็น "not found" แล้วกลืนมันเงียบ ๆ ให้กลายเป็น `null` — แต่ error code จริงของ `.single()` สำหรับ "0 หรือ 2+ แถว" ที่พิสูจน์ข้างบน คือ `PGRST116` เฉพาะเจาะจง และฟังก์ชันนี้ยุบมันรวมกับ RLS rejection จริง (`42501` พิสูจน์ข้างบนเช่นกัน — row อื่น, owner ผิด หรือ select policy ที่ขาดไปเลย) หรือ failure ชั่วคราวจริง ๆ เข้าด้วยกัน caller ของ `getWidgetByTitle` บอกไม่ได้เลยว่า "title นี้ไม่มีอยู่จริง" ต่างจาก "คุณไม่มีสิทธิ์เห็นสิ่งนี้" หรือ "database เข้าไม่ถึงตอนนี้" — สามสถานการณ์ที่ต่างกันสิ้นเชิงที่ควรได้ UI response ต่างกันสิ้นเชิง (หน้า 404, error สิทธิ์, ปุ่ม retry) ถูกยุบรวมเป็น `null` เดียวกันหมด ทางแก้คือเช็ค `error.code` ตรง ๆ เหมือนที่บทนี้ทำ: `if (error) { if (error.code === 'PGRST116') return null; throw error; }` — ตอนนี้เฉพาะกรณี "ไม่มีแถวตรงกันจริง ๆ" เท่านั้นที่คืน `null` ส่วนที่เหลือ propagate เป็น error จริงแทนที่จะหายไปเงียบ ๆ นี่ยังเป็นกรณีที่ควรใช้ `.maybeSingle()` แทน `.single()` ตั้งแต่แรกด้วย: มันทำให้ "ศูนย์แถวคือเรื่องปกติ" เป็น path ที่คาดหวังไว้ ไม่มี error แล้วปล่อยให้ `error` มีความหมายตามที่ควร — คือมีอะไรผิดพลาดจริง ๆ
+</SpotTheBug>
 
-พอตั้งค่าแบบนี้แล้ว การ select column ที่ไม่มีอยู่จริงใน `profiles` หรือเรียก `createProfile` ด้วย object ที่ขาด field ที่จำเป็นจาก `Insert` จะกลายเป็น TypeScript error ตอน build — รู้ตั้งแต่ตอนเขียนโค้ด ไม่ใช่มารู้จาก request ที่ fail ตอน production
+## Mental Model
 
-<Mermaid title="Branch on error, and specifically on error.code, before trusting data" code={typedQueriesDiagram} />
+`{ data, error }` ไม่ใช่สอง field ที่เป็นอิสระต่อกัน — มันคือ discriminated union ตัวเดียวที่ใส่เสื้อผ้าสองช่อง: มีแค่ตัวเดียวที่มีความหมายจริง (non-null) ในแต่ละ call และทุก bug ในบทนี้มาจากโค้ดที่ลืมสิ่งนั้นแล้วอ่าน `data` (หรือ property บนมัน) โดยไม่ได้ตัด `error` ออกไปก่อนจริง ๆ ไม่ว่าจะเป็นเพราะเช็คขาดไป (`SpotTheBug`) หรือ type ที่ไม่ตรงความจริงแล้ว (การพิสูจน์ drift) `Database` type ที่ generate ไว้ไม่ใช่ connection ที่เชื่อมกับ schema แบบสด ๆ — มันคือ **snapshot** ไฟล์ TypeScript ธรรมดาที่เกิดจากการ inspect schema ครั้งเดียว `tsc` ซื่อสัตย์เต็มที่กับไฟล์ที่มันได้รับ มันไม่มีทางรู้เลยว่าไฟล์นั้น stale ไปแล้ว ซึ่งเป็นเหตุผลเป๊ะ ๆ ที่การพิสูจน์ drift compile ผ่านสะอาดบน type เก่า แล้ว fail แค่ตอนที่ generation ใหม่เปลี่ยนสิ่งที่ `tsc` เช็คด้วยจริง ๆ ปฏิบัติต่อ `gen types` เหมือนที่ปฏิบัติต่อการรัน linter ใหม่หลังเปลี่ยน config ของมัน — เป็น step ที่ migration เองไม่ทำให้อัตโนมัติ
 
-export const typedQueriesDiagram = `flowchart LR
-  call[".from('profiles').insert(profile)"] --> result["{ data, error }"]
-  result --> check{"error present?"}
-  check -->|"yes"| code{"error.code"}
-  code -->|"23505"| unique["Show: username already taken"]
-  code -->|"other"| generic["Show a generic failure message"]
-  check -->|"no"| typed["Use typed data safely"]`;
+## Trade-off
 
-<Callout title="สรุปหนึ่งบรรทัด">
-ทุก call ของ `supabase-js` resolve เป็น **`{ data, error }`** แทนที่จะ throw ดังนั้นเช็ก `error` ก่อนเสมอ แล้ว TypeScript จะ narrow `data` ให้เอง `error` ที่มีค่าคือ `PostgrestError` ที่มี **`message`**, **`code`**, **`details`** และ **`hint`** ให้ branch ตาม **`error.code`** ที่ stable (เช่น `23505` สำหรับ unique-constraint violation) แทนการ parse ข้อความ `error.message` ที่เปลี่ยนคำได้ เอา generated `Database` type ไปใส่ `createClient<Database>()` แล้ว `.select()`, `.insert()` และ `.update()` จะถูกเช็กกับ schema จริงตั้งแต่ **compile time** ทำให้ column ผิดหรือ field ที่จำเป็นหายไปกลายเป็น build error แทนเรื่องเซอร์ไพรส์ตอน runtime
-</Callout>
+- **Branch บน `error.code` เสถียรข้าม message wording ที่เปลี่ยนไปและข้าม locale** — แลกกับต้องรู้จักและเปิดหา code เหล่านั้นจริง ๆ (`23505`, `42501`, `PGRST116` และตัวอื่น) แทนที่จะอ่านประโยคภาษาอังกฤษ
+- **`Database` type ที่ generate ไว้ให้ compile-time safety จริงสำหรับเกือบทั้งอายุของ schema** — แลกกับช่องว่างจริงที่พิสูจน์ข้างบน ในช่วงเวลาระหว่าง migration ลงจริงกับตอนที่มีคน regenerate type ช่องว่างนั้นเงียบ ไม่ใช่ build failure
+- **สัญญาแบบเข้มงวด "แค่แถวเดียวเป๊ะ" ของ `.single()` ทำให้การ match หลายแถวโดยไม่ตั้งใจดังชัด** (เป็น `PGRST116` จริง ไม่ใช่เลือกแถวแรกเงียบ ๆ) — แลกกับการทำให้กรณี "ศูนย์แถว" ที่ valid และคาดหวังได้ throw ไปด้วย ซึ่งเป็นกรณีที่ `.maybeSingle()` มีไว้จัดการแทน
+- **retry ในตัวของ `postgrest-js` (พิสูจน์ข้างบน: 3 ครั้ง, exponential backoff, มีแค่ `520`/`503`, อ่านอย่างเดียว) ไม่ต้อง setup อะไรเลยสำหรับ failure ชั่วคราวที่มันครอบคลุม** — แลกกับการครอบคลุมแค่ส่วนแคบ ๆ ของ failure จริง failure อื่น ๆ (`500`, การเขียนที่ timeout) ยังเป็นความรับผิดชอบของแอปเองอยู่ดี
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"ถ้า TypeScript compile ผ่าน แปลว่า query ถูกต้องกับ database จริง"** พิสูจน์แล้วว่าผิด ทั้งสองทิศทาง: `Database` type ที่ stale compile query ที่พังไปแล้วผ่านสะอาด แล้วมีแค่ request จริงตอน runtime เท่านั้นที่เผย `42703` regenerate type หลังทุก migration คือสิ่งที่ทำให้ความเห็นของ `tsc` ตรงกับความจริง ไม่ใช่แค่คำแนะนำ
+- **"branch บน error.message ก็โอเค ตราบใดที่ match wording ปัจจุบันเป๊ะ"** เปราะบางโดยธรรมชาติ: `error.code` คือ contract ที่ documented และเสถียร (`23505`, `42501`, `PGRST116` พิสูจน์ข้างบน) ข้อความคือสำหรับคนอ่าน ไม่ใช่ API ที่ versioned
+- **"error ที่จับได้จาก .single() แปลว่า row ไม่มีอยู่จริงเสมอ"** พิสูจน์แล้วว่าผิดจาก `SpotTheBug` ของบทนี้: branch `error` เดียวกันจับ RLS rejection กับ failure อื่นด้วย นอกจากจะเช็ค `error.code` เฉพาะเจาะจงว่าเป็น `PGRST116`
+- **"error ของ Auth, Storage และ Functions ก็เป็นแค่ PostgrestError เหมือนทุกอย่างในบทนี้"** พิสูจน์แล้วว่าผิดจากการ import แต่ละ package ตรง ๆ: `AuthError`/`AuthApiError`, `StorageError`/`StorageApiError` และ `FunctionsError`/`FunctionsHttpError` เป็นสาม class hierarchy จริงที่ต่างกัน ไม่มีตัวไหนเป็น `PostgrestError` เลย
 
 export const quizTypedQueries = [
   {
-    q: 'ผลลัพธ์ query ของ supabase-js มี shape แบบไหน และรู้ได้อย่างไรว่า fail',
+    q: 'column ถูกเปลี่ยนชื่อใน migration จริง แต่ไม่เคย re-run `supabase gen types` เลย query ที่เขียนกับ generated type เก่า (ตอนนี้ stale) ถูก compile แล้วรัน เกิดอะไรขึ้นจริง ๆ',
     options: [
-      'throw exception ที่ต้องดักด้วย try/catch',
-      'resolve เป็น { data, error } และต้องเช็ก error เองแทนที่จะพึ่ง exception ที่ถูก throw',
-      'คืนแค่ data โดย request ที่ fail จะกลายเป็น array ว่างแบบเงียบ ๆ',
-      'คืน HTTP status code ตัวเลขที่ต้อง interpret เอง',
+      'tsc รายงาน error ทันที เพราะ column ไม่มีอยู่แล้ว',
+      'tsc compile ผ่านสะอาด (พิสูจน์แล้ว: error ศูนย์ตัว) แต่ request จริงกับ database พังตอน runtime ด้วย 42703 undefined_column จริง',
+      'query คืนค่าล่าสุดที่รู้จักของ column เก่าเงียบ ๆ',
+      'supabase-js ตรวจจับ drift และ regenerate type อัตโนมัติตอน runtime',
     ],
     answer: 1,
+    explain: 'พิสูจน์ตรง ๆ: script ตัวเดิมเป๊ะ compile ผ่านด้วย tsc error ศูนย์ตัวบน type เก่า แล้ว fail ตอน runtime ด้วย "42703 column cli_widgets.price does not exist" จริง พอ column ถูกเปลี่ยนชื่อจริงแล้ว',
   },
   {
-    q: 'ทำไม match บน error.code ถึง robust กว่า match บน error.message',
+    q: 'หลัง regenerate Database type ให้ตรงกับ column ที่เปลี่ยนชื่อแล้ว เกิดอะไรขึ้นเมื่อ compile query เดิม (ที่ยังผิด) อีกครั้ง',
     options: [
-      'error.message ไม่มีอยู่บน PostgrestError',
-      'error.code เป็น identifier ที่ stable (เช่น Postgres error code) ส่วน error.message เป็นข้อความอ่านง่ายที่เปลี่ยนคำได้',
-      'error.code มีให้แค่ตอน network failure เท่านั้น',
-      'สองอย่างนี้ไม่มีความต่างในทางปฏิบัติ',
+      'ไม่มีอะไรเปลี่ยน tsc ยัง compile ผ่านสะอาดอยู่',
+      'tsc compile error จริง (TS2339, property ไม่มีอยู่) — type ใหม่จับ mistake เดียวกับที่ type เก่าปล่อยผ่านได้',
+      'query ถูก rewrite อัตโนมัติให้ใช้ชื่อ column ใหม่',
+      'การ regenerate type ไม่มีผลอะไรกับ query ที่เขียนไว้แล้ว',
     ],
     answer: 1,
+    explain: 'พิสูจน์ด้วย tsc diagnostic จริง: "error TS2339: Property \'price\' does not exist on type \'never\'" พอ Database type ถูก regenerate ให้ตรงกับ column ที่เปลี่ยนชื่อจริงแล้ว',
   },
   {
-    q: 'การเอา generated Database type ไปใส่ createClient ให้ประโยชน์อะไรตอน compile-time กับ insert และ update',
+    q: 'ค่า error.code จริงที่พิสูจน์แล้วสำหรับ insert title ซ้ำ, insert owner ปลอมภายใต้ RLS และ .single() ที่ match ศูนย์แถว ตามลำดับคืออะไร',
     options: [
-      'retry insert ที่ fail ให้อัตโนมัติ',
-      'call จะถูกเช็กกับ schema จริง ทำให้ field ที่จำเป็นหายไปหรือ column ที่ไม่มีอยู่จริงกลายเป็น TypeScript error ก่อนโค้ดจะรันด้วยซ้ำ',
-      'ปิด row level security สำหรับ call นั้น',
-      'เปลี่ยนทุก error ให้กลายเป็น exception ที่ถูก throw',
-    ],
-    answer: 1,
-  },
-  {
-    q: 'Postgres error code ที่มักเห็นตอน insert ละเมิด unique constraint คืออะไร',
-    options: [
-      '23505',
-      '404',
-      '500',
-      'PGRST100',
+      '23505, 42501, PGRST116',
+      '42501, 23505, PGRST116',
+      'PGRST116, 23505, 42501',
+      '404, 403, 400',
     ],
     answer: 0,
+    explain: 'พิสูจน์ด้วย request จริง: 23505 (unique_violation) สำหรับ title ซ้ำ, 42501 (insufficient_privilege โค้ดของ RLS rejection) สำหรับ owner ปลอม และ PGRST116 สำหรับ .single() ที่ศูนย์แถวตรงกัน',
+  },
+  {
+    q: 'function ถูกเรียกผ่าน supabase.functions.invoke() แล้วคืน response ที่ไม่ใช่ 2xx error class จริงที่มันเจอคืออะไร ต่างจาก network-level failure',
+    options: [
+      'PostgrestError class เดียวกับ table query failure ทุกตัว',
+      'FunctionsHttpError — ยืนยันด้วยการ import @supabase/functions-js ตรง ๆ แยกจาก FunctionsFetchError (network failure) และ FunctionsRelayError (gateway failure)',
+      'AuthApiError เพราะ Edge Function เป็นส่วนหนึ่งของ Auth service',
+      'Error ธรรมดาไม่มี class เฉพาะแยกเลย',
+    ],
+    answer: 1,
+    explain: 'ยืนยันด้วยการ import @supabase/functions-js ตรง ๆ: มัน export FunctionsError, FunctionsFetchError, FunctionsHttpError และ FunctionsRelayError เป็นสี่ class ที่ต่างกันสำหรับสี่ failure mode ที่ต่างกัน',
+  },
+  {
+    q: 'อ่าน source ของ postgrest-js ที่ติดตั้งจริง ๆ retry logic ในตัวของมันครอบคลุม request แบบไหนจริง ๆ',
+    options: [
+      'ทุก request ไม่ว่า status 4xx หรือ 5xx สูงสุด 3 ครั้ง',
+      'มีแค่ request GET/HEAD/OPTIONS ที่ idempotent เท่านั้น และมีแค่ status 520 หรือ 503 สูงสุด 3 ครั้งด้วย exponential backoff — การเขียน (POST/PATCH/DELETE) ไม่เคยถูก auto-retry เลย',
+      'มีแค่ insert/update/delete เท่านั้น เพื่อป้องกัน transient write failure',
+      'postgrest-js ไม่มี retry logic ในตัวเลย ต้อง implement retry เองทั้งหมด',
+    ],
+    answer: 1,
+    explain: 'อ่านตรงจาก source ของ @supabase/postgrest-js@2.117.2 ที่ติดตั้งจริง: DEFAULT_MAX_RETRIES = 3, RETRYABLE_STATUS_CODES = [520, 503], RETRYABLE_METHODS = ["GET","HEAD","OPTIONS"] — การเขียนถูกยกเว้นโดยตั้งใจ',
   },
 ];
 
