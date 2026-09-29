@@ -1,6 +1,6 @@
 ---
 title: 'Row Level Security Fundamentals'
-description: 'Postgres row level security policy ทำงานยังไง ทำไม RLS ไม่เปิดมาให้ตั้งแต่ต้น และ using กับ with check คุมอะไรกันแน่'
+description: 'Postgres row level security policy ทำงานยังไง ทำไม RLS ไม่เปิดมาให้ตั้งแต่ต้น และ using กับ with check คุมอะไรกันแน่ — พิสูจน์จริงทุกจุดบน local stack'
 sidebar:
   order: 3
 ---
@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
@@ -19,34 +20,301 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 table ใหม่ใน Postgres จะมี RLS **ปิดอยู่** เสมอ ไม่มีการกรองอะไรทั้งนั้น role ไหนก็ตามที่มี `grant` บน table นั้นเห็นและแก้ทุก row ได้หมด คุณต้องเปิด RLS เองแบบ explicit
 
 ```sql
-alter table public.todos enable row level security;
+-- supabase/migrations/5001_rls_bare_table.sql
+create table public.rls_bare (
+  id uuid primary key default gen_random_uuid(),
+  note text not null
+);
+
+alter table public.rls_bare enable row level security;
+
+insert into public.rls_bare (note) values ('seeded directly by postgres, bypassing RLS as owner');
 ```
 
-จุดที่คนเกือบทุกคนพลาดตอนเจอครั้งแรกคือตรงนี้ พอเปิด RLS บน table ที่ **ยังไม่มี policy เลยสักอัน** table นั้นจะกลายเป็น **เข้าไม่ได้เลย** สำหรับ role `anon` และ `authenticated` — ไม่ใช่ "เปิดกว้างโดย default" แต่คือ deny-by-default ถ้ารัน `alter table ... enable row level security` แค่บรรทัดเดียวข้างบน แล้ว query `todos` ผ่าน API จะได้ผลลัพธ์ว่างเปล่า (หรือ permission error) ดูเหมือนมีอะไรพัง แต่จริง ๆ ไม่มีอะไรพังเลย RLS ที่ไม่มี policy หมายความว่าไม่มี role ไหนเห็นหรือแตะ row ได้จนกว่าคุณจะเพิ่ม policy ที่อนุญาตไว้ ทุก table ที่เปิด RLS ต้องมี policy อย่างน้อยหนึ่งอันต่อ operation ที่คุณต้องการให้ทำได้จริง
+จุดที่คนเกือบทุกคนพลาดตอนเจอครั้งแรกคือตรงนี้ พอเปิด RLS บน table ที่ **ยังไม่มี policy เลยสักอัน** table นั้นจะกลายเป็น **เข้าไม่ได้เลย** สำหรับ role `anon` และ `authenticated` — ไม่ใช่ "เปิดกว้างโดย default" แต่คือ deny-by-default `rls_bare` ข้างบนไม่ได้เพิ่ม policy เลยแม้แต่อันเดียวตลอดทั้งบทนี้ ตั้งใจให้มันค้างอยู่ในสถานะนั้นสำหรับการพิสูจน์ด้านล่าง
+
+## พิสูจน์: ไม่มี policy = ไม่มี row สำหรับทุกคน ยกเว้น service_role
+
+`public.rls_bare` มี row เดียว insert ตรงโดย owner ของ table (`postgres` ซึ่งไม่ถูก RLS บังคับเลย) ลอง query ผ่าน Data API จริงในฐานะ `anon`, ในฐานะ user จริงที่ signed-in อยู่ (`authenticated`), และในฐานะ `service_role`:
+
+```bash
+# scripts/rls-no-policy-proof.sh
+curl -s "$API_URL/rest/v1/rls_bare" -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY"
+curl -s "$API_URL/rest/v1/rls_bare" -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ALICE_TOKEN"
+curl -s "$API_URL/rest/v1/rls_bare" -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY"
+```
+
+```text
+anon:           []
+authenticated:  []
+service_role:   [{"id":"6f18430b-53a7-4914-a730-c2836b1a9f47","note":"seeded directly by postgres, bypassing RLS as owner"}]
+```
+
+ทั้ง `anon` และ user จริงที่ signed-in อยู่ (`rls-alice@example.com`) ได้ array ว่างกลับมาเหมือนกัน — ไม่ใช่ error, เป็น array ว่างจริง ๆ พร้อม `200 OK` ตรงนี้ควรคิดตามให้ดี: client แยกไม่ออกเลยว่า "table นี้ไม่มี row ที่ match" กับ "table นี้มี row แต่ฉันไม่มีสิทธิ์เห็น" — หน้าตาเหมือนกันทุกประการผ่าน API `service_role` คือข้อยกเว้นเดียว: Supabase ให้ attribute `BYPASSRLS` ของ Postgres กับมัน ทำให้มันไม่ประเมิน policy เลยไม่ว่า table ไหน ไม่ว่าจะมี policy กี่อัน นี่คือเหตุผลที่ `service_role` ห้ามหลุดไปถึง browser หรือ mobile client เด็ดขาด — มันคือ skeleton key ของทุก table ที่มี RLS ในโปรเจกต์
+
+<Callout title="ทำไมเรื่องนี้สำคัญกับโค้ดที่ AI สร้าง">
+table ที่มี row level security แต่ไม่มี policy เลยคือบั๊กแบบ "แอป Supabase ของฉันไม่คืนข้อมูลเลย ไม่รู้ทำไม" ที่พบบ่อยที่สุด ทางแก้ไม่เคยอยู่ที่โค้ดฝั่ง client — อยู่ที่ `create policy` ที่ขาดหายบนฝั่ง server เสมอ
+</Callout>
 
 ## กายวิภาคของ policy: using vs with check
 
-policy สร้างด้วย `create policy` ผูกกับ table และหนึ่ง operation หรือมากกว่า (`select`, `insert`, `update`, `delete` หรือ `all`)
+policy สร้างด้วย `create policy` ผูกกับ table และหนึ่ง operation หรือมากกว่า (`select`, `insert`, `update`, `delete` หรือ `all`) `using` กับ `with check` เป็นคนละ clause ที่ตอบคนละคำถาม
+
+| Clause | ใช้กับ | คำถามที่ตอบ | ผลเมื่อไม่ผ่าน |
+| --- | --- | --- | --- |
+| `using` | `select`, `update`, `delete` | "row ที่มีอยู่แล้วนี้มองเห็น/แตะต้องได้ไหม" | row ถูกกรองออกเงียบ ๆ (ไม่ error) |
+| `with check` | `insert`, `update` | "row ตามที่จะเป็น**หลังเขียนเสร็จ**อนุญาตไหม" | การเขียนพังด้วย error จริงของ Postgres |
 
 ```sql
-create policy "Users can view their own todos"
-on public.todos
-for select
-using (auth.uid() = user_id);
+-- supabase/migrations/5002_rls_todos_policies.sql
+create table public.rls_todos (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null,
+  title text not null
+);
 
-create policy "Users can insert their own todos"
-on public.todos
-for insert
-with check (auth.uid() = user_id);
+alter table public.rls_todos enable row level security;
+
+create policy rls_todos_select on public.rls_todos
+  for select
+  using (auth.uid() = user_id);
+
+create policy rls_todos_insert on public.rls_todos
+  for insert
+  with check (auth.uid() = user_id);
+
+create policy rls_todos_update on public.rls_todos
+  for update
+  using (auth.uid() = user_id)
+  with check (auth.uid() = user_id);
+-- deliberately no delete policy — proven in the next section
+
+insert into public.rls_todos (user_id, title) values
+  ('64721d1e-dd1d-4672-bdb0-519dcde3c455', 'alice real todo'),
+  ('8f07c3e8-0ce3-4d88-b1b7-75c93cca74ec', 'bob real todo');
 ```
 
-`using` คุม **row ที่มีอยู่แล้วจะมองเห็นได้หรือไม่** สำหรับ `select`, `update`, `delete` — คิดเหมือนตัวกรองที่ใช้กับ row ที่อยู่ใน table อยู่แล้ว ส่วน `with check` คุม **ว่า row ใหม่หรือ row ที่แก้ไขแล้วจะถูกเขียนได้หรือไม่** — ใช้กับ `insert` และ `update` โดยตรวจ row ในสภาพ *หลังจาก* เขียนแล้ว table หนึ่งใบสามารถ (และควร) กำหนดทั้งสองอย่าง `using` เพื่อตัดสินว่า update มองเห็นและแตะ row ไหนได้ ส่วน `with check` เพื่อตัดสินว่า row ที่ update แล้วต้องมีหน้าตายังไงถึงจะเขียนได้
+พิสูจน์แต่ละ clause โดยรันในฐานะ Alice (`set role authenticated` + JWT claims จริงของเธอ ในเซสชันที่ rollback ทิ้ง — เทคนิคเดียวกับที่ฟีเจอร์ impersonate ของ Studio ใช้ภายใน):
 
-## auth.uid(): ตัวประกอบหลักที่ใช้บ่อยที่สุด
+```text
+=# set role authenticated;
+=# set request.jwt.claims = '{"sub":"64721d1e-dd1d-4672-bdb0-519dcde3c455","role":"authenticated"}';
 
-`auth.uid()` คือ function ของ Postgres ที่ Supabase เตรียมไว้ให้ ดึง user ID ที่ authenticated แล้วของ request ปัจจุบันมาจาก JWT ที่พูดถึงในบทก่อนหน้าตรง ๆ นี่คือ expression ที่พบบ่อยที่สุดใน RLS policy ของโลกจริง เพราะ "row นี้เป็นของ user คนปัจจุบันหรือเปล่า" คือกฎการเข้าถึงที่แอปต้องใช้บ่อยที่สุด
+-- พิสูจน์ using: select คืนแค่ row ของ Alice เท่านั้น ของ Bob ถูกกรองออกเงียบ ๆ
+=# select id, user_id, title from public.rls_todos;
+                  id                  |               user_id               |   title
+--------------------------------------+--------------------------------------+------------
+ 48b6fe9d-1210-4da9-957d-c384f505580a | 64721d1e-dd1d-4672-bdb0-519dcde3c455 | alice real todo
+(1 row)
 
-<Mermaid title="A query is filtered per row by the matching policy" code={rlsFundamentalsDiagram} />
+-- พิสูจน์ with check: Alice พยายาม insert row โดยอ้างว่าเป็นของ Bob — การเขียนถูกปฏิเสธตรง ๆ
+=# insert into public.rls_todos (user_id, title) values ('8f07c3e8-0ce3-4d88-b1b7-75c93cca74ec', 'fake bob todo');
+ERROR:  new row violates row-level security policy for table "rls_todos"
+```
+
+สองแบบที่พังนี้ต่างกันจริง ๆ: `using` ไม่ผ่านคือ row หายไปเฉย ๆ (0 row ไม่มี error ปนกับ "ไม่มีข้อมูล" ได้ง่ายมาก) ส่วน `with check` ไม่ผ่านคือ error จริงของ Postgres โยนออกมาตรงจังหวะที่เขียน
+
+## for select/insert/update/delete: แต่ละ operation คือ policy ของตัวเอง
+
+RLS ถูกประเมิน **แยกตาม operation** `rls_todos` ข้างบนมี policy `select`, `insert`, `update` แต่ไม่มี `delete` เลย พิสูจน์ในเซสชัน Alice เดิม ทันทีหลังจาก update row ของตัวเองสำเร็จ:
+
+```text
+=# update public.rls_todos set title = 'alice todo (edited)' where user_id = '64721d1e-dd1d-4672-bdb0-519dcde3c455';
+UPDATE 1
+
+=# delete from public.rls_todos where user_id = '64721d1e-dd1d-4672-bdb0-519dcde3c455';
+DELETE 0
+
+=# select count(*) from public.rls_todos where user_id = '64721d1e-dd1d-4672-bdb0-519dcde3c455';
+ count
+-------
+     1
+(1 row)
+```
+
+ไม่มี error เลยแม้แต่นิดเดียว — `DELETE 0` พอไม่มี policy `delete` clause `using` ของ operation นั้นจะกลายเป็น false โดย default สำหรับทุก row ทำให้จำนวน row ที่ Postgres จะ delete เป็นศูนย์ตั้งแต่ยังไม่ทันแตะ row จริงเลย ยืนยันด้วยการนับ row ทีหลังว่ายังอยู่ครบ นี่คือบั๊ก missing-policy เวอร์ชันเงียบและอันตราย: `insert` ที่ไม่มี `with check` พังดัง ๆ (`42501` อยู่ในบทถัดไป) ส่วน `delete`/`select` ที่ไม่มี policy จะไม่ทำอะไรแล้วรายงานว่าสำเร็จ (`DELETE 0` ไม่ใช่ status ที่ client มองว่าเป็น error เลยถ้าดูแค่ HTTP response code) ซึ่งอ่านผิดเป็น "ไม่มีอะไรให้ลบ" แทนที่จะเป็น "ฉันไม่เคยมีสิทธิ์ทำเลย" ได้ง่ายมาก
+
+## permissive vs restrictive: OR vs AND
+
+ทุก policy ที่เห็นมาก่อนหน้านี้เป็น **`permissive`** โดย implicit (ค่า default) หลาย policy แบบ permissive สำหรับ operation เดียวกันจะรวมกันด้วย **OR** — แค่อันใดอันหนึ่ง match ก็อนุญาต row นั้น ส่วน **`restrictive`** policy กลับกัน: มันรวมกันด้วย **AND** กับทุก policy ที่ใช้กับ operation นั้น (ทั้ง permissive และ restrictive) — แม้ permissive policy จะ match แต่ restrictive policy ที่ไม่ผ่านก็ยังบล็อก row นั้นอยู่ดี
+
+```sql
+-- supabase/migrations/5003_rls_docs_permissive_restrictive.sql
+create table public.rls_docs (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null,
+  title text not null,
+  is_public boolean not null default false
+);
+
+alter table public.rls_docs enable row level security;
+
+create table public.rls_banned_users (
+  user_id uuid primary key
+);
+
+alter table public.rls_banned_users enable row level security;
+
+-- two PERMISSIVE select policies — combined with OR
+create policy rls_docs_owner_read on public.rls_docs
+  for select
+  using (auth.uid() = user_id);
+
+create policy rls_docs_public_read on public.rls_docs
+  for select
+  using (is_public = true);
+
+-- one RESTRICTIVE select policy — combined with AND, on top of whichever permissive policy matched
+create policy rls_docs_not_banned on public.rls_docs
+  as restrictive
+  for select
+  using (not exists (select 1 from public.rls_banned_users b where b.user_id = auth.uid()));
+
+insert into public.rls_docs (user_id, title, is_public) values
+  ('64721d1e-dd1d-4672-bdb0-519dcde3c455', 'alice private doc', false),
+  ('8f07c3e8-0ce3-4d88-b1b7-75c93cca74ec', 'bob public doc', true);
+
+insert into public.rls_banned_users (user_id) values ('64721d1e-dd1d-4672-bdb0-519dcde3c455');
+```
+
+พิสูจน์ OR ก่อน (Alice ยังไม่ถูกแบน): เธอเห็น private doc ของตัวเองผ่าน `rls_docs_owner_read` **และ** เห็น public doc ของ Bob ผ่าน policy คนละอันคือ `rls_docs_public_read` — ไม่มี policy อันไหนอันเดียวครอบคลุมทั้งสอง row ได้ เป็นไปได้เพราะ permissive policy รวมกันด้วย OR เท่านั้น:
+
+```text
+=# select title from public.rls_docs order by title;
+       title
+-------------------
+ alice private doc
+ bob public doc
+(2 rows)
+```
+
+พิสูจน์ AND: พอ Alice อยู่ใน `rls_banned_users` แล้ว `using` ของ restrictive policy จะเป็น false สำหรับเธอ — และ restrictive policy ที่ไม่ผ่านจะบล็อก row นั้น **ไม่ว่า permissive policy จะว่ายังไงก็ตาม** รวมถึง public-read policy ที่ไม่เกี่ยวอะไรกับความเป็นเจ้าของหรือการแบนเลย:
+
+```text
+=# select title from public.rls_docs order by title;
+ title
+-------
+(0 rows)
+```
+
+ไม่เหลือ row เดียวเลย — แม้แต่ public doc ของ Bob ที่ permissive-only policy set จะยังโชว์ให้เธอเห็นอยู่ นี่คือประเด็นทั้งหมดของ `restrictive`: มันคือ gate บังคับที่ครอบทับสิ่งที่ permissive policy อนุญาตไว้ เหมาะกับกฎแบบ cross-cutting เช่น "user ที่ถูกแบนไม่เห็นอะไรเลย จบ" ที่ไม่ต้องไปเขียนซ้ำในทุก condition ของ permissive policy
+
+## auth.uid(), auth.jwt(), และ auth.role(): ค่าจริง ไม่ใช่การเดา
+
+สามตัวนี้คือสิ่งที่ policy ทุกอันข้างบนสร้างขึ้นมาจากมันจริง ๆ ทั้งสามอ่านจากที่เดียวกัน — JWT claims ที่ PostgREST ส่งต่อเข้าไปในเซสชัน Postgres เป็น `request.jwt.claims` — การเรียกผ่าน RPC จริง ในฐานะผู้เรียกจริงหลายแบบ คือวิธีตรงที่สุดที่จะเห็นสิ่งที่ policy condition เห็นจริง ๆ:
+
+```sql
+-- supabase/migrations/5004_rls_whoami.sql
+create function public.rls_whoami()
+returns table (uid uuid, role text, jwt jsonb)
+language sql
+security invoker
+stable
+set search_path = ''
+as $$
+  select auth.uid(), auth.role(), auth.jwt();
+$$;
+
+grant execute on function public.rls_whoami() to anon, authenticated, service_role;
+```
+
+```bash
+# scripts/rls-whoami-proof.sh
+curl -s -X POST "$API_URL/rest/v1/rpc/rls_whoami" -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY"
+curl -s -X POST "$API_URL/rest/v1/rpc/rls_whoami" -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ALICE_TOKEN"
+curl -s -X POST "$API_URL/rest/v1/rpc/rls_whoami" -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY"
+```
+
+```text
+anon:
+[{"uid":null,"role":"anon","jwt":{"exp":1983812996,"iss":"supabase-demo","role":"anon"}}]
+
+authenticated (Alice, real sign-in token):
+[{"uid":"64721d1e-dd1d-4672-bdb0-519dcde3c455","role":"authenticated","jwt":{"aal":"aal1","amr":[{"method":"password","timestamp":1790655757}],"aud":"authenticated","exp":1790659357,"iat":1790655757,"iss":"http://127.0.0.1:55321/auth/v1","sub":"64721d1e-dd1d-4672-bdb0-519dcde3c455","role":"authenticated","email":"rls-alice@example.com","session_id":"50449164-70ff-43fc-ae4a-7209bc160558","is_anonymous":false}}]
+
+service_role:
+[{"uid":null,"role":"service_role","jwt":{"exp":1983812996,"iss":"supabase-demo","role":"service_role"}}]
+```
+
+`auth.uid()` เป็น `null` ทั้งคู่สำหรับ `anon` และ `service_role` — ทั้งสองไม่ใช่ user จริง เลยไม่มี claim `sub` ให้อ่าน มันจะมีค่าก็ต่อเมื่อเป็นเซสชัน `authenticated` (หรือ `anon` sign-in ที่พูดถึงทีหลังในโมดูลนี้) ที่ signed-in จริงเท่านั้น `auth.role()` มีค่าเสมอ เพราะทุก request — แม้แต่ static API key ของ `anon`/`service_role` — มี claim `role` ติดมาด้วย `auth.jwt()` คืนค่า object claims ทั้งก้อน นี่คือเหตุผลที่ custom claim (พูดถึงใน Auth Hook section ของบทถัดไป) อ่านด้วย `(auth.jwt() ->> 'my_claim')` แทนที่จะมี function เฉพาะ
+
+## ตรวจสอบ policy: `\dp` กับ `pg_policies`
+
+สองวิธีดูว่า table ตั้งค่าอะไรไว้จริง โดยไม่ต้องไปอ่านไฟล์ migration:
+
+```text
+=# \dp public.rls_todos
+                                                Access privileges
+ Schema |   Name    | Type  |        Access privileges        | Column privileges |           Policies
+--------+-----------+-------+---------------------------------+-------------------+-------------------------------
+ public | rls_todos | table | postgres=arwdDxtm/postgres     +|                   | rls_todos_select (r):        +
+        |           |       | anon=arwdDxtm/postgres         +|                   |   (u): (auth.uid() = user_id)+
+        |           |       | authenticated=arwdDxtm/postgres+|                   | rls_todos_insert (a):        +
+        |           |       | service_role=arwdDxtm/postgres  |                   |   (c): (auth.uid() = user_id)+
+        |           |       |                                 |                   | rls_todos_update (w):        +
+        |           |       |                                 |                   |   (u): (auth.uid() = user_id)+
+        |           |       |                                 |                   |   (c): (auth.uid() = user_id)
+(1 row)
+```
+
+`\dp` โชว์ **grant** (ใครมีสิทธิ์ `select`/`insert`/`update`/`delete` บ้าง — ประตูหยาบ ๆ ระดับ table) ในคอลัมน์ "Access privileges" บวกสรุปย่อของทุก policy ในคอลัมน์ "Policies" ของมันเอง (`(r)`/`(a)`/`(w)` แทน operation `select`/`insert`/`update` ที่ policy แต่ละอันคุม, `(u)`/`(c)` แทน expression `using`/`with check` ของมัน) ไม่มีบรรทัด `(d)` เลยสักบรรทัด — ช่องว่างเดียวกับที่พิสูจน์สดไปแล้วว่าไม่มี policy `delete` เห็นได้จาก `\dp` ตรง ๆ โดยไม่ต้องเปิดไฟล์ migration เลยสักไฟล์ `pg_policies` คือ catalog view เฉพาะของ RLS ที่อยู่เบื้องหลังสรุปย่อนั้น ให้เงื่อนไขแบบเต็ม ไม่ย่อ พร้อม role ที่ policy แต่ละอันเล็ง:
+
+```text
+=# select policyname, permissive, roles, cmd, qual, with_check
+   from pg_policies where schemaname = 'public' and tablename = 'rls_todos';
+    policyname    | permissive |  roles   |  cmd   |          qual           |       with_check
+------------------+------------+----------+--------+-------------------------+-------------------------
+ rls_todos_select | PERMISSIVE | {public} | SELECT | (auth.uid() = user_id)  |
+ rls_todos_insert | PERMISSIVE | {public} | INSERT |                         | (auth.uid() = user_id)
+ rls_todos_update | PERMISSIVE | {public} | UPDATE | (auth.uid() = user_id)  | (auth.uid() = user_id)
+(3 rows)
+```
+
+สังเกตว่าไม่มีแถว `delete` เลย — ยืนยันจาก catalog เองตรง ๆ ว่าเป็นช่องว่างเดียวกับที่พิสูจน์ด้วย `DELETE 0` จริงไปแล้วก่อนหน้านี้ `grant delete` ใน `\dp` ที่ไม่มีแถวคู่กันใน `pg_policies` สำหรับ `cmd = 'DELETE'` คือลายเซ็นของบั๊กนี้เป๊ะ ๆ: สิทธิ์ระดับ table มีอยู่ แต่ RLS ยังบล็อกทุก row อยู่ดี
+
+## RLS บน view: `security_invoker` (Postgres 15+)
+
+`create view` ธรรมดาจะมี owner เป็นใครก็ตามที่สร้างมัน — ใน migration คือ role superuser ของ Postgres ที่ migration รันอยู่ ก่อน Postgres 15 view จะ**ใช้สิทธิ์ของ owner เสมอ**ในการตรวจสิทธิ์และ RLS บน table ที่อยู่ข้างใต้ ไม่ว่าใครจะเป็นคน query view นั้น เพราะ view ที่สร้างจาก migration มี owner เป็น role ที่ RLS ไม่บังคับใช้เลย นี่หมายความว่า view ธรรมดาสามารถเจาะทะลุ policy ของ base table ได้เงียบ ๆ:
+
+```sql
+-- supabase/migrations/5005_rls_todos_view.sql
+create view public.rls_todos_view as select * from public.rls_todos;
+```
+
+```text
+=# set role authenticated;
+=# set request.jwt.claims = '{"sub":"8f07c3e8-0ce3-4d88-b1b7-75c93cca74ec","role":"authenticated"}';
+
+-- Bob query VIEW แล้วเห็น row ทั้งสองแถว รวมถึงของ Alice ด้วย
+-- ทั้งที่ policy ของ rls_todos เองไม่มีทางให้เขาเห็นถ้า query table ตรง ๆ
+=# select count(*) from public.rls_todos_view;
+ count
+-------
+     2
+(1 row)
+```
+
+Postgres 15 เพิ่มทางแก้เข้ามา: `security_invoker` เป็น view option ที่ทำให้ view ตรวจสิทธิ์และ RLS โดยใช้ตัวตนของ role ที่ **query** แทนที่จะเป็นของ owner:
+
+```sql
+alter view public.rls_todos_view set (security_invoker = true);
+```
+
+```text
+=# set role authenticated;
+=# set request.jwt.claims = '{"sub":"8f07c3e8-0ce3-4d88-b1b7-75c93cca74ec","role":"authenticated"}';
+
+-- view เดิม Bob คนเดิม — ตอนนี้กรองเหลือแค่ row ของเขาเองถูกต้องแล้ว
+=# select count(*) from public.rls_todos_view;
+ count
+-------
+     1
+(1 row)
+```
+
+view เดียวกัน, user query คนเดียวกัน — สิ่งเดียวที่เปลี่ยนคือ `security_invoker` และจำนวน row ที่เห็นเปลี่ยนจาก "ทุก row ใน table" เป็น "แค่ row ที่ RLS อนุญาตให้ Bob เห็นจริง ๆ" นี่ไม่ใช่ footgun ในทฤษฎี — `create view ... as select ...` ที่เขียนโดย migration tool, ORM, หรือ AI assistant จะ default ไปที่พฤติกรรมก่อน 15 เสมอ ถ้าไม่ตั้ง `security_invoker = true` (หรือ `with (security_invoker = true)` ตอนสร้าง) ให้ชัดเจน local CLI stack ของ Supabase รัน Postgres 17.6 ซึ่งผ่านจุดตัดของ Postgres 15 ที่ option นี้เริ่มมีมานานแล้ว
+
+<Mermaid title="Query หนึ่งอันถูกกรองทีละ row ตาม policy ที่ match" code={rlsFundamentalsDiagram} />
 
 export const rlsFundamentalsDiagram = `flowchart LR
   req["Query arrives as anon/authenticated role"] --> pg[("Postgres evaluates RLS")]
@@ -56,8 +324,49 @@ export const rlsFundamentalsDiagram = `flowchart LR
   check --> result`;
 
 <Callout title="สรุปหนึ่งบรรทัด">
-**Row Level Security ไม่เปิดมาให้ตั้งแต่ต้น** — คุณต้องรัน `alter table your_table enable row level security;` เอง และพอเปิดแล้วแต่ **ไม่มี policy เลย** table จะถูกล็อกจนเข้าไม่ได้เลยสำหรับ `anon`/`authenticated` จนกว่าคุณจะเพิ่ม policy (deny-by-default ไม่ใช่ open-by-default) clause **`using`** ของ policy กรอง row ที่มีอยู่แล้วสำหรับ select/update/delete ส่วน **`with check`** ตรวจว่า row ใหม่หรือ row ที่แก้แล้วมีหน้าตายังไงถึงเขียนได้สำหรับ insert/update และ **`auth.uid()`** — ที่ดึง user ID ตรงจาก JWT ของ request — เป็นตัวประกอบหลักของ policy ในโลกจริงเกือบทุกอัน
+**Row Level Security ไม่เปิดมาให้ตั้งแต่ต้น** — คุณต้องรัน `alter table your_table enable row level security;` เอง และพอเปิดแล้วแต่ **ไม่มี policy เลย** table จะถูกล็อกจนเข้าไม่ได้เลยสำหรับ `anon`/`authenticated` (พิสูจน์แล้ว: ทั้งคู่ได้ `[]`) จนกว่าคุณจะเพิ่ม policy มีแค่ `service_role` เท่านั้นที่ข้าม RLS ได้ทั้งหมด ผ่าน attribute `BYPASSRLS` ของ Postgres clause **`using`** กรอง row ที่มีอยู่แล้วสำหรับ select/update/delete (เงียบ ไม่ error) clause **`with check`** ตรวจว่า row ใหม่/ที่แก้แล้วมีหน้าตายังไงถึงเขียนได้สำหรับ insert/update (error จริงเมื่อไม่ผ่าน) และ RLS ถูกประเมิน**แยกตาม operation** — policy `delete` ที่หายไปคือ `DELETE 0` ไม่ใช่ error หลาย policy แบบ **`permissive`** รวมกันด้วย OR ส่วน **`restrictive`** policy รวมด้วย AND ทับบนนั้นอีกที `create view` ธรรมดามี owner เป็นผู้สร้าง (ที่ RLS ไม่บังคับ) และเจาะทะลุ RLS ของ base table ได้เงียบ ๆ ถ้าไม่สร้างด้วย `with (security_invoker = true)` (Postgres 15+)
 </Callout>
+
+## อ่านโค้ดที่ AI สร้าง
+
+AI assistant ถูกขอให้ "เพิ่ม view ให้ mobile app อ่าน todos ผ่าน endpoint ที่ง่ายกว่า" แล้วสร้างโค้ดนี้มา:
+
+<SpotTheBug lang="sql" code={`create table public.rls_todos (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null,
+  title text not null
+);
+
+alter table public.rls_todos enable row level security;
+
+create policy "owner can read own todos"
+on public.rls_todos
+for select
+using (auth.uid() = user_id);
+
+-- "a simpler endpoint for the mobile app"
+create view public.todos_for_mobile as
+select id, title from public.rls_todos;
+`}>
+policy ของ table เองถูกต้อง — user คนหนึ่งจะ `select` ได้เฉพาะ row ของตัวเองตรง ๆ จาก `rls_todos` แต่ view ถูกสร้างโดยไม่มี option `security_invoker` เลย ดังนั้นบน Postgres ทุกเวอร์ชันก่อน 15 (หรือบน 15+ ที่ไม่ได้ตั้งค่านี้ชัดเจน ซึ่งเกิดขึ้นตรงนี้เป๊ะ) มันจะรันด้วยสิทธิ์ของ **owner ของ view** — role ไหนก็ตามที่รัน migration แทบทุกครั้งคือ superuser หรือ role `postgres` ที่ RLS ไม่บังคับใช้เลย mobile user ทุกคนที่ยิง `/rest/v1/todos_for_mobile` จะได้ `title` ของทุกคน ไม่ใช่แค่ของตัวเอง — พิสูจน์แล้วข้างบนด้วยบั๊กแบบเดียวกันเป๊ะบน `rls_todos_view` ทางแก้คือ clause เดียว: `create view public.todos_for_mobile with (security_invoker = true) as select id, title from public.rls_todos;` (หรือ `alter view ... set (security_invoker = true)` ทีหลัง) — แค่นั้นก็ทำให้ view ประเมิน policy `using (auth.uid() = user_id)` ของ `rls_todos` เองใหม่ ในฐานะ user ที่ query จริง ไม่ใช่ owner ของ view
+</SpotTheBug>
+
+## Mental Model
+
+RLS ไม่ใช่ filter ที่แอปเราเติมเข้าไปใน query — มันคือ filter ที่ Postgres เติมเข้าไปใน*ทุก* query บน table แบบโปร่งใส โดยอิงจาก role และ claims ที่มากับ connection นั้น ๆ `select * from todos` หน้าตาไม่ต่างกันเลยไม่ว่า RLS จะเปิดหรือปิด ความต่างอยู่ที่ Postgres ตัดสินใจรันอะไรอยู่ข้างใต้เท่านั้น `using` กับ `with check` เข้าใจง่ายที่สุดถ้ามองเป็นสอง gate คนละจังหวะ: `using` คุม*สิ่งที่มีอยู่แล้วและถูกดูหรือแตะได้*, `with check` คุม*สิ่งที่กำลังจะถูกเขียน* view ไม่ได้สืบทอดพฤติกรรมนี้อัตโนมัติแบบที่ table ทำ — view ถูกนิยามด้วย *query* หนึ่งอัน และโดย default query นั้นรันด้วยตัวตนของ owner ของ view เอง นี่คือเหตุผลที่ `security_invoker` ต้องถูกเพิ่มมาเป็น opt-in ชัดเจน แทนที่จะกลายเป็น default ทันที (ซึ่งจะทำให้ view ที่มีอยู่แล้วทุกอันในทุก database ที่มีอยู่แล้วพังพร้อมกันหมด)
+
+## Trade-offs
+
+- **RLS ผลักการควบคุมสิทธิ์เข้าไปอยู่ในฐานข้อมูล ใกล้กับข้อมูลที่สุด** — client ทุกตัว (REST, GraphQL, mobile SDK ในอนาคต, session `psql` ดิบ ๆ) ได้การรับประกันแบบเดียวกันฟรี — **แลกกับ** กฎการเข้าถึงอยู่ใน SQL migration แทนที่จะอยู่ในโค้ดแอป ซึ่งเป็น context-switch จริง ๆ สำหรับทีมที่คุ้นกับ authorization logic อยู่ใน backend framework
+- **deny-by-default ตอนเปิด RLS คือ failure mode ที่ปลอดภัย** — policy ที่ลืมเขียนจะพังแบบปิด (ผลลัพธ์ว่าง / การเขียนถูกบล็อก) ไม่ใช่พังแบบเปิด — **แลกกับ** ประสบการณ์ debug แรกที่งงมาก: "array ว่าง" กับ "permission denied" หน้าตาเหมือนกันหมดสำหรับมือใหม่ ไม่มีสัญญาณชัดเจนบอกว่า "คุณลืม policy"
+- **`restrictive` policy ให้คุณเขียนกฎแบบ cross-cutting ที่บังคับ (แบน, feature flag, maintenance mode) ได้ครั้งเดียว แทนที่จะเขียนซ้ำในทุก permissive policy** — แลกกับ mental model อีกอันที่ต้องจำ (OR vs AND) ตอนอ่าน policy set ของ table ที่ไม่คุ้นเคย
+
+## Common Misconceptions
+
+- **"RLS เปิดแล้ว = table ถูกป้องกันแล้ว"** RLS เปิดแล้วแต่ไม่มี policy เลย = table ถูก*ล็อก* ไม่ใช่ถูก*ป้องกัน* — ป้องกันแปลว่าคนที่ควรเข้าได้ยังเข้าได้อยู่ ซึ่งต้องมี policy ที่คุณเขียนเองด้วย
+- **"clause `using` ไม่ผ่าน กับ `with check` ไม่ผ่าน พฤติกรรมเหมือนกัน"** ไม่เหมือนเลย — พิสูจน์แล้วข้างบน: `using` ไม่ผ่านคือกรอง row ออกเงียบ ๆ (หรือสำหรับ `delete` คือรายงาน `0` row ที่ลบโดยไม่ error) ส่วน `with check` ไม่ผ่านคือ error จริงของ Postgres โยนออกมาตรงจังหวะเขียน
+- **"view ที่นิยามทับ table ที่มี RLS จะเคารพ policy ของ table นั้นเองอัตโนมัติ"** เคารพก็ต่อเมื่อ view ถูกสร้าง (หรือ alter) ด้วย `security_invoker = true` เท่านั้น — ไม่งั้น view จะรันด้วยสิทธิ์ของ *owner* และ owner ของ view ที่สร้างจาก migration บ่อยมากคือ role ที่ RLS ไม่บังคับใช้เลยด้วยซ้ำ
+- **"restrictive policy มาแทนที่ permissive policy"** table ต้องมี permissive policy อย่างน้อยหนึ่งอันที่ match ถึงจะมี row มองเห็นได้เลย — restrictive policy ทำได้แค่*ลบ*ออกจาก row ที่ permissive policy อนุญาตไว้แล้วเท่านั้น มันให้สิทธิ์เข้าถึงเองไม่ได้
 
 export const quizRlsFundamentals = [
   {
@@ -69,36 +378,73 @@ export const quizRlsFundamentals = [
       'เปิดให้เฉพาะ table ที่มี primary key เท่านั้น',
     ],
     answer: 1,
+    explain: 'table ใหม่มี RLS ปิดอยู่เสมอ — role ที่มี grant เห็นและแก้ทุก row ได้จนกว่าคุณจะรัน alter table ... enable row level security เองแบบ explicit',
   },
   {
-    q: 'จะเกิดอะไรขึ้นเมื่อเปิด RLS บน table ที่ยังไม่มี policy เลยสักอัน',
+    q: 'table หนึ่งเปิด RLS แล้วแต่ไม่มี policy เลย curl ไปจะได้อะไรกลับมาทั้งในฐานะ anon และ user authenticated จริง',
     options: [
-      'table จะเปิดกว้างให้ทุก role เข้าถึงได้เต็มที่',
-      'table จะเข้าไม่ได้เลยสำหรับ role anon และ authenticated จนกว่าจะมี policy อย่างน้อยหนึ่งอัน',
-      'Postgres จะลบ table นั้นทิ้งอัตโนมัติ',
-      'RLS จะไม่ทำอะไรเลยจนกว่าจะเพิ่ม policy',
+      '403 Forbidden ทั้งคู่',
+      'array ว่าง [] พร้อม status 200 ทั้งคู่ — พิสูจน์แล้วว่าเหมือนกันเป๊ะทั้ง anon และ authenticated',
+      'anon ได้ [] ส่วน authenticated ได้ทุก row',
+      'table ถูกลบทิ้งอัตโนมัติ',
     ],
     answer: 1,
+    explain: 'พิสูจน์จริง: ทั้ง anon และ user จริงที่ signed-in (rls-alice) ได้ [] พร้อม 200 OK — มีแค่ service_role ที่มี BYPASSRLS เท่านั้นที่เห็น row ที่ seed ไว้',
   },
   {
-    q: 'ความต่างระหว่าง using กับ with check ใน policy คืออะไร',
+    q: 'ความต่างในทางปฏิบัติระหว่าง using ไม่ผ่าน กับ with check ไม่ผ่านคืออะไร',
     options: [
-      'ใช้แทนกันได้ ทำงานเหมือนกันทุกอย่าง',
-      'using กรอง row ที่มีอยู่แล้วสำหรับ select/update/delete ส่วน with check ตรวจว่า row ใหม่หรือ row ที่แก้แล้วเขียนได้หรือไม่',
-      'using ใช้ได้เฉพาะ insert ส่วน with check ใช้ได้เฉพาะ select',
-      'with check เลิกใช้แล้ว ให้ใช้ using แทน',
+      'พฤติกรรมเหมือนกันทุกกรณี',
+      'using กรอง row ออกเงียบ ๆ (เช่น DELETE 0) ส่วน with check ไม่ผ่านคือ error จริงของ Postgres ตรงจังหวะเขียน',
+      'with check ใช้ได้เฉพาะกับ select เท่านั้น',
+      'using ใช้ได้เฉพาะ delete เท่านั้น ใช้กับ select หรือ update ไม่ได้',
     ],
     answer: 1,
+    explain: 'พิสูจน์แล้วข้างบน: insert ของ Alice ที่ละเมิด with check โยน error "new row violates row-level security policy" ส่วน delete ที่ไม่มี policy delete เลยคืน DELETE 0 ไม่มี error',
   },
   {
-    q: 'auth.uid() คืนค่าอะไรภายใน RLS policy ของ Postgres',
+    q: 'table หนึ่งมี policy select, insert, update แต่ไม่มี policy delete จะเกิดอะไรขึ้นเมื่อ user ที่มีสิทธิ์รัน DELETE บน row ของตัวเอง',
     options: [
-      'ชื่อของ database ปัจจุบัน',
-      'user ID ที่ authenticated แล้ว ซึ่งดึงมาจาก JWT ของ request ปัจจุบัน',
-      'UUID สุ่มที่สร้างใหม่ทุก query',
-      'Supabase project ID',
+      'Postgres โยน permission denied error',
+      'การ delete match row เป็นศูนย์เงียบ ๆ (DELETE 0) เพราะ policy ที่หายไปทำให้ using เป็น false โดย default สำหรับ operation นั้น',
+      'การ delete สำเร็จเพราะ policy select ครอบคลุมทุก operation',
+      'RLS ถูกปิดอัตโนมัติสำหรับ operation ที่ไม่มี policy',
     ],
     answer: 1,
+    explain: 'RLS ถูกประเมินแยกตาม operation — พิสูจน์จริง: DELETE 0 ไม่มี error และ row ยังอยู่ครบหลังจากนั้น',
+  },
+  {
+    q: 'table หนึ่งมี PERMISSIVE select policy สองอัน กับ RESTRICTIVE select policy หนึ่งอัน รวมกันยังไง',
+    options: [
+      'ทั้งสามรวมกันด้วย AND หมด',
+      'permissive policy รวมกันด้วย OR ก่อน แล้วผลลัพธ์ต้องผ่าน restrictive policy ด้วย (AND) — พิสูจน์แล้ว: user ที่ถูกแบนไม่เห็น row เลยแม้ permissive policy อันเดียวจะโชว์ public row ให้ก็ตาม',
+      'ประเมินแค่ restrictive policy เท่านั้น permissive ถูกเมิน',
+      'permissive กับ restrictive policy อยู่ใน table เดียวกันไม่ได้',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วข้างบนด้วย rls_docs: ก่อนแบน OR ทำให้ Alice เห็นทั้ง doc ของตัวเองและ public doc ของ Bob หลังแบน restrictive policy ที่ไม่ผ่านบล็อกทุกอย่างรวมถึง public row ที่ permissive-only จะยังโชว์',
+  },
+  {
+    q: 'view หนึ่งถูกสร้างด้วย `create view ... as select ...` ธรรมดา ทับ table ที่มี RLS แบบ owner-only ใครเห็น row ไหนผ่าน view นี้บ้าง',
+    options: [
+      'row เดียวกับที่ RLS จะโชว์ผ่าน base table โดยอัตโนมัติ',
+      'อาจเห็นทุก row เลย เพราะ view รันด้วยสิทธิ์ของ owner โดย default ไม่ใช่ของ user ที่ query จนกว่าจะตั้ง security_invoker = true',
+      'ไม่เห็น row เลย เพราะ view อ่าน table ที่มี RLS ไม่ได้',
+      'เห็นเฉพาะ row ที่ owner ของ view สร้างเองเท่านั้น',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์จริง: Bob เห็นทั้ง row ของตัวเองและของ Alice ผ่าน view ธรรมดา (bypass ด้วยสิทธิ์ owner) แล้วเห็นแค่ row ของตัวเองหลังตั้ง security_invoker = true บน view เดียวกัน',
+  },
+  {
+    q: 'auth.uid() คืนค่าอะไรเมื่อเรียกผ่าน RPC ด้วย service_role key',
+    options: [
+      'user ID ของเจ้าของโปรเจกต์',
+      'null — service_role ไม่ใช่ user ที่ signed-in จริง เลยไม่มี claim sub ให้อ่าน แม้ auth.role() จะยังคืน "service_role" อยู่',
+      'error เพราะ service_role เรียก RPC function ไม่ได้',
+      'UUID สุ่ม',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์จริงผ่าน rls_whoami(): ทั้ง anon และ service_role ได้ uid: null มีแค่เซสชัน authenticated จริง (token จริงของ Alice) เท่านั้นที่ได้ uid ไม่เป็น null',
   },
 ];
 

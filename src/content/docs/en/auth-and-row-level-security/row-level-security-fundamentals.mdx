@@ -1,6 +1,6 @@
 ---
 title: 'Row Level Security Fundamentals'
-description: 'How Postgres row level security policies work, why RLS is never on by default, and what using and with check actually control.'
+description: 'How Postgres row level security policies work, why RLS is never on by default, and what using and with check actually control — proved end to end on a real local stack.'
 sidebar:
   order: 3
 ---
@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
@@ -19,32 +20,299 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 A brand new Postgres table has RLS **disabled**. Nothing is filtered, and any role with a `grant` on the table can see and modify every row. You have to explicitly enable it:
 
 ```sql
-alter table public.todos enable row level security;
+-- supabase/migrations/5001_rls_bare_table.sql
+create table public.rls_bare (
+  id uuid primary key default gen_random_uuid(),
+  note text not null
+);
+
+alter table public.rls_bare enable row level security;
+
+insert into public.rls_bare (note) values ('seeded directly by postgres, bypassing RLS as owner');
 ```
 
-Here is the part that catches almost everyone the first time: once RLS is enabled on a table with **zero policies defined**, that table becomes **completely inaccessible** to the `anon` and `authenticated` roles — not "open by default," but deny-by-default. If you run only the `alter table ... enable row level security` statement above and then query `todos` through the API, you will get back nothing (or a permission error), and it will look like something broke. Nothing broke — RLS with no policies means no role can see or touch any row until you add a policy that says otherwise. Every table you enable RLS on needs at least one policy per operation you actually want to allow.
+Here is the part that catches almost everyone the first time: once RLS is enabled on a table with **zero policies defined**, that table becomes **completely inaccessible** to the `anon` and `authenticated` roles — not "open by default," but deny-by-default. `rls_bare` above never gets a single policy added anywhere in this lesson, on purpose, so it stays in exactly that state for the proof below.
+
+## Proof: no policy means no rows, for anyone except service_role
+
+`public.rls_bare` has one row, inserted directly as the table owner (`postgres`, which is not subject to RLS at all). Querying it through the real Data API as `anon`, as a real signed-in `authenticated` user, and as `service_role`:
+
+```bash
+# scripts/rls-no-policy-proof.sh
+curl -s "$API_URL/rest/v1/rls_bare" -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY"
+curl -s "$API_URL/rest/v1/rls_bare" -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ALICE_TOKEN"
+curl -s "$API_URL/rest/v1/rls_bare" -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY"
+```
+
+```text
+anon:           []
+authenticated:  []
+service_role:   [{"id":"6f18430b-53a7-4914-a730-c2836b1a9f47","note":"seeded directly by postgres, bypassing RLS as owner"}]
+```
+
+Both `anon` and a real, signed-in `authenticated` user (`rls-alice@example.com`) get back an empty array — not an error, an empty array, `200 OK`. That is worth sitting with: a client cannot tell "this table has no matching rows" apart from "this table has rows I'm not allowed to see" — both look identical over the API. `service_role` is the one exception: Supabase grants it the Postgres `BYPASSRLS` attribute, so it never evaluates policies at all, on any table, regardless of how many are defined. That is exactly why `service_role` must never reach a browser or mobile client — it is a skeleton key for every RLS-protected table in the project.
+
+<Callout title="Why this matters for AI-generated code">
+A row level security table with no policies is the single most common "my Supabase app returns no data and I don't know why" bug report. The fix is never in the client code — it is always a missing `create policy` on the server.
+</Callout>
 
 ## Policy anatomy: using vs with check
 
-A policy is created with `create policy`, scoped to a table and one or more operations (`select`, `insert`, `update`, `delete`, or `all`):
+A policy is created with `create policy`, scoped to a table and one or more operations (`select`, `insert`, `update`, `delete`, or `all`). `using` and `with check` are separate clauses that answer two different questions:
+
+| Clause | Applies to | Question it answers | What happens on failure |
+| --- | --- | --- | --- |
+| `using` | `select`, `update`, `delete` | "Is this **existing** row visible/targetable to me?" | Row is silently filtered out (not an error) |
+| `with check` | `insert`, `update` | "Is the row **as it will exist after the write** allowed?" | The write fails with a real Postgres error |
 
 ```sql
-create policy "Users can view their own todos"
-on public.todos
-for select
-using (auth.uid() = user_id);
+-- supabase/migrations/5002_rls_todos_policies.sql
+create table public.rls_todos (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null,
+  title text not null
+);
 
-create policy "Users can insert their own todos"
-on public.todos
-for insert
-with check (auth.uid() = user_id);
+alter table public.rls_todos enable row level security;
+
+create policy rls_todos_select on public.rls_todos
+  for select
+  using (auth.uid() = user_id);
+
+create policy rls_todos_insert on public.rls_todos
+  for insert
+  with check (auth.uid() = user_id);
+
+create policy rls_todos_update on public.rls_todos
+  for update
+  using (auth.uid() = user_id)
+  with check (auth.uid() = user_id);
+-- deliberately no delete policy — proven in the next section
+
+insert into public.rls_todos (user_id, title) values
+  ('64721d1e-dd1d-4672-bdb0-519dcde3c455', 'alice real todo'),
+  ('8f07c3e8-0ce3-4d88-b1b7-75c93cca74ec', 'bob real todo');
 ```
 
-`using` controls **which existing rows are visible** for `select`, `update`, and `delete` — think of it as the filter applied to rows already in the table. `with check` controls **whether a new or modified row is allowed to be written** — it applies to `insert` and `update`, checking the row as it would exist *after* the write. A table can (and often should) define both: `using` to decide what an update can see and touch, `with check` to decide what the updated row is allowed to look like once written.
+Proof of each clause, run as Alice (`set role authenticated` + her real JWT claims, inside a session that rolls back — the same technique Studio's "impersonate" feature uses under the hood):
 
-## auth.uid(): the building block
+```text
+=# set role authenticated;
+=# set request.jwt.claims = '{"sub":"64721d1e-dd1d-4672-bdb0-519dcde3c455","role":"authenticated"}';
 
-`auth.uid()` is a Postgres function Supabase provides that extracts the current request's authenticated user ID straight from the JWT covered in the previous lesson. It is by far the most common expression inside real-world RLS policies, because "does this row belong to the current user" is by far the most common access rule an application needs.
+-- using proof: select only ever returns Alice's own row, Bob's is filtered out silently
+=# select id, user_id, title from public.rls_todos;
+                  id                  |               user_id               |   title
+--------------------------------------+--------------------------------------+------------
+ 48b6fe9d-1210-4da9-957d-c384f505580a | 64721d1e-dd1d-4672-bdb0-519dcde3c455 | alice real todo
+(1 row)
+
+-- with check proof: Alice tries to insert a row claiming to be Bob's — the WRITE itself is rejected
+=# insert into public.rls_todos (user_id, title) values ('8f07c3e8-0ce3-4d88-b1b7-75c93cca74ec', 'fake bob todo');
+ERROR:  new row violates row-level security policy for table "rls_todos"
+```
+
+The two failure modes are genuinely different: `using` failing means the row simply never shows up (0 rows, no error, easy to mistake for "there's no data"); `with check` failing is a real Postgres error thrown at the moment of the write.
+
+## for select/insert/update/delete: each operation is its own policy
+
+RLS is evaluated **per operation**. `rls_todos` above has `select`, `insert`, and `update` policies but no `delete` policy at all. Proof, as the same Alice session, immediately after successfully updating her own row:
+
+```text
+=# update public.rls_todos set title = 'alice todo (edited)' where user_id = '64721d1e-dd1d-4672-bdb0-519dcde3c455';
+UPDATE 1
+
+=# delete from public.rls_todos where user_id = '64721d1e-dd1d-4672-bdb0-519dcde3c455';
+DELETE 0
+
+=# select count(*) from public.rls_todos where user_id = '64721d1e-dd1d-4672-bdb0-519dcde3c455';
+ count
+-------
+     1
+(1 row)
+```
+
+No error at all — `DELETE 0`. With no `delete` policy, the `using` clause for that operation defaults to false for every row, so Postgres's own row count for the `delete` is zero before it ever gets near an actual row; the row is still there afterward, confirmed by the count. This is the quiet, dangerous version of the missing-policy bug: an `insert` without `with check` fails loudly (`42501`, covered in the next lesson); a `delete`/`select` without a policy just does nothing and reports success (`DELETE 0` is not an error status to a client parsing HTTP response codes), which is easy to misread as "there was nothing to delete" instead of "I was never allowed to."
+
+## permissive vs restrictive: OR vs AND
+
+Every policy you have seen so far was implicitly **`permissive`** (the default). Multiple permissive policies for the same operation are combined with **OR** — if any one of them matches, the row is allowed. A **`restrictive`** policy inverts that: it is combined with **AND** across every applicable policy (permissive and restrictive alike) — even if a permissive policy matches, a failing restrictive policy still blocks the row.
+
+```sql
+-- supabase/migrations/5003_rls_docs_permissive_restrictive.sql
+create table public.rls_docs (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null,
+  title text not null,
+  is_public boolean not null default false
+);
+
+alter table public.rls_docs enable row level security;
+
+create table public.rls_banned_users (
+  user_id uuid primary key
+);
+
+alter table public.rls_banned_users enable row level security;
+
+-- two PERMISSIVE select policies — combined with OR
+create policy rls_docs_owner_read on public.rls_docs
+  for select
+  using (auth.uid() = user_id);
+
+create policy rls_docs_public_read on public.rls_docs
+  for select
+  using (is_public = true);
+
+-- one RESTRICTIVE select policy — combined with AND, on top of whichever permissive policy matched
+create policy rls_docs_not_banned on public.rls_docs
+  as restrictive
+  for select
+  using (not exists (select 1 from public.rls_banned_users b where b.user_id = auth.uid()));
+
+insert into public.rls_docs (user_id, title, is_public) values
+  ('64721d1e-dd1d-4672-bdb0-519dcde3c455', 'alice private doc', false),
+  ('8f07c3e8-0ce3-4d88-b1b7-75c93cca74ec', 'bob public doc', true);
+
+insert into public.rls_banned_users (user_id) values ('64721d1e-dd1d-4672-bdb0-519dcde3c455');
+```
+
+OR proof first (Alice is not yet banned): she sees her own private doc via `rls_docs_owner_read`, **and** Bob's public doc via the separate `rls_docs_public_read` policy — neither policy alone covers both rows, so this is only possible because permissive policies are OR'd:
+
+```text
+=# select title from public.rls_docs order by title;
+       title
+-------------------
+ alice private doc
+ bob public doc
+(2 rows)
+```
+
+AND proof: once Alice is in `rls_banned_users`, the restrictive policy's `using` evaluates to false for her — and a failing restrictive policy blocks the row **no matter what the permissive policies say**, including the public-read policy that has nothing to do with ownership or bans:
+
+```text
+=# select title from public.rls_docs order by title;
+ title
+-------
+(0 rows)
+```
+
+Zero rows — not even Bob's public doc, which a permissive-only policy set would still have shown her. That is the entire point of `restrictive`: it is a mandatory gate layered on top of whatever the permissive policies allow, useful for cross-cutting rules like "banned users see nothing, full stop" that should not have to be repeated inside every permissive policy's own condition.
+
+## auth.uid(), auth.jwt(), and auth.role(): real values, not assumptions
+
+These three functions are what every RLS policy above is actually built from. They all read from the same place — the JWT claims PostgREST forwards into the Postgres session as `request.jwt.claims` — so calling them through a real RPC, as different real callers, is the most direct way to see exactly what a policy condition sees:
+
+```sql
+-- supabase/migrations/5004_rls_whoami.sql
+create function public.rls_whoami()
+returns table (uid uuid, role text, jwt jsonb)
+language sql
+security invoker
+stable
+set search_path = ''
+as $$
+  select auth.uid(), auth.role(), auth.jwt();
+$$;
+
+grant execute on function public.rls_whoami() to anon, authenticated, service_role;
+```
+
+```bash
+# scripts/rls-whoami-proof.sh
+curl -s -X POST "$API_URL/rest/v1/rpc/rls_whoami" -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY"
+curl -s -X POST "$API_URL/rest/v1/rpc/rls_whoami" -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ALICE_TOKEN"
+curl -s -X POST "$API_URL/rest/v1/rpc/rls_whoami" -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY"
+```
+
+```text
+anon:
+[{"uid":null,"role":"anon","jwt":{"exp":1983812996,"iss":"supabase-demo","role":"anon"}}]
+
+authenticated (Alice, real sign-in token):
+[{"uid":"64721d1e-dd1d-4672-bdb0-519dcde3c455","role":"authenticated","jwt":{"aal":"aal1","amr":[{"method":"password","timestamp":1790655757}],"aud":"authenticated","exp":1790659357,"iat":1790655757,"iss":"http://127.0.0.1:55321/auth/v1","sub":"64721d1e-dd1d-4672-bdb0-519dcde3c455","role":"authenticated","email":"rls-alice@example.com","session_id":"50449164-70ff-43fc-ae4a-7209bc160558","is_anonymous":false}}]
+
+service_role:
+[{"uid":null,"role":"service_role","jwt":{"exp":1983812996,"iss":"supabase-demo","role":"service_role"}}]
+```
+
+`auth.uid()` is `null` for both `anon` and `service_role` — neither is a real user, so there is no `sub` claim to read; it only ever returns something for a real signed-in `authenticated` (or `anon` sign-in, covered later in this module) session. `auth.role()` always has a value, because every request — even the static `anon`/`service_role` API keys — carries a `role` claim. `auth.jwt()` returns the whole decoded claims object, which is why custom claims (covered in the next lesson's Auth Hook section) are read as `(auth.jwt() ->> 'my_claim')` rather than a dedicated function.
+
+## Inspecting policies: `\dp` and `pg_policies`
+
+Two ways to see what is actually configured on a table, without reading migration files:
+
+```text
+=# \dp public.rls_todos
+                                                Access privileges
+ Schema |   Name    | Type  |        Access privileges        | Column privileges |           Policies
+--------+-----------+-------+---------------------------------+-------------------+-------------------------------
+ public | rls_todos | table | postgres=arwdDxtm/postgres     +|                   | rls_todos_select (r):        +
+        |           |       | anon=arwdDxtm/postgres         +|                   |   (u): (auth.uid() = user_id)+
+        |           |       | authenticated=arwdDxtm/postgres+|                   | rls_todos_insert (a):        +
+        |           |       | service_role=arwdDxtm/postgres  |                   |   (c): (auth.uid() = user_id)+
+        |           |       |                                 |                   | rls_todos_update (w):        +
+        |           |       |                                 |                   |   (u): (auth.uid() = user_id)+
+        |           |       |                                 |                   |   (c): (auth.uid() = user_id)
+(1 row)
+```
+
+`\dp` shows the **grants** (who has `select`/`insert`/`update`/`delete` privilege at all — the coarse, table-level gate) in "Access privileges", plus an abbreviated summary of every policy in its own "Policies" column (`(r)`/`(a)`/`(w)` for the `select`/`insert`/`update` command each policy governs, `(u)`/`(c)` for its `using`/`with check` expressions). There is no `(d)` line at all — the same missing-`delete`-policy gap proven live above, visible straight from `\dp` without reading a single migration file. `pg_policies` is the RLS-specific catalog view underneath that same summary, giving the full, unabbreviated conditions and the roles each policy targets:
+
+```text
+=# select policyname, permissive, roles, cmd, qual, with_check
+   from pg_policies where schemaname = 'public' and tablename = 'rls_todos';
+    policyname    | permissive |  roles   |  cmd   |          qual           |       with_check
+------------------+------------+----------+--------+-------------------------+-------------------------
+ rls_todos_select | PERMISSIVE | {public} | SELECT | (auth.uid() = user_id)  |
+ rls_todos_insert | PERMISSIVE | {public} | INSERT |                         | (auth.uid() = user_id)
+ rls_todos_update | PERMISSIVE | {public} | UPDATE | (auth.uid() = user_id)  | (auth.uid() = user_id)
+(3 rows)
+```
+
+Note there is no `delete` row at all — confirming, from the catalog itself, the same gap proven with a real `DELETE 0` earlier. A `grant delete` in `\dp` without a matching row in `pg_policies` for `cmd = 'DELETE'` is the signature of exactly this bug: the table-level privilege exists, but RLS still blocks every row.
+
+## RLS on views: `security_invoker` (Postgres 15+)
+
+A plain `create view` is owned by whoever creates it — in a migration, that is the Postgres superuser role the migration runs as. Before Postgres 15, a view **always** used its owner's privileges to evaluate permissions and RLS on the underlying tables, regardless of who queries the view. Since a migration-created view is owned by a role that is not subject to RLS at all, that meant a plain view could silently punch a hole straight through the base table's policies:
+
+```sql
+-- supabase/migrations/5005_rls_todos_view.sql
+create view public.rls_todos_view as select * from public.rls_todos;
+```
+
+```text
+=# set role authenticated;
+=# set request.jwt.claims = '{"sub":"8f07c3e8-0ce3-4d88-b1b7-75c93cca74ec","role":"authenticated"}';
+
+-- Bob queries the VIEW — and sees BOTH rows, including Alice's, which rls_todos's own
+-- policies would never let him see querying the table directly
+=# select count(*) from public.rls_todos_view;
+ count
+-------
+     2
+(1 row)
+```
+
+Postgres 15 added a fix: `security_invoker`, a view option that makes the view evaluate permissions and RLS using the **querying** role's identity instead of the view owner's:
+
+```sql
+alter view public.rls_todos_view set (security_invoker = true);
+```
+
+```text
+=# set role authenticated;
+=# set request.jwt.claims = '{"sub":"8f07c3e8-0ce3-4d88-b1b7-75c93cca74ec","role":"authenticated"}';
+
+-- same view, same Bob — now correctly filtered down to his own row only
+=# select count(*) from public.rls_todos_view;
+ count
+-------
+     1
+(1 row)
+```
+
+Same view definition, same querying user — the only thing that changed is `security_invoker`, and the row count went from "every row in the table" to "exactly the rows RLS actually allows Bob to see." This is not a hypothetical footgun: any `create view ... as select ...` written by a migration tool, an ORM, or an AI assistant defaults to the pre-15 behavior unless `security_invoker = true` (or `with (security_invoker = true)` at creation) is set explicitly. Supabase's local CLI stack ships Postgres 17.6, well past the Postgres 15 cutoff where this option became available.
 
 <Mermaid title="A query is filtered per row by the matching policy" code={rlsFundamentalsDiagram} />
 
@@ -56,8 +324,49 @@ export const rlsFundamentalsDiagram = `flowchart LR
   check --> result`;
 
 <Callout title="The one-line takeaway">
-**Row Level Security is never on by default** — you must run `alter table your_table enable row level security;` explicitly, and once it is on with **zero policies**, the table is completely locked down to `anon`/`authenticated` until you add policies (deny-by-default, not open-by-default). A policy's **`using`** clause filters which existing rows are visible for select/update/delete, its **`with check`** clause validates what a new or modified row is allowed to look like for insert/update, and **`auth.uid()`** — reading the user ID straight out of the request's JWT — is the building block nearly every real policy is written around.
+**Row Level Security is never on by default** — you must run `alter table your_table enable row level security;` explicitly, and once it is on with **zero policies**, the table is completely locked down to `anon`/`authenticated` (proved: both get back `[]`) until you add policies; only `service_role` bypasses RLS entirely, via its Postgres `BYPASSRLS` attribute. A policy's **`using`** clause filters which existing rows are visible for select/update/delete (silent, no error), its **`with check`** clause validates what a new/modified row is allowed to look like for insert/update (a real error on failure), and RLS is evaluated **per operation** — a missing `delete` policy means `DELETE 0`, not an error. Multiple **`permissive`** policies combine with OR; a **`restrictive`** policy combines with AND on top of them. A plain `create view` is owned by its (RLS-exempt) creator and can silently bypass the base table's RLS entirely unless it is created `with (security_invoker = true)` (Postgres 15+).
 </Callout>
+
+## Reading AI-generated code
+
+An AI assistant asked to "add a view so the mobile app can read todos through a simpler endpoint" produced this:
+
+<SpotTheBug lang="sql" code={`create table public.rls_todos (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null,
+  title text not null
+);
+
+alter table public.rls_todos enable row level security;
+
+create policy "owner can read own todos"
+on public.rls_todos
+for select
+using (auth.uid() = user_id);
+
+-- "a simpler endpoint for the mobile app"
+create view public.todos_for_mobile as
+select id, title from public.rls_todos;
+`}>
+The table's own RLS policy is correct — a user can only `select` their own rows directly from `rls_todos`. But the view is created with no `security_invoker` option, so on any Postgres before 15 (or on 15+ without setting it explicitly, which is exactly what happened here) it runs with the **view owner's** privileges — whichever role ran the migration, almost always a superuser or the `postgres` role that is not subject to RLS at all. Every mobile user hitting `/rest/v1/todos_for_mobile` gets back every user's `title`, not just their own — proved above with the identical bug on `rls_todos_view`. The fix is one clause: `create view public.todos_for_mobile with (security_invoker = true) as select id, title from public.rls_todos;` (or `alter view ... set (security_invoker = true)` after the fact) — that alone makes the view re-evaluate `rls_todos`'s own `using (auth.uid() = user_id)` policy as the actual querying user, not the view's owner.
+</SpotTheBug>
+
+## Mental Model
+
+RLS is not a filter your application adds to a query — it is a filter Postgres adds to *every* query on a table, transparently, based on whichever role and claims arrived with the connection. Nothing about `select * from todos` looks different whether RLS is on or off; the difference is entirely in what Postgres decides to execute underneath it. `using` and `with check` are best understood as two separate gates on two separate moments: `using` gates *what already exists and can be looked at or targeted*, `with check` gates *what is about to be written*. A view does not automatically inherit this behavior the way a table does — a view is defined in terms of a *query*, and by default that query runs with the view's own owner's identity, which is why `security_invoker` had to be added as an explicit opt-in rather than becoming instant default behavior (a compatibility break every existing view in every existing database would otherwise have hit at once).
+
+## Trade-offs
+
+- **RLS pushes access control into the database, closest to the data** — every client (REST, GraphQL, a future mobile SDK, a raw `psql` session) gets the same guarantee for free — **at the cost of** access rules living in SQL migrations instead of application code, which is a real context-switch for teams used to keeping authorization logic in their backend framework.
+- **Deny-by-default on enabling RLS is the safe failure mode** — a forgotten policy fails closed (empty results / blocked writes), not open — **at the cost of** a confusing first debugging experience: "empty array" and "permission denied" both look like the same nothing to newcomers, with no obvious signal pointing at "you forgot a policy."
+- **`restrictive` policies let you express mandatory cross-cutting rules once** (bans, feature flags, maintenance mode) **instead of repeating them inside every permissive policy** — at the cost of one more mental model to hold (OR vs AND) when reading an unfamiliar table's policy set.
+
+## Common Misconceptions
+
+- **"RLS being on means the table is protected."** RLS being on with zero policies means the table is *locked*, not protected — protected implies the right people can still get in, which requires policies you write yourself.
+- **"A `using` clause failing and a `with check` clause failing behave the same way."** They do not — proved above: a `using` failure silently filters the row out (or, for `delete`, reports `0` rows deleted with no error), while a `with check` failure throws a real Postgres error at the moment of the write.
+- **"Views defined over an RLS-protected table automatically respect that table's policies."** Only if the view is created (or altered) with `security_invoker = true` — otherwise a view runs with its *owner's* privileges, and a migration-created view's owner is very often a role RLS does not even apply to.
+- **"Restrictive policies replace permissive ones."** A table needs at least one matching permissive policy for a row to ever be visible at all — a restrictive policy only ever *removes* rows a permissive policy already allowed; it can never grant access on its own.
 
 export const quizRlsFundamentals = [
   {
@@ -69,36 +378,73 @@ export const quizRlsFundamentals = [
       'Only if the table has a primary key',
     ],
     answer: 1,
+    explain: 'A brand new table has RLS disabled — any role with a grant sees and modifies every row until you explicitly run alter table ... enable row level security.',
   },
   {
-    q: 'What happens when RLS is enabled on a table that has zero policies defined?',
+    q: 'A table has RLS enabled with zero policies. What does curl get back querying it as anon and as a real authenticated user?',
     options: [
-      'The table becomes fully open to every role',
-      'The table becomes completely inaccessible to anon and authenticated roles until at least one policy is added',
-      'Postgres automatically deletes the table',
-      'RLS silently does nothing until a policy is added',
+      'A 403 Forbidden error for both',
+      'An empty array [] with a 200 status for both — proved identical for anon and authenticated',
+      'anon gets [], authenticated gets every row',
+      'The table is automatically dropped',
     ],
     answer: 1,
+    explain: 'Proved live: both anon and a real signed-in authenticated user (rls-alice) got back [] with 200 OK — only service_role, which has BYPASSRLS, saw the seeded row.',
   },
   {
-    q: 'What is the difference between using and with check in a policy?',
+    q: 'What is the practical difference between a using clause failing and a with check clause failing?',
     options: [
-      'They are interchangeable and do the same thing',
-      'using filters which existing rows are visible for select/update/delete, while with check validates whether a new or modified row is allowed to be written',
-      'using only applies to insert, with check only applies to select',
-      'with check is deprecated in favor of using',
+      'They behave identically in every case',
+      'using filtering a row out is silent (no error, e.g. DELETE 0); with check failing throws a real Postgres error at the moment of the write',
+      'with check only ever applies to select statements',
+      'using can only be used with delete, never select or update',
     ],
     answer: 1,
+    explain: 'Proved above: Alice\'s insert violating with check threw "new row violates row-level security policy"; her delete with no delete policy at all returned DELETE 0 with no error.',
   },
   {
-    q: 'What does auth.uid() return inside a Postgres RLS policy?',
+    q: 'A table has select, insert, and update policies but no delete policy. What happens when an authorized user runs DELETE on their own row?',
     options: [
-      'The name of the current database',
-      'The authenticated user ID extracted from the current request JWT',
-      'A random UUID generated per query',
-      'The Supabase project ID',
+      'Postgres throws a permission denied error',
+      'The delete silently matches zero rows (DELETE 0) because the missing policy means using defaults to false for that operation',
+      'The delete succeeds because select policy grants coverage for all operations',
+      'RLS is disabled automatically for operations with no policy',
     ],
     answer: 1,
+    explain: 'RLS is evaluated per operation — proved live: DELETE 0, no error, and the row was still present afterward.',
+  },
+  {
+    q: 'Two PERMISSIVE select policies and one RESTRICTIVE select policy exist on a table. How do they combine?',
+    options: [
+      'All three are combined with AND',
+      'The permissive policies are OR\'d together, then the result must also satisfy the restrictive policy (AND) — proved: a banned user saw zero rows even though a permissive policy alone would have shown a public row',
+      'Only the restrictive policy is evaluated, permissive policies are ignored',
+      'Permissive and restrictive policies cannot coexist on the same table',
+    ],
+    answer: 1,
+    explain: 'Proved above with rls_docs: before the ban, OR gave Alice both her own and Bob\'s public doc; after the ban, the failing restrictive policy blocked everything, including the public row a permissive-only policy set would still show.',
+  },
+  {
+    q: 'A view is created with plain `create view ... as select ...` over a table with strict owner-only RLS. Who can see which rows through the view?',
+    options: [
+      'The same rows RLS would show them through the base table, automatically',
+      'Potentially every row, because the view runs with its owner\'s privileges by default, not the querying user\'s, unless security_invoker = true is set',
+      'No rows at all, because views cannot read RLS-protected tables',
+      'Only rows the view owner personally created',
+    ],
+    answer: 1,
+    explain: 'Proved live: Bob saw both his and Alice\'s row through a plain view (owner-privilege bypass), then only his own row once security_invoker = true was set on the same view.',
+  },
+  {
+    q: 'What does auth.uid() return when called via RPC as the service_role key?',
+    options: [
+      'The project owner\'s user ID',
+      'null — service_role is not a real signed-in user, so there is no sub claim to read, even though auth.role() still returns "service_role"',
+      'An error, because service_role cannot call RPC functions',
+      'A random UUID',
+    ],
+    answer: 1,
+    explain: 'Proved live via rls_whoami(): both anon and service_role got uid: null; only a real authenticated session (Alice\'s real token) returned a non-null uid.',
   },
 ];
 
