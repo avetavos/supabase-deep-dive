@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
@@ -36,7 +37,7 @@ The Auto-Generated API module already gave you a way to run custom logic close t
 - The work is CPU-bound in a way SQL cannot express cleanly (image processing, complex string parsing, calling out to another library).
 - You want a plain stateless HTTP endpoint with full control over headers, status codes, and the request/response cycle.
 
-If none of those apply and the operation is really just "read or write some rows with some logic," an RPC function is usually simpler and faster because it never leaves the database.
+If none of those apply and the operation is really just "read or write some rows with some logic," an RPC function is usually simpler and faster because it never leaves the database — see [Database Functions as RPC](/supabase/en/auto-generated-api/database-functions-as-rpc/) for why an atomic, in-database operation is often the better default.
 
 ## The CLI workflow
 
@@ -70,9 +71,119 @@ export const edgeFunctionsOverviewDiagram = `flowchart LR
   edge -->|"optional"| db
   edge -->|"optional"| ext["Third-party API"]`;
 
+## What actually runs when you `serve`: the isolate model
+
+`supabase functions serve` and Supabase's hosted platform are both powered by the same open-source **Edge Runtime** ([github.com/supabase/edge-runtime](https://github.com/supabase/edge-runtime)) — "a server based on Deno runtime, capable of running JavaScript, TypeScript, and WASM services," per the project's own README, built so the same engine can be used "to locally test and self-host Supabase's Edge Functions (or any Deno Function)." It runs **two** distinct runtimes, not one:
+
+- A **main runtime** that proxies incoming requests, has no user-facing limits, and can read every environment variable.
+- A **user runtime** — a separate, sandboxed Deno isolate per function — that actually executes your code, with enforced memory and time limits, and access to only the environment variables the main runtime explicitly allows through.
+
+That sandboxing is not just theoretical. Proof from this local stack: a function using the `postgres` npm driver to reach the database pooler by its Docker network hostname (`supabase_pooler_probe`) fails inside the user runtime even though the *exact same hostname* resolves fine from a plain `docker exec` into the same container:
+
+```text
+# from inside the running edge-runtime container directly (docker exec):
+$ getent hosts supabase_pooler_probe
+172.18.0.14     supabase_pooler_probe
+
+# from inside a function running in that container's user-runtime isolate:
+[Error] Error: getaddrinfo ENOTFOUND supabase_pooler_probe
+    at ... postgres/3.4.9/src/query.js:36:24
+    at Object.handler (file:///var/tmp/sb-compile-edge-runtime/edge-notes-pooler/index.ts:7:25) {
+  code: "ENOTFOUND",
+  syscall: "getaddrinfo",
+  hostname: "supabase_pooler_probe"
+}
+```
+
+The same function reaches the database fine over a raw IP or `host.docker.internal` (used in the next lesson) — only the container's own **Docker-internal DNS name** is unreachable from inside the isolate. This is a concrete, observable instance of the user-runtime sandbox restricting what the "outer" container can otherwise do, exactly the kind of isolation the two-runtime model exists to enforce. A full lifecycle treatment — permission model internals, module graph caching, and how isolates get retired and replaced — is covered in [Edge Runtime Isolates](/supabase/en/supabase-internals/edge-runtime-isolates/).
+
+## Cold start, measured on this local stack
+
+An isolate has to boot before it can serve its first request; subsequent requests to the same warm isolate skip that cost. Proved with `curl -w`, timing a bare `Deno.serve` "hello world" function under `supabase functions serve` on this Mac:
+
+```bash
+# scripts/edge-cold-start.sh
+curl -s -o /dev/null -w "time_total=%{time_total}s http=%{http_code}\n" \
+  "$FUNCTIONS_URL/edge-hello" -H "Authorization: Bearer $ANON_KEY" -H "apikey: $ANON_KEY"
+```
+
+```text
+first request (cold isolate):   time_total=0.066398s http=200
+second request (warm isolate):  time_total=0.007159s http=200
+third request (warm isolate):   time_total=0.006022s http=200
+```
+
+Roughly a **10x** difference between the first request (which pays isolate boot cost) and every request after it on a warm isolate — real numbers from this Mac's local stack, not a hosted-platform benchmark; absolute numbers on Supabase's actual edge network will differ, but the cold-vs-warm shape is the same mechanism described above: a fresh user-runtime isolate has to be created before the first request, and a per-worker policy (the local stack's `policy = "per_worker"` in `config.toml`) keeps it alive to serve the ones after it.
+
+## What runs where: local `serve` vs. hosted
+
+`supabase functions serve` runs the identical Edge Runtime binary that Supabase's hosted platform runs, on your own machine, against your local Postgres — which is why the proofs in this module transfer directly to production behavior. The differences that do exist are about *placement* and *scale*, not the request-handling code path:
+
+- **Local**: one Edge Runtime instance, one project, `--env-file`-driven secrets, hot-reloads on file change (`policy = "per_worker"`), no geographic distribution.
+- **Hosted**: functions deploy to Supabase's global edge network and run close to whichever region a request comes from; secrets come from `supabase secrets set`; isolates scale horizontally across regions rather than living in one process on your laptop.
+
+## Limits (from the docs)
+
+Supabase publishes hard resource limits for the hosted runtime ([supabase.com/docs/guides/functions/limits](https://supabase.com/docs/guides/functions/limits)):
+
+```text
+Maximum Memory: 256MB
+Maximum Duration (wall clock): Free plan 150s, Paid plans 400s
+Maximum CPU Time: 2s of actual CPU time per request (excludes async I/O wait)
+Request idle timeout: 150s (no response before this returns a 504 Gateway Timeout)
+```
+
+The CPU-time limit is easy to misread: it is **2 seconds of the CPU actually computing**, not 2 seconds of wall-clock time — an `await fetch(...)` to a slow third-party API does not burn CPU time while it waits, so a function can legitimately run far longer than 2 seconds as long as it is not *computing* for more than 2 of those seconds. This is also, concretely, why CPU-bound work (image processing, heavy parsing) is a good reason to reach for an Edge Function in the first place, and why a function that tries to do a large in-memory aggregation over rows pulled from Postgres is fighting exactly this limit — see the bug below.
+
+## When NOT to reach for one
+
+The flip side of "Edge Functions are for logic that is not a database query" is a common trap: pulling rows out of Postgres into a function just to do work Postgres itself would do faster, with no network round trip and no CPU-time budget to fight. If the job is "aggregate/filter/join rows," it belongs in a Postgres function callable over `/rpc` — see [Database Functions as RPC](/supabase/en/auto-generated-api/database-functions-as-rpc/) — not inside a Deno isolate with a 2-second CPU budget.
+
 <Callout title="The one-line takeaway">
-**Edge Functions** are server-side TypeScript functions running on **Deno** (not Node.js), deployed globally at the edge, scaffolded with `supabase functions new`, run locally with `supabase functions serve`, and shipped with `supabase functions deploy` — reach for one instead of a Postgres RPC function whenever you need a **third-party API call**, a **secret** the database should not hold, **CPU-bound work**, or a **custom HTTP endpoint**.
+**Edge Functions** are server-side TypeScript functions running on **Deno** (not Node.js) inside the open-source **Edge Runtime** ([github.com/supabase/edge-runtime](https://github.com/supabase/edge-runtime)) — a sandboxed **user runtime** isolate per function, behind an unrestricted **main runtime** proxy — deployed globally at the edge, scaffolded with `supabase functions new`, run locally with `supabase functions serve` (proved: **~10x** slower on a cold isolate than a warm one on this Mac), and shipped with `supabase functions deploy`. Hosted limits are **256MB** memory, **2s CPU time** per request, and a **150s/400s** wall-clock budget (free/paid) — reach for an Edge Function for a **third-party API call**, a **secret**, **CPU-bound work**, or a **custom HTTP endpoint**, and reach for a Postgres RPC function instead whenever the job is really just querying and aggregating rows.
 </Callout>
+
+## Reading AI-generated code
+
+An AI assistant asked for "an endpoint that returns the total revenue across all orders" produced this:
+
+<SpotTheBug lang="ts" code={`// supabase/functions/revenue-report/index.ts
+import { createClient } from 'jsr:@supabase/supabase-js@2'
+
+Deno.serve(async (_req) => {
+  const supabase = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,
+  )
+
+  // Pull every order row into the function and sum it in JavaScript
+  const { data: orders } = await supabase.from('orders').select('amount')
+  const total = (orders ?? []).reduce((sum, o) => sum + o.amount, 0)
+
+  return new Response(JSON.stringify({ total }), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+})
+`}>
+This works on a small table and then quietly gets worse as `orders` grows: every row is fetched over the network into the isolate, held in memory, and summed in a JavaScript loop, inside a runtime with a **256MB memory ceiling** and a **2-second CPU-time budget per request**. A table with a few hundred thousand rows either blows the memory limit, burns through the CPU-time budget doing the reduce, or both — and the fix has nothing to do with Edge Functions at all: `select sum(amount) from orders` computes the same number inside Postgres, in one round trip, using an engine built to aggregate rows efficiently. The corrected version calls `supabase.rpc('total_revenue')` (or even a plain `.select('amount').limit(0)`-style aggregate via PostgREST) backed by a `security invoker`, `stable` Postgres function — the exact "database functions as RPC" pattern from the earlier module — and the Edge Function, if it is still needed at all, is left to do only what an RPC call cannot: authorization checks, a third-party call, or shaping the response for a specific client.
+</SpotTheBug>
+
+## Mental Model
+
+An Edge Function is not "your server code, just somewhere else" — it is a short-lived, sandboxed Deno isolate that Supabase's Edge Runtime boots on demand, keeps warm for a while to absorb the next few requests cheaply, and eventually retires. The **main runtime / user runtime** split exists so that "the thing routing your request" and "the thing running your arbitrary code" are never the same trust boundary — proved above by the very real DNS restriction inside the user runtime that does not exist for `docker exec` into the same container. Thinking of an Edge Function as "a tiny, temporary, sandboxed server that Postgres cannot see" is the model that predicts both its strengths (isolation, a secret the client never touches, code that can call anything on the internet) and its limits (a real memory ceiling, a real CPU-time budget, no persistent state between cold isolates).
+
+## Trade-offs
+
+- **Edge Functions run arbitrary TypeScript with full internet access** — **at the cost of a hard memory ceiling (256MB) and CPU-time budget (2s/request)** that a Postgres function never has to think about, because Postgres itself is the thing doing the computing there.
+- **A warm isolate serves requests about 10x faster than a cold one (measured above)** — **at the cost of unpredictability**: whether a given request hits a warm or cold isolate depends on recent traffic, not anything the function's own code controls.
+- **Local `supabase functions serve` runs the identical Edge Runtime binary as hosted** — **at the cost of losing geographic distribution and the hosted secrets store locally**: `.env`/`--env-file` stands in for `supabase secrets set`, and there is exactly one instance, not one per region.
+
+## Common Misconceptions
+
+- **"An Edge Function is basically a small Node.js server."** It runs on Deno, inside a purpose-built sandboxed runtime with its own permission model and resource limits — code that assumes Node.js APIs or bare npm-style imports will not work unmodified, covered in the next lesson.
+- **"If my function is slow, I should just give it more memory/time."** The hosted limits (256MB, 2s CPU time, 150s/400s wall clock) are fixed platform ceilings, not a dial to turn — a function that needs more than that is usually doing work that belongs somewhere else (Postgres for aggregation, a queue/background job for genuinely long-running work).
+- **"Edge Functions always run in the same place as my database."** They deploy to a global edge network and run close to the *request*, not close to the database — a function that makes several sequential round trips to Postgres pays real network latency per trip, unlike a Postgres function's SQL running right next to its own data.
+- **"CPU-time limit means my function can only run for 2 seconds."** The 2-second budget is CPU time actually spent *computing*, not wall-clock time — a function can legitimately take much longer than 2 seconds if most of that time is spent `await`-ing network I/O (a slow third-party API, a database query) rather than burning CPU.
 
 export const quizWhatAreEdgeFunctions = [
   {
@@ -84,6 +195,7 @@ export const quizWhatAreEdgeFunctions = [
       'A custom Python interpreter',
     ],
     answer: 1,
+    explain: 'Edge Functions run on Deno, inside the open-source Edge Runtime (github.com/supabase/edge-runtime) — not Node.js.',
   },
   {
     q: 'When should you choose an Edge Function over a Postgres RPC function',
@@ -94,26 +206,51 @@ export const quizWhatAreEdgeFunctions = [
       'Only when the project has no database at all',
     ],
     answer: 1,
+    explain: 'RPC functions stay the better default for anything that is really just a database operation; Edge Functions earn their place for third-party calls, secrets, and CPU-bound work outside SQL.',
   },
   {
-    q: 'What does `supabase functions deploy hello-world` do',
+    q: 'What are the two runtimes inside Supabase\'s Edge Runtime, and what is each responsible for',
     options: [
-      'Runs the function only on your local machine',
-      'Ships the function so it runs on Supabase edge infrastructure',
-      'Deletes the function from the project',
-      'Generates TypeScript types for the function',
+      'A frontend runtime and a backend runtime, split by framework',
+      'A main runtime that proxies requests with no user-facing limits, and a sandboxed user runtime that executes function code under enforced limits',
+      'A development runtime and a production runtime',
+      'There is only one runtime; the split does not exist',
     ],
     answer: 1,
+    explain: 'Proved above: a Docker-internal hostname resolves fine via docker exec into the container (main-runtime-level access) but fails with ENOTFOUND from inside a running function (the sandboxed user runtime).',
   },
   {
-    q: 'Which command runs Edge Functions locally for development',
+    q: 'On this local stack, roughly how much slower was the first (cold) request to a function than a later (warm) one',
     options: [
-      'supabase functions new',
-      'supabase functions deploy',
-      'supabase functions serve',
-      'supabase start functions',
+      'About the same, cold start has no measurable cost',
+      'About 10x slower, from real curl -w timings (0.066s cold vs ~0.006-0.007s warm)',
+      'About 1000x slower',
+      'Warm requests were slower because of caching overhead',
     ],
-    answer: 2,
+    answer: 1,
+    explain: 'Real curl -w -o /dev/null timings against a local edge-hello function: 0.066398s cold, then 0.007159s and 0.006022s warm — roughly a 10x gap.',
+  },
+  {
+    q: 'What does the hosted platform\'s "2 seconds of CPU time" limit actually measure',
+    options: [
+      'Total wall-clock time the request is allowed to take',
+      'Time the CPU spends actually computing, excluding time spent awaiting async I/O like network calls',
+      'The time it takes to boot a cold isolate',
+      'The maximum time a database query inside the function may take',
+    ],
+    answer: 1,
+    explain: 'Per the docs (supabase.com/docs/guides/functions/limits): CPU time is "the amount of actual time spent on the CPU per request" and does not include async I/O wait — a function awaiting a slow API call is not burning its CPU-time budget while it waits.',
+  },
+  {
+    q: 'An AI-generated function fetches every row of a large `orders` table and sums an `amount` column in a JavaScript reduce(). What is the real risk, and what is the fix?',
+    options: [
+      'No real risk, Edge Functions have unlimited memory for this',
+      'It risks the 256MB memory ceiling and the 2s CPU-time budget as the table grows; the fix is an aggregate query (select sum(amount), or an RPC function) run inside Postgres instead',
+      'The risk is that Deno cannot sum numbers correctly',
+      'The fix is to increase the function\'s wall-clock limit',
+    ],
+    answer: 1,
+    explain: 'Aggregation is exactly the kind of work that belongs in Postgres (a single sum(amount) query) rather than pulled row-by-row into a memory- and CPU-time-constrained isolate.',
   },
 ];
 
