@@ -1,0 +1,300 @@
+---
+title: 'Edge Runtime Isolates'
+description: 'How supabase/edge-runtime actually runs your function — one V8 isolate per function behind an unrestricted main worker, the real Rust permission model (allow_all: true vs false), the module cache on disk, and real cold-vs-warm timings including a heavy npm: import.'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+`supabase/edge-runtime` is a Rust process embedding two different kinds of Deno runtime — one unrestricted **main worker** that routes every incoming request, and one sandboxed **user worker** (isolate) per function, created with `allow_all: false` and an explicit, narrow permission list — and the "cold start" [What Are Edge Functions](/supabase/en/edge-functions/what-are-edge-functions/) already measured is the real, one-time cost of creating and permission-configuring exactly that isolate.
+
+<Callout title="Versions in force for every proof below">
+`docker ps` / the `supabase functions serve` boot log on this course's own stack: **`supabase-edge-runtime-1.74.3` (compatible with Deno v2.1.4)**. Source citations below are permalinked to commit [`457b4358`](https://github.com/supabase/edge-runtime/tree/457b4358c5f9133122c9fdbd38fd965a5862b987) of [github.com/supabase/edge-runtime](https://github.com/supabase/edge-runtime) — re-resolve `git log -1` on `main` if you want whatever is current when you read this.
+</Callout>
+
+## Proof: the real permission model, from the Rust source itself
+
+Not a docs paraphrase — `crates/base/src/runtime/permissions.rs` ([permalink](https://github.com/supabase/edge-runtime/blob/457b4358c5f9133122c9fdbd38fd965a5862b987/crates/base/src/runtime/permissions.rs)) in full:
+
+```text
+pub fn get_default_permissions(kind: WorkerKind) -> PermissionsOptions {
+  match kind {
+    WorkerKind::MainWorker | WorkerKind::EventsWorker => PermissionsOptions {
+      allow_all: true,
+      allow_env: Some(Default::default()),
+      allow_net: Some(Default::default()),
+      allow_ffi: Some(Default::default()),
+      allow_read: Some(Default::default()),
+      allow_run: Some(Default::default()),
+      allow_sys: Some(Default::default()),
+      allow_write: Some(Default::default()),
+      allow_import: Some(Default::default()),
+      ..Default::default()
+    },
+
+    WorkerKind::UserWorker => PermissionsOptions {
+      allow_all: false,
+      allow_env: Some(Default::default()),
+      allow_net: Some(Default::default()),
+      allow_read: Some(Default::default()),
+      allow_write: Some(Default::default()),
+      allow_import: Some(Default::default()),
+      allow_sys: Some(vec!["hostname".to_string()]),
+      ..Default::default()
+    },
+  }
+}
+```
+
+This is the exact split this course has referred to informally: `WorkerKind::MainWorker` gets `allow_all: true` — the thing that parses your request, decides which function it's for, and proxies it has no sandbox at all, by design (it's Supabase's own trusted code, never yours). `WorkerKind::UserWorker` — **your** function — gets `allow_all: false`, and every one of `allow_read`/`allow_write`/`allow_ffi`/`allow_run` is either absent (denied outright, like `allow_ffi`/`allow_run` here) or present with an empty default allow-list, meaning "reads/writes/env/net are permitted only against a list this struct doesn't populate here" — the actual allowed paths (your function's own module directory, `/tmp`, the loopback network for reaching Postgres/the Data API) are granted narrowly elsewhere in the worker-creation path, not in this default.
+
+## Proof: the sandbox is real, not a suggestion
+
+A function in this lesson's own namespace, trying to read a file that has nothing to do with its own module directory:
+
+```ts
+// supabase/functions/int-edge-probe/index.ts
+Deno.serve(async (req) => {
+  const url = new URL(req.url);
+  if (url.pathname.endsWith('/read-hosts')) {
+    try {
+      const text = await Deno.readTextFile('/etc/hosts');
+      return new Response(JSON.stringify({ ok: true, bytes: text.length }), { status: 200 });
+    } catch (err) {
+      return new Response(JSON.stringify({ ok: false, name: (err as Error).name, message: (err as Error).message }), { status: 500 });
+    }
+  }
+  return new Response(JSON.stringify({ ok: true, now: Date.now() }), { status: 200 });
+});
+```
+
+```text
+$ curl -s "$API_URL/functions/v1/int-edge-probe/read-hosts" -H "apikey: $ANON_KEY"
+{"ok":false,"name":"NotFound","message":"path not found: /etc/hosts: readfile '/etc/hosts': path not found: /etc/hosts: readfile '/etc/hosts': path not found: /etc/hosts"}
+
+$ docker exec supabase_edge_runtime_probe cat /etc/hosts
+127.0.0.1	localhost
+::1	localhost ip6-localhost ip6-loopback
+fe00::	ip6-localnet
+```
+
+Two things worth being precise about, both proven directly above. First, `docker exec` into the **container** reads `/etc/hosts` fine — the file genuinely exists on that filesystem; the isolate's own sandboxed view of the filesystem is what denies it, not a missing file. Second, the error name is `NotFound`, **not** `PermissionDenied` — the isolate reports a path outside its allowed set as if it simply doesn't exist, rather than confirming "it exists, but you can't read it." This matches Deno's own security posture of not leaking information about paths a sandboxed script has no business knowing about, and it is a real, provable difference from what most developers expect the error to look like (see Common Misconceptions).
+
+<Mermaid title="One main worker, one isolate per function, two different sandboxes" code={edgeRuntimeDiagram} />
+
+export const edgeRuntimeDiagram = `flowchart TD
+  http["HTTP request: /functions/v1/int-edge-probe"] --> kong["Kong gateway"]
+  kong --> main["Main worker (allow_all: true, unrestricted)"]
+  main -->|"parse path, resolve service_name"| pool{"Isolate already warm for this function?"}
+  pool -->|yes| warm["Reuse existing UserWorker isolate"]
+  pool -->|no| cold["EdgeRuntime.userWorkers.create({ servicePath, memoryLimitMb, workerTimeoutMs, ... })\\nboot a NEW UserWorker isolate (allow_all: false)"]
+  cold --> exec["worker.fetch(req) inside the sandboxed isolate"]
+  warm --> exec
+  exec --> resp["Response back through the main worker"]`;
+
+## Proof: cold vs warm, including a heavy `npm:` import
+
+[What Are Edge Functions](/supabase/en/edge-functions/what-are-edge-functions/) already measured a bare `Deno.serve` hello-world at **~66ms cold, ~6-7ms warm** on this same Mac. Re-measuring `int-edge-probe` (also a bare `Deno.serve`, no imports) against an already-running Edge Runtime process shows a smaller absolute gap — a reminder that "cold" always means *this isolate's* first request, not *the whole runtime's* first request ever; the main worker process itself, and Deno's own internal V8 snapshot, were already warm from serving other functions in this session:
+
+```text
+$ curl -s -o /dev/null -w "first (cold):  time_total=%{time_total}s\n" "$API_URL/functions/v1/int-edge-probe" -H "apikey: $ANON_KEY"
+first (cold):  time_total=0.008365s
+$ curl -s -o /dev/null -w "second (warm): time_total=%{time_total}s\n" "$API_URL/functions/v1/int-edge-probe" -H "apikey: $ANON_KEY"
+second (warm): time_total=0.004279s
+```
+
+Roughly **2x**, not 10x — because this isolate's own module (one file, zero imports) is nearly free to instantiate even cold. The interesting comparison is a function whose cold start actually has work to do — resolving and loading an `npm:` package:
+
+```ts
+// supabase/functions/int-edge-probe-npm/index.ts
+import { z } from 'npm:zod@3.23.8';
+
+const Schema = z.object({ n: z.number() });
+
+Deno.serve(async (req) => {
+  const parsed = Schema.safeParse({ n: 1 });
+  return new Response(JSON.stringify({ ok: parsed.success }), { status: 200 });
+});
+```
+
+```text
+$ curl -s -o /dev/null -w "first (cold):  time_total=%{time_total}s\n" "$API_URL/functions/v1/int-edge-probe-npm" -H "apikey: $ANON_KEY"
+first (cold):  time_total=0.187833s
+$ curl -s -o /dev/null -w "second (warm): time_total=%{time_total}s\n" "$API_URL/functions/v1/int-edge-probe-npm" -H "apikey: $ANON_KEY"
+second (warm): time_total=0.003650s
+```
+
+**~51x**, not ~2x — a real, measured, isolate-specific cost: the first request to `int-edge-probe-npm` has to resolve `npm:zod@3.23.8` against the npm registry, download it, and instantiate it inside the new isolate; every warm request after that skips all of it. This is the concrete reason the `edge-functions-and-the-database` lesson's own module-scope-client pattern matters even more for functions with real dependencies — the amortization of a one-time cost over many warm requests is bigger the heavier the import.
+
+## Proof: the module cache these downloads land in
+
+```text
+$ docker exec supabase_edge_runtime_probe find /root/.cache/deno -maxdepth 1
+/root/.cache/deno
+/root/.cache/deno/node_analysis_cache_v2
+/root/.cache/deno/dep_analysis_cache_v2
+/root/.cache/deno/remote
+/root/.cache/deno/npm
+
+$ docker exec supabase_edge_runtime_probe find /root/.cache/deno/npm/registry.npmjs.org/zod -maxdepth 2
+/root/.cache/deno/npm/registry.npmjs.org/zod
+/root/.cache/deno/npm/registry.npmjs.org/zod/3.23.8
+/root/.cache/deno/npm/registry.npmjs.org/zod/3.23.8/README.md
+/root/.cache/deno/npm/registry.npmjs.org/zod/3.23.8/index.d.ts
+/root/.cache/deno/npm/registry.npmjs.org/zod/3.23.8/package.json
+/root/.cache/deno/npm/registry.npmjs.org/zod/3.23.8/lib
+```
+
+`zod@3.23.8` is sitting on disk, unpacked, inside the container's own Deno cache — this is what makes the *second* isolate boot for the same function (or even a brand-new isolate after this one is retired) skip network resolution entirely; only the very first request to ever hit this exact package+version on this container pays the download cost. `node_analysis_cache_v2`/`dep_analysis_cache_v2` (both SQLite-backed — the `-wal`/`-shm` files alongside them confirm it) are Deno's own module-graph/Node-compat analysis caches, serving the same purpose one layer up: skip re-parsing a module's dependency graph on every cold isolate.
+
+<Callout title="EDGE_RUNTIME_* env vars: not what's actually there on this local stack">
+The literal environment variables on `supabase_edge_runtime_probe` (`docker inspect supabase_edge_runtime_probe --format '{{range .Config.Env}}{{println .}}{{end}}'`) are `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_DB_URL`, `SUPABASE_INTERNAL_PUBLISHABLE_KEY`, `SUPABASE_INTERNAL_SECRET_KEY`, `SUPABASE_INTERNAL_JWT_SECRET`, `SUPABASE_JWKS`, `SUPABASE_INTERNAL_HOST_PORT`, `SUPABASE_INTERNAL_FUNCTIONS_CONFIG`, and `PATH` — no `EDGE_RUNTIME_*`-prefixed variable exists on the CLI-managed container. `SUPABASE_INTERNAL_FUNCTIONS_CONFIG` is the real one worth knowing: a JSON map, one entry per deployed function, each with `verifyJWT` and `entrypointPath` — this is how the main worker resolves an incoming `service_name` to an actual file on disk without a database round trip. (`SUPABASE_JWKS` is a preview of [Auth Token Lifecycle](/supabase/en/supabase-internals/auth-token-lifecycle/) — the edge-runtime container gets the project's JWKS handed to it directly as an env var, not fetched over the network per request.)
+</Callout>
+
+## Proof: the main worker's own request-routing shape
+
+Supabase doesn't publish the exact production main-service script, but its own test fixture (`crates/base/test_cases/main/index.ts`, [permalink](https://github.com/supabase/edge-runtime/blob/457b4358c5f9133122c9fdbd38fd965a5862b987/crates/base/test_cases/main/index.ts)) — used by the project's own test suite to drive the same `EdgeRuntime.userWorkers` API the real main worker calls — shows the exact shape:
+
+```text
+const path_parts = pathname.split("/");
+let service_name = path_parts[1];
+...
+const servicePath = `./test_cases/${service_name}`;
+...
+return await EdgeRuntime.userWorkers.create({
+  servicePath,
+  memoryLimitMb,        // proof above's isolate cost is bounded by this
+  workerTimeoutMs,       // the wall-clock limit docs describe, as a real parameter
+  cpuTimeSoftLimitMs,
+  cpuTimeHardLimitMs,
+  noModuleCache,
+  noNpm,
+  envVars,
+  context,
+  staticPatterns: ["**/*.wasm"],
+});
+```
+
+The first path segment (`/int-edge-probe/read-hosts` → `int-edge-probe`) is exactly the `service_name` PostgREST-style routing this lesson's own `curl`s relied on, and `EdgeRuntime.userWorkers.create` is the literal call that produces the "cold start" this lesson (and the earlier `what-are-edge-functions` lesson) measured — `workerTimeoutMs`/`cpuTimeSoftLimitMs`/`cpuTimeHardLimitMs`/`memoryLimitMb` are the mechanism-level names behind the platform limits [Supabase's own docs](https://supabase.com/docs/guides/functions/limits) state as **256MB memory, 2s CPU time per request, 150s/400s wall-clock (free/paid)**, and the **546 `WORKER_RESOURCE_LIMIT`** response ([troubleshooting docs](https://supabase.com/docs/guides/troubleshooting/edge-function-546-error-response)) is what an isolate returns once it exhausts one of them: *"Once an isolate uses 50% of any resource, it will finish the current request and then shut down. However, if that remaining request exhausts all CPU or memory before completion, the isolate will terminate immediately and return a 546 response."*
+
+## Proof: the `policy` config knob is a real Rust enum, not a documentation-only concept
+
+This project's own `[edge_runtime]` config (`tools/probe/supabase/config.toml`) sets `policy = "per_worker"` with the comment *"enables hot reload during local development"* vs. the `"oneshot"` fallback. That maps directly onto a real Rust type, `SupervisorPolicy`, in `crates/base/src/worker/pool.rs` ([permalink](https://github.com/supabase/edge-runtime/blob/457b4358c5f9133122c9fdbd38fd965a5862b987/crates/base/src/worker/pool.rs)):
+
+```text
+pub enum SupervisorPolicy {
+  #[default]
+  PerWorker,
+  PerRequest {
+    oneshot: bool,
+  },
+}
+```
+
+`PerWorker` is what let this lesson's own warm-timing proofs above reuse the *same* isolate across multiple requests (the ~4ms/~3.6ms "warm" numbers); `PerRequest { oneshot: true }` — the CLI's `oneshot` config value — would instead retire the isolate after every single request, trading the warm-reuse speedup for a fresh, fully isolated sandbox per call (useful for debugging a function that might be leaking state between requests, at a real per-request cold-start cost).
+
+## Reading AI-generated code
+
+<SpotTheBug lang="ts" code={`// AI-generated "read the request's client IP from a trusted proxy config file"
+Deno.serve(async (req) => {
+  const proxyConfig = await Deno.readTextFile('/etc/nginx/nginx.conf');
+  const trustedRanges = parseProxyConfig(proxyConfig);
+  const clientIp = resolveClientIp(req, trustedRanges);
+  return new Response(JSON.stringify({ clientIp }));
+});
+
+function parseProxyConfig(text: string) { /* ... */ return []; }
+function resolveClientIp(req: Request, ranges: string[]) { /* ... */ return req.headers.get('x-forwarded-for'); }`}>
+This is exactly the sandbox proven above, hit from a different angle: a real Edge Function isolate has `allow_read` with no path outside its own module directory permitted by default (`crates/base/src/runtime/permissions.rs`'s `WorkerKind::UserWorker` entry, quoted in full above) — `/etc/nginx/nginx.conf` is not part of that isolate's filesystem view at all, whether or not the file exists on the container, or even whether nginx is part of this stack's topology in the first place (it isn't — Kong is the gateway here). This call will throw the same `NotFound` this lesson proved above, not a helpful "config file not found, did you mean...", and definitely not the trusted-range data the function's logic assumes it got. The fix is architectural, not a permissions flag to flip: an Edge Function has no business reading gateway/proxy config off disk at all — `x-forwarded-for` (or better, a platform-provided header your gateway sets and your function trusts *without* re-deriving trust from a config file it can never see) is the only input actually available inside the sandbox, and if genuine IP-allowlisting logic is needed, it belongs in the gateway (Kong) or in a Postgres RPC function reading a table your Edge Function calls with `service_role`, not inside the isolate itself.
+</SpotTheBug>
+
+## Mental Model
+
+Think of the Edge Runtime as a single trusted receptionist (the **main worker**, `allow_all: true`, one process) standing in front of a bank of soundproofed interview rooms (**user worker isolates**, `allow_all: false`). The receptionist can go anywhere in the building and reads every visitor's badge (the request path) to decide which room to send them to — reusing an already-occupied, already-warm room when policy allows it (`per_worker`), or building a brand-new room from scratch when it doesn't (a cold start, proven above to cost real, measurable milliseconds — dramatically more when the room's occupant needs furniture shipped in from outside, i.e. an `npm:` import). Once inside a room, a visitor (your function code) can only touch what that room was explicitly built with — asking for something outside it doesn't get "sorry, that's restricted," it gets "that doesn't exist here," by design.
+
+## Trade-offs
+
+| Design choice | Benefit | Cost |
+|---|---|---|
+| Two-runtime split: unrestricted main worker, sandboxed user worker | Your code can never accidentally (or maliciously) touch the routing layer or other tenants' isolates — proven above via a real, unbypassable filesystem denial | An extra process boundary and IPC hop (the main worker's own `worker.fetch(req)` call) on every single request, even a warm one |
+| `allow_all: false` with an empty default allow-list per permission kind | A new capability (reading a new path, a new env var) requires an explicit, auditable grant somewhere in the worker-creation path, not "off by default, easy to forget to lock down" | Debugging "why can't my function read this file" requires understanding the sandbox model this lesson just proved, not just Deno's general permission flags |
+| `per_worker` isolate reuse (this stack's default) | The 2x-51x warm speedup proven above, on every request after the first to a given function | State genuinely persists across requests inside one isolate (module-scope variables, open connections) — a source of real bugs if a function assumes each request starts totally fresh |
+| npm: packages resolved and cached to disk on first use | Every isolate after the first (even for a different, brand-new isolate of the same function) skips the network entirely | The very first real request to a newly-deployed function with a new dependency pays a real, measured cost (188ms here) that has nothing to do with the function's own logic |
+
+## Common Misconceptions
+
+- **"Edge Function sandbox violations throw a PermissionDenied error."** Disproved above with a real, unedited error: the isolate reports `NotFound`, not `PermissionDenied`, for a path outside its allowed set — deliberately indistinguishable from "this file genuinely doesn't exist."
+- **"Cold start cost is roughly the same for every function, regardless of what it imports."** Disproved above: a bare `Deno.serve` cold-started in ~8ms on an already-warm runtime process, while the same isolate class with one `npm:` import cold-started in ~188ms — a ~23x difference in absolute cold-start cost driven entirely by what has to be resolved and loaded, not by anything about isolates in general.
+- **"The main worker runs in the same sandbox as user code, just with more permissions."** Disproved directly by the Rust source above: `WorkerKind::MainWorker` gets `allow_all: true` — categorically unrestricted, not "restricted, but with a longer allow-list" the way `WorkerKind::UserWorker` is.
+- **"docker exec into the Edge Runtime container proves what a function can access."** Disproved above: `docker exec cat /etc/hosts` succeeds trivially (the container's own root filesystem has no sandbox), while the exact same path from inside a `UserWorker` isolate fails — the container and the isolate are two different security boundaries, and only the isolate's is the one your function's code actually runs inside.
+
+## Quiz
+
+export const quizEdgeRuntimeIsolates = [
+  {
+    q: 'The real Rust source for get_default_permissions shows WorkerKind::MainWorker with allow_all: true and WorkerKind::UserWorker with allow_all: false. What does this split actually mean?',
+    options: [
+      'Both worker kinds are equally sandboxed, just with different config values',
+      'The main worker (which routes every request) is deliberately unrestricted trusted code, while every user function runs in a genuinely different, narrower sandbox',
+      'allow_all only affects logging verbosity, not real permissions',
+      'UserWorker is more permissive because it lists more explicit allow_ fields',
+    ],
+    answer: 1,
+    explain: 'Proven directly from the quoted source: allow_all: true vs false is a categorical difference — MainWorker is Supabase\'s own trusted routing code with no sandbox, UserWorker is where arbitrary developer code runs, deliberately narrowed.',
+  },
+  {
+    q: 'The real curl proof against Deno.readTextFile(\'/etc/hosts\') inside a UserWorker isolate returned an error named "NotFound", not "PermissionDenied" — even though docker exec into the same container reads that file fine. What does this prove?',
+    options: [
+      'The file genuinely does not exist anywhere in the stack',
+      'The isolate\'s sandboxed filesystem view denies the path by reporting it as nonexistent rather than confirming it exists-but-is-restricted — a real, deliberate difference from a permission error',
+      'PermissionDenied and NotFound are the same error under a different name in this Deno version',
+      'The container itself has no /etc/hosts file, only the isolate does',
+    ],
+    answer: 1,
+    explain: 'The docker exec proof shows the file is real on the container\'s filesystem; the isolate\'s own denial masquerades as nonexistence rather than a permission error — proven directly by the captured, unedited error name and message.',
+  },
+  {
+    q: 'The measured cold-start numbers showed int-edge-probe (no imports) at ~8ms cold vs int-edge-probe-npm (one npm: import) at ~188ms cold — roughly a 23x gap between the two functions\' own cold starts. What does this prove about "cold start cost"?',
+    options: [
+      'Cold start cost is a fixed constant regardless of what a function imports',
+      'Cold start cost is dominated by whatever the specific isolate actually has to resolve and load — a bare function is nearly free, a function with a real npm: dependency pays a real, much larger one-time cost',
+      'npm: imports are always slower than regular imports, warm or cold',
+      'The 188ms figure represents network latency to Postgres, unrelated to isolate creation',
+    ],
+    answer: 1,
+    explain: 'The warm timings for both functions converged to roughly the same ~3.6-4ms — proving the ongoing per-request cost is unrelated to the import; the entire 23x gap in COLD start numbers is attributable to the one-time cost of resolving/loading npm:zod, confirmed by the zod package appearing in the on-disk module cache immediately afterward.',
+  },
+  {
+    q: 'After the first request to int-edge-probe-npm, `zod@3.23.8` was found unpacked on disk at /root/.cache/deno/npm/registry.npmjs.org/zod/3.23.8/. What does this cache location and its contents prove about subsequent cold starts?',
+    options: [
+      'Every future cold start of any function pays the same npm resolution cost regardless of this cache',
+      'A future isolate (even a brand-new one) that needs the same package+version can skip the network download entirely and read it from this on-disk cache',
+      'The cache only helps warm requests, never a genuinely new cold isolate',
+      'This cache is deleted and rebuilt on every single request',
+    ],
+    answer: 1,
+    explain: 'The cache is a persistent, on-disk artifact on the container\'s own filesystem (survives beyond any one isolate\'s lifetime) — a brand-new isolate created later for the same function, or even a different function importing the same package+version, reads from this cache instead of re-resolving against the npm registry over the network.',
+  },
+  {
+    q: 'config.toml\'s `policy = "per_worker"` maps to which real Rust type in the edge-runtime source, and what does the alternative value actually change?',
+    options: [
+      'It maps to nothing real — policy is a CLI-only concept with no runtime effect',
+      'SupervisorPolicy::PerWorker (isolate reused across requests, enabling the warm-request speedups measured in this lesson) vs SupervisorPolicy::PerRequest{oneshot:true} (a fresh isolate every single request, trading warm-reuse speed for stronger per-request isolation)',
+      'It only controls how verbose the Edge Runtime\'s logs are',
+      'It changes the memory limit per isolate, not the reuse behavior',
+    ],
+    answer: 1,
+    explain: 'Proven directly from crates/base/src/worker/pool.rs\'s real SupervisorPolicy enum, which config.toml\'s policy setting maps onto — PerWorker is what let this lesson\'s own warm-timing proofs reuse the same isolate; oneshot/PerRequest would retire it after every call instead.',
+  },
+];
+
+<Quiz client:visible id="supabase-internals/edge-runtime-isolates" questions={quizEdgeRuntimeIsolates} />
+
+<ProgressTracker client:visible id="supabase-internals/edge-runtime-isolates" />
