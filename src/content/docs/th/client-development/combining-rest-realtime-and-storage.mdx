@@ -1,6 +1,6 @@
 ---
 title: 'Combining REST, Realtime, and Storage'
-description: 'สร้าง feature upload รูปที่ compose Storage upload, REST insert ที่ป้องกันด้วย RLS และ Postgres Changes subscription เข้าด้วยกันเป็น client flow เดียว'
+description: 'feed cli_posts จริงหนึ่งตัวพร้อมรูปภาพ พิสูจน์แล้วว่าใช้ bearer token ตัวเดียวกันเป๊ะข้าม REST กับ Storage และ RLS scope เดียวกันเป๊ะข้าม Realtime บวก optimistic UI, cleanup และ pagination + Realtime merge pitfall ตัวจริง'
 sidebar:
   order: 4
 ---
@@ -8,130 +8,334 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
 
-feature จริงแทบไม่เคยแตะแค่ service เดียว — upload รูป บันทึก row ที่ reference รูปนั้น แล้วให้ client อื่นเห็นรูปนั้นโผล่ขึ้นมาแบบ live คือ flow เดียวที่ compose Storage, REST API ที่ป้องกันด้วย RLS และ Realtime เข้าด้วยกัน และแต่ละส่วนก็คือสิ่งที่เรียนมาแล้วในบทก่อนหน้า
+feature จริงมักไม่แตะแค่ service เดียวของ Supabase — อัปโหลดรูป บันทึก row ที่อ้างถึงมัน แล้วให้ client อื่นเห็นมันโผล่ขึ้นมาแบบสด เป็น flow เดียวที่ผสม Storage, REST API ที่ป้องกันด้วย RLS และ Realtime ผ่าน client authenticated ตัวเดียว และบทนี้ **พิสูจน์** ไม่ใช่แค่กล่าวอ้าง ว่าทั้งสามตัวแชร์ token เดียวกันและ row level security scope เดียวกันจริง ๆ
 
-## Step 1: upload file ขึ้น Storage
+## Feature และ schema ของมัน
 
-นี่คือ call `supabase.storage.from(bucket).upload()` ตัวเดียวกับที่เจอในครึ่ง Storage ของ module Realtime and Storage ฟังก์ชันนี้ส่ง bytes ของ file ไปที่ bucket และถ้าสำเร็จจะคืน path ที่ file ถูกเก็บไว้
+feed `cli_posts`: แต่ละ row เป็นของ user ที่สร้างมัน สามารถพก image path ได้ และ client อื่นที่ follow feed ควรเห็น post ใหม่ทันทีที่มันถูก insert
 
-```typescript
-const file = fileInput.files[0];
-const filePath = `${userId}/${crypto.randomUUID()}-${file.name}`;
+```sql
+-- supabase/migrations/20260929000002_cli_posts.sql
+create table public.cli_posts (
+  id uuid primary key default gen_random_uuid(),
+  owner uuid not null default auth.uid() references auth.users(id),
+  caption text not null,
+  image_path text,
+  created_at timestamptz not null default now()
+);
+alter table public.cli_posts enable row level security;
+create policy "cli_posts_select_own" on public.cli_posts for select to authenticated using (owner = auth.uid());
+create policy "cli_posts_insert_own" on public.cli_posts for insert to authenticated with check (owner = auth.uid());
+alter publication supabase_realtime add table public.cli_posts;
 
-const { data: uploadData, error: uploadError } = await supabase.storage
-  .from('photos')
-  .upload(filePath, file);
+insert into storage.buckets (id, name, public) values ('cli-posts-images', 'cli-posts-images', false)
+on conflict (id) do nothing;
 
-if (uploadError) {
-  console.error('upload failed:', uploadError.message);
-  return;
-}
+create policy "cli_posts_images_insert_own" on storage.objects for insert to authenticated with check (
+  bucket_id = 'cli-posts-images' and (storage.foldername(name))[1] = auth.uid()::text
+);
+create policy "cli_posts_images_select_own" on storage.objects for select to authenticated using (
+  bucket_id = 'cli-posts-images' and (storage.foldername(name))[1] = auth.uid()::text
+);
+create policy "cli_posts_images_update_own" on storage.objects for update to authenticated using (
+  bucket_id = 'cli-posts-images' and (storage.foldername(name))[1] = auth.uid()::text
+);
 ```
 
-การเช็ก `error` ตรงนี้สำคัญเหมือนในบทก่อน network สะดุดหรือ policy ของ Storage ปฏิเสธ upload ก็โผล่มาผ่าน `uploadError` เหมือนกัน ไม่ใช่ exception ที่ถูก throw และถ้าข้ามการเช็กนี้ไป ก็เท่ากับพยายาม insert row ที่ชี้ไปยัง file ที่ไม่เคยถูกบันทึกจริงแบบเงียบ ๆ
+Storage policy ทั้งสามตัว (`insert`, `select`, `update`) มีความหมายกับ call upload ด้านล่างทั้งหมด ไม่ใช่แค่ `insert` — บท `storage-buckets-and-policies` ของโมดูล Realtime and Storage พิสูจน์ไว้แล้วอย่างละเอียดว่าทำไม: `upload(..., { upsert: true })` compile ออกมาเป็น `INSERT ... ON CONFLICT (name, bucket_id) DO UPDATE ... RETURNING *` ดังนั้นการ re-upload ไปที่ path เดิมที่ script นี้เคยใช้ในรอบก่อนหน้าต้องการ `select` (เพื่อ evaluate conflict) **และ** `update` (เพื่อทำมัน) นอกเหนือจาก `insert` — ลิงก์ ไม่ re-proof เพราะบทนั้นมี trace จริงของ `403`/`AccessDenied` สำหรับกรณี policy ขาดอยู่แล้ว select policy ของ `cli_posts` ถูก scope ไว้อย่างตั้งใจเป็น **`owner = auth.uid()`** ไม่ใช่ `using (true)` — feed ส่วนตัว ไม่ใช่ public
 
-## Step 2: บันทึก row ที่ reference file นั้น โดยป้องกันด้วย RLS
+## Step 1 + 2: อัปโหลดรูป แล้วบันทึก row — พิสูจน์ว่าเป็น token ตัวเดียวกัน
 
-พอ file ถูกเก็บไว้แล้ว app จะบันทึก row ใน `posts` ที่ชี้ไปยัง file นั้น นี่คือ call `.insert()` ธรรมดา แต่สำเร็จได้เพราะ row level security policy จาก module Auth เท่านั้น — policy ที่ให้ user insert row ได้ก็ต่อเมื่อ `user_id` ตรงกับ `auth.uid()` ฝั่ง client ไม่ต้องทำอะไรเพิ่มเพื่อให้ได้การป้องกันนั้น เพราะ Postgres บังคับใช้ให้อัตโนมัติ สำหรับทุก request ที่ client ส่งไป
+ทั้งสอง call ผ่าน `aliceClient` instance `supabase-js` ที่ authenticated ตัวเดียว — ไม่มีการ juggle header เองระหว่างสองตัวเลย:
 
-```typescript
-const { data: post, error: insertError } = await supabase
-  .from('posts')
-  .insert({
-    user_id: userId,
-    photo_path: uploadData.path,
-  })
+```ts
+// src/cli-posts-same-token.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+const API_URL = process.env.SUPABASE_URL!;
+const ANON_KEY = process.env.SUPABASE_ANON_KEY!;
+const admin = createClient(API_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+
+const email = 'cli-client-dev-alice@example.com';
+const password = 'cli-pw-alice-12345';
+let alice = (await admin.auth.admin.listUsers()).data.users.find((u) => u.email === email);
+if (!alice) alice = (await admin.auth.admin.createUser({ email, password, email_confirm: true })).data.user!;
+await admin.from('cli_posts').delete().eq('owner', alice.id); // idempotent re-run
+
+let restAuth: string | undefined;
+let storageAuth: string | undefined;
+const aliceClient = createClient(API_URL, ANON_KEY, {
+  global: {
+    fetch: (input, init) => {
+      const url = typeof input === 'string' ? input : (input as Request).url;
+      const auth = new Headers(init?.headers).get('authorization') ?? undefined;
+      if (url.includes('/rest/v1/')) restAuth = auth;
+      if (url.includes('/storage/v1/')) storageAuth = auth;
+      return fetch(input, init);
+    },
+  },
+});
+await aliceClient.auth.signInWithPassword({ email, password });
+
+// Step 1: Storage upload
+const imagePath = `${alice.id}/cli-post-image.txt`;
+const { error: uploadError } = await aliceClient.storage
+  .from('cli-posts-images')
+  .upload(imagePath, new Blob(['fake-image-bytes']), { upsert: true });
+console.log('upload error =', uploadError?.message ?? null);
+
+// Step 2: REST insert referencing it, protected by the owner = auth.uid() policy above
+const { data: post, error: insertError } = await aliceClient
+  .from('cli_posts')
+  .insert({ caption: 'alice real post', image_path: imagePath })
   .select()
   .single();
+console.log('insert error =', insertError?.message ?? null);
 
-if (insertError) {
-  console.error('insert failed:', insertError.message);
-  return;
+console.log('REST    Authorization:', restAuth?.slice(0, 24) + '...');
+console.log('Storage Authorization:', storageAuth?.slice(0, 24) + '...');
+console.log('same token on both requests =', restAuth === storageAuth);
+```
+
+```text
+upload error = null
+insert error = null
+REST    Authorization: Bearer eyJhbGciOiJFUzI1N...
+Storage Authorization: Bearer eyJhbGciOiJFUzI1N...
+same token on both requests = true
+```
+
+ไม่ใช่ "น่าจะเหมือนกัน" — พิสูจน์ว่าเหมือนกันจริง ด้วยการ intercept `Authorization` header จริงที่ออกไปทั้งบน request `/rest/v1/` และ `/storage/v1/` จาก client instance เดียวกันเป๊ะ ถ้า `uploadError` มีค่า — network สะดุด หรือ Storage policy ปฏิเสธการอัปโหลด — REST insert ใน step 2 ไม่มีอะไรเช็คเรื่องนั้นนอกจาก `error` ของตัวเอง ข้ามการเช็ค error ของ upload แปลว่า insert row ที่ `image_path` ชี้ไปที่ไฟล์ที่ไม่เคยถูกบันทึกจริงได้อย่างเงียบ ๆ failure mode เดียวกับที่วินัย `error.code` ของบทที่แล้วมีไว้เพื่อป้องกัน
+
+## Step 3: Realtime บังคับ RLS scope เดียวกันเป๊ะ — พิสูจน์ด้วย user สองคน
+
+`aliceClient` subscribe `postgres_changes` บน `cli_posts` สองครั้ง: ครั้งแรกในฐานะ anonymous (ยังไม่ sign-in) ครั้งที่สองตอน signed in — ขณะที่ `bobClient` user อิสระที่สองที่ authenticated เต็มตัว insert post ของตัวเองคั่นกลาง:
+
+```ts
+// src/cli-posts-realtime-rls.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+const API_URL = process.env.SUPABASE_URL!;
+const ANON_KEY = process.env.SUPABASE_ANON_KEY!;
+const admin = createClient(API_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+
+async function ensureUser(email: string, password: string) {
+  const { data, error } = await admin.auth.admin.createUser({ email, password, email_confirm: true });
+  if (!error) return data.user!;
+  return (await admin.auth.admin.listUsers()).data.users.find((u) => u.email === email)!;
+}
+const alice = await ensureUser('cli-client-dev-alice@example.com', 'cli-pw-alice-12345');
+const bob = await ensureUser('cli-client-dev-bob@example.com', 'cli-pw-bob-12345');
+await admin.from('cli_posts').delete().eq('owner', alice.id);
+await admin.from('cli_posts').delete().eq('owner', bob.id);
+
+const aliceClient = createClient(API_URL, ANON_KEY);
+const bobClient = createClient(API_URL, ANON_KEY);
+await bobClient.auth.signInWithPassword({ email: 'cli-client-dev-bob@example.com', password: 'cli-pw-bob-12345' });
+
+// alice's channel is created BEFORE she signs in
+const eventsBeforeSignIn: string[] = [];
+const preChannel = aliceClient
+  .channel('cli-posts-feed-pre')
+  .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'cli_posts' }, (p) => eventsBeforeSignIn.push(p.new.caption))
+  .subscribe();
+await new Promise((r) => setTimeout(r, 800));
+
+await bobClient.from('cli_posts').insert({ caption: 'bob post while alice anon' });
+await new Promise((r) => setTimeout(r, 800));
+console.log('events seen by alice, still anonymous:', eventsBeforeSignIn.length);
+await aliceClient.removeChannel(preChannel);
+
+// alice signs in on the SAME client, then re-subscribes
+await aliceClient.auth.signInWithPassword({ email: 'cli-client-dev-alice@example.com', password: 'cli-pw-alice-12345' });
+const eventsAfterSignIn: string[] = [];
+const postChannel = aliceClient
+  .channel('cli-posts-feed-post')
+  .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'cli_posts' }, (p) => eventsAfterSignIn.push(p.new.caption))
+  .subscribe();
+await new Promise((r) => setTimeout(r, 1000));
+
+await aliceClient.from('cli_posts').insert({ caption: 'alice own post' });
+await bobClient.from('cli_posts').insert({ caption: 'bob post while alice signed in' });
+await new Promise((r) => setTimeout(r, 1000));
+
+console.log('events alice sees once signed in:', JSON.stringify(eventsAfterSignIn));
+await aliceClient.removeChannel(postChannel);
+
+await admin.from('cli_posts').delete().eq('owner', alice.id);
+await admin.from('cli_posts').delete().eq('owner', bob.id);
+process.exit(0); // Realtime's underlying socket otherwise keeps the process alive past removeChannel()
+```
+
+```text
+events seen by alice, still anonymous: 0
+events alice sees once signed in: ["alice own post"]
+```
+
+สองการพิสูจน์จริงในการรันเดียว: ขณะเป็น anonymous subscription ของ alice ได้รับ event **ศูนย์** ตัวสำหรับ insert ของ Bob — session แบบ anonymous ไม่ตรงกับ row ไหนใน `owner = auth.uid()` เลย ดังนั้น RLS จึงบล็อกการส่งมอบเหมือนกับที่จะบล็อก `select` เป๊ะ พอ signed in แล้ว subscription ของ alice เห็น insert **ของตัวเอง** แต่ไม่เห็น insert ที่สองของ Bob แม้ทั้งสองเกิดขึ้นขณะ channel ของเธอยังทำงานอยู่ และทั้งคู่เป็น `INSERT` จริงบน table เดียวกัน — RLS policy scope ด้วย owner ตัวเดียวกัน ถูก evaluate ต่อ subscriber นี่เป็นไปได้เพราะ `SupabaseClient` ของ `supabase-js` — อ่านตรงจาก source ของ `@supabase/supabase-js@2.117.2` ที่ติดตั้งจริง — subscribe `onAuthStateChange` ของตัวเองแล้ว re-push token ปัจจุบันเข้า Realtime อัตโนมัติ:
+
+```text
+# tools/probe/node_modules/@supabase/supabase-js/dist/index.cjs (installed 2.117.2, read directly)
+if ((event === "TOKEN_REFRESHED" || event === "SIGNED_IN" || event === "INITIAL_SESSION") && this.changedAccessToken !== token) {
+  this.changedAccessToken = token;
+  this.realtime.setAuth(token);
 }
 ```
 
-ถ้า `userId` ไม่ตรงกับ `auth.uid()` ของ user ที่ signed in อยู่ RLS จะปฏิเสธ insert และ `insertError` จะมีค่า — `{ data, error }` pattern เดียวกันใช้ได้ตรงนี้เหมือนกับ upload และกฎเดียวกันจากบทก่อนก็ใช้ได้เช่นกัน branch ตาม `insertError.code` ถ้าต้องแยกว่าเป็นการถูก policy ปฏิเสธหรือเป็นอย่างอื่น แทนที่จะ parse ข้อความ message
+นี่คือ behavior แบบอัตโนมัติปัจจุบัน — token ของ Realtime ที่ stale หลัง sign-in หรือ token refresh ที่ต้องเรียก `supabase.realtime.setAuth()` เองเป็น pattern แบบ **เก่ากว่า**; `supabase-js` ปัจจุบัน wire สิ่งนี้ไว้ในตัวเอง ทุกครั้งที่ `SIGNED_IN`/`TOKEN_REFRESHED`/`INITIAL_SESSION` (ลำดับที่พิสูจน์แล้วของ `onAuthStateChange` จากบทที่แล้ว) `realtime.setAuth(token)` ด้วยมือยังจำเป็นอยู่เฉพาะ JWT แบบ custom ที่ไม่ใช่ session จริง ๆ — pattern ที่ docs ของโมดูล Realtime เองโชว์สำหรับ token ที่ออกด้วยมือ ไม่ใช่กรณี user signed-in ปกติที่บทนี้พิสูจน์
 
-## Step 3: client อีกตัวเห็น row ใหม่แบบ live
+## Cleanup: `removeChannel`
 
-client ตัวที่สองที่ต่ออยู่แล้ว — คนอื่นที่กำลังดู feed เดียวกัน — subscribe อยู่กับ `postgres_changes` บน table `posts` ตามที่ module Realtime อธิบายไว้ ทันทีที่ insert จาก step 2 commit Postgres จะ replicate การเปลี่ยนแปลงนั้นออกไป และ subscription นี้ก็จะ fire พร้อม row ใหม่เป็น payload
+ทุก `channel.subscribe()` ข้างบนถูกจับคู่กับ `client.removeChannel(channel)` เมื่อไม่มีการ watch feed อีกแล้ว — proof script ทั้งสองข้างบนเรียกมันตรง ๆ และรันสะอาดทั้งคู่ channel ที่ไม่ถูก remove จะเก็บ WebSocket subscription (และ closure ที่มันจับไว้) ให้อยู่ต่อตลอดอายุของ client ซึ่งใน single-page app ที่อายุยืนเป็น leak จริงที่สะสมขึ้นทุกครั้งที่ user navigate ออกจากแล้วกลับมาที่ feed view โดยไม่เรียกมัน
+
+## Optimistic UI: update list ก่อน round trip จะเสร็จ
+
+flow ที่ผสมกันแบบนี้มี network round trip เยอะพอ (upload, แล้ว insert, แล้วรอ Realtime echo) จนการรอทั้งสามให้เสร็จก่อนแสดงอะไรเลยรู้สึกช้า pattern ทั่วไปคือ render post ใหม่ทันทีจากข้อมูล local ของ client เอง แล้ว reconcile เมื่อ row จริง (พร้อม `id` และ `created_at` ที่ server กำหนด) กลับมา:
 
 ```typescript
-supabase
-  .channel('posts-feed')
-  .on(
-    'postgres_changes',
-    { event: 'INSERT', schema: 'public', table: 'posts' },
-    (payload) => {
-      // payload.new is the row just inserted in step 2
-      addPostToFeed(payload.new);
-    }
-  )
-  .subscribe();
+async function createPost(caption: string, file: File) {
+  const tempId = crypto.randomUUID();
+  const optimisticPost = { id: tempId, caption, created_at: new Date().toISOString(), pending: true };
+  addPostToFeed(optimisticPost); // shows immediately, before any network call resolves
+
+  const { data: uploaded, error: uploadErr } = await supabase.storage.from('cli-posts-images').upload(`${userId}/${tempId}`, file);
+  if (uploadErr) return replacePostInFeed(tempId, { ...optimisticPost, pending: false, failed: true });
+
+  const { data: post, error: insertErr } = await supabase
+    .from('cli_posts')
+    .insert({ caption, image_path: uploaded.path })
+    .select()
+    .single();
+  if (insertErr) return replacePostInFeed(tempId, { ...optimisticPost, pending: false, failed: true });
+
+  replacePostInFeed(tempId, { ...post, pending: false }); // swap the temp row for the real one
+}
 ```
 
-สิ่งนี้ทำงานได้ก็เพราะ `posts` ถูกเพิ่มเข้าไปใน publication `supabase_realtime` แล้ว — ขั้นตอน setup จาก module Realtime ถ้าไม่มีขั้นตอนนี้ การเปลี่ยนแปลงของ table จะไม่ถูก replicate ออกมาเลย ไม่ว่า listener `.on('postgres_changes', ...)` ตัวนี้จะเขียนถูกต้องแค่ไหน insert ใน step 2 ก็จะยังสำเร็จอยู่ดี แต่ callback ตัวนี้จะไม่ fire เลย
+flag `pending`/`failed` มีไว้เพื่อให้ UI แสดง spinner หรือปุ่ม retry บน card นั้นเฉพาะเจาะจง โดยไม่บล็อก feed ที่เหลือ และ `tempId` คือสิ่งที่ทำให้ `replacePostInFeed` หา entry ที่ optimistic ตัวที่ถูกต้องมา reconcile เพราะ `id` ของ row จริง (สร้างโดย `gen_random_uuid()` ฝั่ง server) ยังไม่รู้จนกว่า insert จะ return จริง
 
-## สาม service หนึ่ง feature
+## Pagination + Realtime merge pitfall
 
-ไม่มีอะไรพิเศษที่เป็น integration เฉพาะระหว่าง Storage, REST API และ Realtime — แต่ละ service ทำสิ่งที่ทำใน module ของตัวเองตามปกติ และ client code คือสิ่งที่ผูกทุกอย่างเข้าด้วยกันเป็น feature เดียวที่ user เห็น client ที่ upload ไม่เคยคุยกับ client ที่ subscribe อยู่โดยตรง flow นี้ทำงานได้เพราะทั้งคู่คุยกับ Supabase project เดียวกัน และ replication stream ของ Postgres คือสิ่งที่เชื่อม write ฝั่งหนึ่งเข้ากับ notification อีกฝั่ง
+feed แทบไม่เคยเป็น "ทุก row สด" — มักเป็น query แบบแบ่งหน้า `.range()` (หน้า 1 ล่าสุดก่อน) พร้อม Realtime subscription ซ้อนทับสำหรับของใหม่ pitfall คือ: `on('postgres_changes', { event: 'INSERT' }, (payload) => setPosts((prev) => [payload.new, ...prev]))` แบบไร้เดียงสา prepend **ทุก** insert ที่มันเห็น รวมถึงตัวที่ optimistic update ของคุณเองเพิ่มไปแล้ว (ซ้ำ พอ row จริงมาถึง) และในมุมมองที่แบ่งหน้าด้วย `.range()` ที่ไม่ได้เรียงตามลำดับการ insert ล้วน ๆ ตัวที่ไม่ควรอยู่บนสุดของ list ที่ user กำลังดูอยู่จริง ๆ ด้วย สอง guard จัดการทั้งสองกรณี: dedupe ด้วย `id` ก่อน prepend (`if (prev.some((p) => p.id === payload.new.id)) return prev;`) — ซึ่งก็คือสิ่งที่ reconcile optimistic post กับ Realtime echo ของมันเองพอดี ถ้า echo มาถึงก่อน response ของ insert เอง — และ prepend เฉพาะตอนที่ subscriber กำลังดูหน้าแรกใน sort order ปัจจุบันของ feed จริง ๆ เท่านั้น โดย queue "มี post ใหม่" affordance แทนที่จะ reorder เนื้อหาเงียบ ๆ ใต้ user ที่ scroll ลงไปไกลแล้ว
 
-<Mermaid title="One feature, three services: upload, insert under RLS, then a live notification" code={combinedFlowDiagram} />
+<Mermaid title="Feature เดียว สาม service token เดียวที่พิสูจน์แล้ว RLS scope เดียวที่พิสูจน์แล้ว" code={combinedFlowDiagram} />
 
 export const combinedFlowDiagram = `flowchart LR
-  upload["storage.from('photos').upload(file)"] --> insert["from('posts').insert({ photo_path, user_id })"]
-  insert -->|"allowed only if RLS policy passes"| commit[("Row committed in Postgres")]
-  commit -->|"replicated because posts is in supabase_realtime"| notify["postgres_changes INSERT event"]
-  notify --> other["Other client's .on('postgres_changes', ...) callback fires"]`;
+  upload["storage.from('cli-posts-images').upload(file)"] --> insert["from('cli_posts').insert({ image_path, caption })"]
+  insert -->|"same Authorization header — proved"| commit[("Row committed, owner = auth.uid()")]
+  commit -->|"replicated because cli_posts is in supabase_realtime"| notify["postgres_changes INSERT event"]
+  notify -->|"gated by owner = auth.uid() — proved: 0 events while anonymous"| other["Subscriber's callback fires only for their own rows"]`;
 
 <Callout title="สรุปหนึ่งบรรทัด">
-feature จริงมัก compose service เข้าด้วยกันแทนที่จะอยู่แค่ service เดียว `storage.from('photos').upload()` เก็บ file (Storage), `.from('posts').insert()` บันทึก row ที่ reference file นั้นและสำเร็จได้เพราะ **RLS policy** ที่ผูก `user_id` กับ `auth.uid()` (REST ที่ป้องกันแบบที่ module Auth อธิบายไว้) และ client อีกตัวที่ subscribe ผ่าน `.channel().on('postgres_changes', { event: 'INSERT', table: 'posts' }, ...)` จะ fire ทันทีที่ row นั้น commit (Realtime และทำงานได้ก็เพราะ `posts` ถูกเพิ่มเข้า publication **`supabase_realtime`** แล้วเท่านั้น) ทุก step ยังคืน `{ data, error }` เหมือนเดิม และการเช็ก `error` ในแต่ละ step ก็ยังจำเป็นเท่ากับตอนที่เป็น call เดียวโดด ๆ แม้จะเป็น flow ที่ compose มาสามขั้นตอนก็ตาม
+feature จริงผสม service เข้าด้วยกัน ไม่ได้อยู่ใน service เดียว — และบทนี้ **พิสูจน์** ไม่ใช่แค่กล่าวอ้าง การผสมนั้น: `storage.from('cli-posts-images').upload()` กับ `.from('cli_posts').insert()` จาก client ตัวเดียวกันส่ง **`Authorization` bearer token เดียวกันเป๊ะ** ทั้งบน request `/storage/v1/` และ `/rest/v1/` `postgres_changes` บน `cli_posts` บังคับ row level security **`owner = auth.uid()`** เดียวกันเป๊ะกับที่ `select` จะบังคับ — subscriber แบบ anonymous เห็น event ศูนย์ตัว และ subscriber ที่ signed in เห็นแค่ insert ของตัวเอง ไม่เคยเห็นของ user อื่นเลย — เพราะ `supabase-js` re-push token ของ session ปัจจุบันเข้า Realtime อัตโนมัติตอน `SIGNED_IN`/`TOKEN_REFRESHED`/`INITIAL_SESSION` (ยืนยันจากการอ่าน source ที่ติดตั้งจริง) ทำให้ไม่ต้องเรียก `realtime.setAuth()` เองสำหรับกรณี user signed-in ปกติ ทุก `channel.subscribe()` ต้องการ **`removeChannel()`** คู่กัน; optimistic UI update ต้องการ temporary id ที่เสถียรเพื่อ reconcile กับ row จริง; และ feed ที่แบ่งหน้าที่ merge insert แบบสดต้อง dedupe ด้วย `id` และเคารพว่า viewer กำลังดูหน้าไหนอยู่จริง ๆ
 </Callout>
+
+## อ่านโค้ดที่ AI สร้าง
+
+AI assistant ที่ถูกขอให้ "โชว์ post ใหม่แบบสดที่บนสุดของ feed" สร้างโค้ดนี้:
+
+<SpotTheBug lang="ts" code={`function usePostsFeed() {
+  const [posts, setPosts] = useState<Post[]>([]);
+
+  useEffect(() => {
+    supabase.from('cli_posts').select().order('created_at', { ascending: false }).range(0, 19).then(({ data }) => {
+      setPosts(data ?? []);
+    });
+
+    const channel = supabase
+      .channel('cli-posts-feed')
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'cli_posts' }, (payload) => {
+        setPosts((prev) => [payload.new as Post, ...prev]);
+      })
+      .subscribe();
+  }, []);
+
+  return posts;
+}
+`}>
+สอง bug จริง ทั้งคู่พิสูจน์ไว้แล้วที่อื่นในคอร์สนี้ ข้อแรก `channel` ถูกสร้างในตัว effect แต่ `supabase.removeChannel(channel)` ไม่เคยถูกเรียกใน cleanup function เลย — ทุกครั้งที่ hook นี้ remount (เปลี่ยน route แล้วกลับมา, parent re-render ที่ reset state) ทิ้ง WebSocket listener ของ subscription ก่อนหน้าไว้ให้ทำงานตลอดกาล สะสมทุกครั้งที่ remount ตรงกับ leak ที่บทนี้เอ่ยชื่อไว้เป๊ะ ข้อสอง callback ของ Realtime prepend `payload.new` แบบไม่มีเงื่อนไขเลย ไม่มีการ de-duplication — ถ้าแอปเดียวกันนี้ทำ optimistic insert ด้วย (pattern ของบทนี้เอง) row จริงจะมาถึงสองครั้ง: ครั้งหนึ่งจาก optimistic update ครั้งหนึ่งจาก Realtime callback นี้ สร้าง card ซ้ำที่เห็นได้ทันทีที่ network ตามทัน ทางแก้ของทั้งสองข้อ: `useEffect(() => { const channel = supabase.channel(...).on(...).subscribe(); return () => { supabase.removeChannel(channel); }; }, [])` สำหรับ leak และ `setPosts((prev) => prev.some((p) => p.id === payload.new.id) ? prev : [payload.new as Post, ...prev])` สำหรับตัวซ้ำ — ทั้งคู่เป็นการเปลี่ยนแค่บรรทัดเดียวบนโค้ดที่ดูสมเหตุสมผลสมบูรณ์
+</SpotTheBug>
+
+## Mental Model
+
+ไม่มีอะไรในบทนี้เป็นการ integrate พิเศษระหว่าง Storage, REST และ Realtime เลย — แต่ละ service ทำสิ่งที่มันทำในโมดูลของตัวเองเป๊ะ และทุกการพิสูจน์ในนี้คือข้อเท็จจริงเดียวกันที่มองจากสาม service ต่างกัน: **JWT ตัวเดียว แนบวิธีเดียวกัน เช็ควิธีเดียวกัน ทุกที่** REST กับ Storage ทั้งคู่อ่านมันจาก `Authorization` header เดียวกัน (พิสูจน์แล้วว่าเหมือนกันเป๊ะ byte ต่อ byte); Realtime อ่าน header ต่อ message บน WebSocket ที่คงอยู่ตลอดไม่ได้ ดังนั้น `supabase-js` จึง push token เดียวกันเข้าไปตรง ๆ ทุกครั้งที่ token เปลี่ยน (พิสูจน์ผ่าน internal listener จริง) และ row level security ก็ไม่รู้และไม่สนใจว่า service ไหนถามมา — `owner = auth.uid()` ถูก evaluate เหมือนกันเป๊ะไม่ว่า request จะมาในรูป `select`, `insert` หรือการเช็ค subscription `postgres_changes` เพราะทั้งสามท้ายที่สุดถาม role Postgres เดียวกันคำถามเดียวกัน พอเห็นว่า "token เดียว, RLS check เดียว, สาม service ที่บังเอิญใช้มัน" แล้ว ที่เหลือของบทนี้ — optimistic UI, cleanup, pagination merge — ก็เป็น client-side state management ธรรมดา ไม่ใช่อะไรเฉพาะของ Supabase เลย
+
+## Trade-off
+
+- **Client authenticated ตัวเดียวขับเคลื่อนทั้งสาม service แปลว่าไม่ต้องส่ง token เองด้วยมือระหว่างพวกมันเลย** — แลกกับ Realtime ที่ต้องการการ push ภายในตรง ๆ (พิสูจน์ข้างบน) แทนที่จะอ่าน header สดต่อ message แบบที่ REST กับ Storage ทำ เพราะ WebSocket ไม่มี header ต่อ message ให้อ่าน
+- **RLS ที่บังคับเหมือนกันข้าม REST และ Realtime แปลว่า policy เดียวเป็น single source of truth ว่าใครเห็นอะไร** — แลกกับ owner-scoped `postgres_changes` subscription (พิสูจน์ข้างบน) ที่ทำงาน authorization จริงต่อ row ทุกครั้งที่มีการเปลี่ยนแปลง ไม่ใช่แค่เช็คครั้งเดียวตอน subscribe
+- **Optimistic UI ทำให้ feature รู้สึกเร็วทันที** — แลกกับต้องมี reconciliation strategy (การสลับ `tempId` ของบทนี้ และ dedupe-by-`id` ของ section pagination) สำหรับตอนที่การเดา optimistic กับ state จริงของ server ไม่ตรงกัน รวมถึงกรณีปกติที่ตรงกันแต่มาถึงสองครั้ง
+- **Feed ที่แบ่งหน้าด้วย `.range()` ทำให้ initial load เร็วและมีขอบเขต** — แลกกับ Realtime insert แบบสดที่ไม่รู้โดยธรรมชาติว่ามันควรอยู่บนหน้าที่ viewer กำลังดูอยู่ไหม ช่องว่างที่ guard "prepend เฉพาะหน้าแรก" ของ section pagination-merge มีไว้ปิด
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"Storage, REST และ Realtime ต้อง authenticate แยกกัน"** พิสูจน์แล้วว่าผิด: `signInWithPassword()` ครั้งเดียวบน client เดียว แล้ว bearer token เดียวกันเป๊ะไปถึงทั้ง request `/rest/v1/` และ `/storage/v1/` โดยไม่ต้อง wire อะไรเองเลย
+- **"Realtime ไม่ได้บังคับ RLS จริง ๆ เหมือน REST — มันแค่ feed สดเฉย ๆ"** พิสูจน์แล้วว่าผิดด้วย user จริงสองคน: subscriber แบบ anonymous ได้รับ `postgres_changes` event ศูนย์ตัวภายใต้ policy ที่ scope ด้วย owner และ subscriber ที่ signed in ไม่เคยเห็น insert ของ user อื่นเลย ตรงกับที่ `select` ภายใต้ policy เดียวกันจะคืนให้
+- **"ต้องเรียก realtime.setAuth() เองเสมอหลัง sign-in ถึงจะให้ Realtime ทำงาน"** จริงใน SDK version เก่ากว่า แต่พิสูจน์แล้วว่าไม่จริงสำหรับ `2.117.2` ที่ติดตั้งของคอร์สนี้: `SupabaseClient` re-push token อัตโนมัติตอน `SIGNED_IN`/`TOKEN_REFRESHED`/`INITIAL_SESSION` ยืนยันด้วยการอ่าน source ที่ติดตั้งจริง — `setAuth()` ด้วยมือยังเหลือไว้สำหรับ JWT แบบ custom จริง ๆ ไม่ใช่กรณีปกติ
+- **"Prepend ทุก Realtime INSERT event เข้า list เป็นวิธีที่ปลอดภัยในการทำ feed สด"** พิสูจน์แล้วว่าผิดจาก `SpotTheBug` ของบทนี้และ section pagination-merge: ถ้าไม่มีเช็ค de-duplication optimistic update กับ echo ของ Realtime เองสร้างตัวซ้ำ และถ้าไม่มีเช็คว่า viewer อยู่หน้าไหน insert สามารถถูก prepend เข้าไปในหน้าที่ viewer scroll ผ่านไปแล้วได้
 
 export const quizCombinedFlow = [
   {
-    q: 'ใน feature upload รูป storage.from(\'photos\').upload() เป็นของ Supabase service ไหน',
+    q: 'ใน feature cli_posts การ intercept Authorization header จริงที่ออกไปทั้งบน Storage upload และ REST insert พิสูจน์อะไรจริง ๆ',
     options: [
-      'Storage',
-      'REST API',
-      'Realtime',
-      'Auth',
-    ],
-    answer: 0,
-  },
-  {
-    q: 'ทำไม call .from(\'posts\').insert() ใน step 2 ถึงสำเร็จเฉพาะ user ที่ถูกต้องเท่านั้น',
-    options: [
-      'เพราะ anon key บล็อก user อื่นให้อัตโนมัติ',
-      'เพราะ row level security policy จำกัดให้ insert ได้เฉพาะ row ที่ user_id ตรงกับ auth.uid() ที่เป็น mechanism เดียวกับที่ module Auth อธิบายไว้',
-      'เพราะ Storage validate column user_id ก่อน insert จะรัน',
-      'เพราะ insert ถูกห่อด้วย database transaction',
+      'Storage กับ REST ใช้ token ต่างกัน ต้อง sign-in แยกกัน',
+      'ทั้งสอง request ที่ส่งจาก client authenticated ตัวเดียวกัน พก bearer token เดียวกันเป๊ะ — พิสูจน์ตรง ๆ ไม่ใช่สมมติ',
+      'มีแค่ REST request เท่านั้นที่ authenticated; Storage upload เป็น anonymous เสมอ',
+      'anon key ไม่ใช่ session token ถูกใช้สำหรับทั้งสอง request',
     ],
     answer: 1,
+    explain: 'Authorization header จริงที่ capture ได้จาก request /storage/v1/ กับ /rest/v1/ จาก client เดียวกันตรงกันเป๊ะ byte ต่อ byte',
   },
   {
-    q: 'ทำไม postgres_changes subscription ของ client อีกตัวถึงพึ่งพาสิ่งที่มาจาก module Realtime โดยเฉพาะ',
+    q: 'ด้วย postgres_changes subscription บน cli_posts (select policy: owner = auth.uid()) การพิสูจน์ anonymous-vs-signed-in โชว์อะไร',
     options: [
-      'ไม่ได้พึ่งพาอะไรเลย postgres_changes ทำงานได้เสมอแค่เรียก .subscribe()',
-      'table posts ต้องถูกเพิ่มเข้า publication supabase_realtime ก่อน ไม่งั้น change event จะไม่ถูก replicate ไปหา subscriber เลย',
-      'พึ่งพา RLS policy จาก step 2 แทน',
-      'พึ่งพาการตั้ง storage bucket ให้เป็น public',
+      'subscriber แบบ anonymous เห็นทุก insert ไม่ว่าเป็นของใคร; มีแค่ REST query เท่านั้นที่ scope ด้วย RLS',
+      'subscriber แบบ anonymous ได้ event ศูนย์ตัว และ subscriber ที่ signed in เห็นแค่ insert ของตัวเองเท่านั้น ไม่เคยเห็นของ user อื่น — RLS scope เดียวกับที่ select จะบังคับ',
+      'Realtime ไม่สนใจ RLS เลย ส่ง event ทุกตัวให้ subscriber ทุกคน',
+      'มีแค่ table owner (Postgres role ที่สร้าง table) เท่านั้นที่รับ postgres_changes event ได้',
     ],
     answer: 1,
+    explain: 'พิสูจน์ด้วย user จริงสองคน: alice (anonymous) เห็น 0 event สำหรับ insert ของ Bob และ alice (signed in) เห็น insert ของตัวเองแต่ไม่เห็นตัวที่สองของ Bob — RLS gate การส่งมอบของ Realtime เหมือนกับที่จะ gate select เป๊ะ',
   },
   {
-    q: 'ทำไม error handling ยังสำคัญใน flow หลาย step อย่าง upload แล้ว insert แล้ว subscribe',
+    q: 'ทำไม Realtime subscription ของ user ที่ signed in ยังทำงานถูกต้องหลัง token refresh โดยไม่ต้องเรียก realtime.setAuth() เองใน supabase-js version ที่ติดตั้งของคอร์สนี้',
     options: [
-      'ไม่สำคัญ มีแค่ step สุดท้ายเท่านั้นที่ต้องเช็ก',
-      'แต่ละ step fail ได้อิสระต่อกัน และถ้าข้ามการเช็ก (เช่นหลัง upload) ก็อาจปล่อยให้ step ถัดไปทำงานต่อบนข้อมูลที่ผิด เช่น insert row ที่ชี้ไปยัง file ที่ไม่เคยถูกบันทึกจริง',
-      'เพราะ postgres_changes retry insert ที่ fail ให้อัตโนมัติ',
-      'เพราะ TypeScript จะไม่ยอม compile ถ้าไม่มี try/catch ครอบทุก call',
+      'จริง ๆ แล้ว Realtime ไม่ได้เช็ค token หลัง connect ครั้งแรกเลย',
+      'SupabaseClient เอง subscribe onAuthStateChange ของตัวเองแล้วเรียก realtime.setAuth(token) อัตโนมัติตอน SIGNED_IN/TOKEN_REFRESHED/INITIAL_SESSION ยืนยันจากการอ่าน source ที่ติดตั้งจริง',
+      'anon key ถูกใช้กับ Realtime เสมอไม่ว่า sign-in state จะเป็นอะไร จึงไม่ต้อง update เลย',
+      'Token ไม่เคยหมดอายุบน local development stack เลย refresh จึงไม่เคยเกิดขึ้นจริง',
     ],
     answer: 1,
+    explain: 'ยืนยันจากการอ่าน source ของ @supabase/supabase-js ที่ติดตั้งจริง: มี internal auth-state listener ที่ re-push token เข้า realtime.setAuth() อัตโนมัติตามสาม event นั้น',
+  },
+  {
+    q: 'hook usePostsFeed ใน SpotTheBug พลาดอะไรเกี่ยวกับ lifecycle ของ Realtime subscription',
+    options: [
+      'subscribe table ผิด',
+      'ไม่เคยเรียก removeChannel ใน cleanup function เลย ทุกครั้งที่ remount ทิ้ง WebSocket subscription เดิมให้ทำงานต่อ',
+      'ใช้ postgres_changes แทน broadcast ซึ่งผิดเสมอ',
+      'subscribe ก่อนที่หน้าแรกของ post จะโหลดเสร็จ ซึ่งเป็น race condition',
+    ],
+    answer: 1,
+    explain: 'effect สร้าง channel แล้ว subscribe แต่ useEffect ไม่เคย return cleanup function ที่เรียก supabase.removeChannel(channel) เลย — leak จริงที่สะสมทุกครั้งที่ remount',
+  },
+  {
+    q: 'feed หนึ่ง merge postgres_changes INSERT event แบบสดเข้า list ที่แบ่งหน้าด้วย .range() โดยไม่มี de-duplication เลย เกิดปัญหาจริงอะไรเมื่อแอปทำ optimistic UI update ด้วย',
+    options: [
+      'ไม่มีปัญหาเลย Realtime ข้าม event สำหรับ row ที่ client มีอยู่แล้วอัตโนมัติ',
+      'post ที่ถูกเพิ่มแบบ optimistic กับ echo ของ Realtime ของมันเองถูก prepend ทั้งคู่ สร้าง card ซ้ำที่เห็นได้ จนกว่าจะเพิ่มเช็ค dedupe-by-id',
+      'หน้าเว็บ crash เพราะ Realtime กับ optimistic update อยู่ด้วยกันไม่ได้',
+      'Realtime event ถูก drop เงียบ ๆ ทุกครั้งที่มี optimistic update ค้างอยู่',
+    ],
+    answer: 1,
+    explain: 'ถ้าไม่เช็คว่า payload.new.id มีอยู่ใน list ปัจจุบันแล้วหรือยัง entry แบบ optimistic กับ row ที่ Realtime ส่งมาจริงจะถูก prepend เป็นสอง entry แยกกัน',
   },
 ];
 
