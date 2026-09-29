@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
@@ -60,6 +61,28 @@ supabase db push
 
 With this in place, a migration file merged to the main branch is applied to production the same way every time, by the same automated process that already tested it against a preview branch — no human running ad hoc SQL against a live database, and no environment silently drifting out of sync with what is in version control.
 
+## Checking before shipping: `--dry-run` and `db lint`, proven for real
+
+A CI step that just runs `db push` blind is still one bad migration away from a broken production database. Two real, non-destructive checks belong before it. First, `--dry-run` — lists exactly what would be applied without touching anything:
+
+```text
+$ supabase db push --db-url "postgresql://...127.0.0.1:55322/postgres?sslmode=disable" --dry-run --yes
+DRY RUN: migrations will *not* be pushed to the database.
+Would push these migrations:
+ • 20260929070903_fnd_capture_courses.sql
+ • 20260929072708_fnd_add_note_to_widgets.sql
+{"upToDate":false,"dryRun":true,"migrations":[...],"message":"Finished supabase db push."}
+```
+
+Confirmed against the real database afterward — the listed migrations were **not** applied; the column one of them adds does not exist yet. This lesson's [Foundations counterpart](/supabase/en/foundations/tables-schema-and-migrations/) proves the full real migration workflow (`migration new`, `db diff -f`, `db push`, `migration list`) and `db lint` output end to end against this same local stack — this lesson does not repeat that proof, only the CI-shaped addition above it: a `--dry-run` step, and a `db lint --fail-on error` step, both run *before* the real `db push` in the same pipeline, so a broken or unexpectedly large migration is caught in CI output rather than by whatever the migration actually does to production.
+
+```bash
+# scripts/ci-migration-check.sh
+supabase db push --db-url "$SUPABASE_DB_URL" --dry-run
+supabase db lint --db-url "$SUPABASE_DB_URL" --fail-on error
+supabase db push --db-url "$SUPABASE_DB_URL"
+```
+
 <Mermaid title="A Git branch flows through an isolated Supabase preview branch, then merges to production" code={branchingDiagram} />
 
 export const branchingDiagram = `flowchart LR
@@ -68,6 +91,34 @@ export const branchingDiagram = `flowchart LR
   mig --> merge["Pull request merged"]
   merge --> ci["CI runs supabase db push"]
   ci --> prod[("Production Postgres")]`;
+
+## Reading AI-generated code
+
+An AI assistant, asked to "set up the CI step that deploys database changes," produced this:
+
+<SpotTheBug lang="bash" code={`# scripts/ai-ci-deploy-db.sh
+# An AI assistant's suggested CI step for shipping migrations
+supabase link --project-ref "$SUPABASE_PROJECT_REF"
+supabase db push --yes
+`}>
+This runs without asking questions, which in a CI pipeline is exactly the wrong property for a step with no prior check. The `--yes` flag skips the interactive "do you want to push these migrations?" confirmation this lesson's earlier examples show by default — reasonable for a non-interactive pipeline, but only once something else has actually verified what is about to ship. Nothing here does: no `--dry-run` to print what would be applied, no `db lint` to catch a typing error before it reaches production, and no distinction between a migration that already ran safely on a preview branch versus one that has never been tested at all. The fix is the three-line pipeline proved above: `--dry-run` first (prints, does not apply), `db lint --fail-on error` second (fails the build on a real schema error before touching the database), and only then the real `db push` — turning "trust the CLI and hope" into "verify, then apply," the same shift from ClickOps to reviewable process this whole module keeps returning to.
+</SpotTheBug>
+
+## Mental Model
+
+Treat CI's `db push` step the same way you would treat a deploy of application code: something should verify the change *before* it runs against anything real, and the check should fail loudly and stop the pipeline rather than let a bad migration through because "it usually works." `--dry-run` and `db lint` are that verification step for schema changes specifically — cheap, non-destructive, and both proven above to run against the same real database the actual push will target, so they are testing the real thing, not a simulation of it.
+
+## Trade-offs
+
+- **Branching gives you a fully isolated database to test a risky migration against** — **at the cost of needing a hosted, linked project** (proved throughout this course: the local CLI stack alone cannot simulate branching, since it has no concept of a hosted preview environment).
+- **`--dry-run` is fast and completely safe to run on every single CI run** — **at the cost of only checking "what would be applied," not "will this actually succeed"** — a migration that passes dry-run can still fail for real on `db push` if, for instance, a table it depends on was dropped since the migration file was written.
+- **Automating `db push` through CI removes the human error of ad hoc production SQL** — **at the cost of making the CI pipeline itself a high-trust target**: whatever credentials let CI run `db push` against production can do anything any migration file could do, which is exactly why those credentials deserve the same scrutiny a service_role key gets elsewhere in this course.
+
+## Common Misconceptions
+
+- **"`--dry-run` actually tests whether the migration will succeed."** Disproved by what it demonstrably does above: it only prints which migration files are pending, without connecting them to Postgres for real execution — `db lint` and the eventual real `db push` are what actually exercise the SQL.
+- **"`--yes` is a shortcut that skips something optional."** It skips the one interactive confirmation standing between a CI pipeline and applying migrations with zero human review — appropriate only once `--dry-run`/`db lint` have already done that job programmatically, as the SpotTheBug above shows going wrong.
+- **"Branching and migrations are two unrelated CLI features that happen to live in the same module."** They are the same workflow at two different stages: a migration is tested in isolation on a branch, then the identical file — unchanged — is what CI applies to production; branching without migrations to test would have nothing repeatable to carry forward.
 
 <Callout title="The one-line takeaway">
 A Supabase **branch** is a real, isolated preview copy of your project tied to a Git branch or pull request, not a feature flag inside a shared database. **Migrations** — plain SQL files created with `supabase migration new` or captured after the fact with `supabase db diff` — are what let a schema change tested on a branch get replayed reliably elsewhere, and running `supabase db push` from **CI** rather than by hand is what keeps that replay consistent, ordered, and free of ad hoc production SQL.
@@ -83,6 +134,7 @@ export const quizBranchingMigrations = [
       'A separate frontend deployment with no database changes involved',
     ],
     answer: 1,
+    explain: 'The local CLI stack cannot simulate this on its own — branching genuinely needs a hosted, linked project, unlike the migration workflows proved elsewhere in this course.',
   },
   {
     q: 'What is `supabase db diff` for?',
@@ -93,6 +145,7 @@ export const quizBranchingMigrations = [
       'Listing every preview branch on the linked project',
     ],
     answer: 1,
+    explain: 'Proved in full, with real output including a genuine shared-database gotcha, in the Foundations module\'s Tables, Schema, and Migrations lesson.',
   },
   {
     q: 'Why does running `supabase db push` through CI matter more than running it by hand against production?',
@@ -103,6 +156,7 @@ export const quizBranchingMigrations = [
       'It only matters for projects that do not use branching',
     ],
     answer: 1,
+    explain: 'The AI-generated bash SpotTheBug above shows exactly what running it blind, with no prior check, looks like — and why --dry-run and db lint belong ahead of it.',
   },
   {
     q: 'What does `supabase db push` do?',
@@ -113,6 +167,18 @@ export const quizBranchingMigrations = [
       'It permanently deletes the linked project',
     ],
     answer: 1,
+    explain: 'This is the command both `--dry-run` (prints, does not apply) and the real push proved above target — the same command, just with or without the flag.',
+  },
+  {
+    q: 'A real `db push --dry-run` against this course\'s local stack listed two pending migrations and reported `"dryRun":true`. What did a follow-up `psql` check confirm, and why does that matter for a CI pipeline?',
+    options: [
+      'The migrations were applied immediately regardless of the flag',
+      'Neither migration had actually been applied yet — --dry-run only reports what would happen, making it safe to run on every CI invocation before the real db push',
+      'The dry-run command deleted the pending migrations',
+      '--dry-run requires a separate database from the real one',
+    ],
+    answer: 1,
+    explain: 'Proved above: the column one migration would add was confirmed absent afterward — --dry-run is purely informational, which is exactly what makes it safe to run unconditionally in CI.',
   },
 ];
 

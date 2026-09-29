@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
@@ -60,7 +61,29 @@ supabase db push
 
 เมื่อตั้งค่าแบบนี้แล้ว migration file ที่ merge เข้า main branch จะถูก apply เข้า production แบบเดียวกันทุกครั้ง โดย automated process ตัวเดียวกับที่ test บน preview branch มาแล้ว — ไม่มีคนมารัน SQL แบบ ad hoc เข้า database ที่รันจริงอยู่ และไม่มี environment ไหนแอบ drift ออกจากสิ่งที่อยู่ใน version control
 
-<Mermaid title="A Git branch flows through an isolated Supabase preview branch, then merges to production" code={branchingDiagram} />
+## เช็คก่อน ship: `--dry-run` กับ `db lint` พิสูจน์จริง
+
+CI step ที่แค่รัน `db push` เปล่า ๆ ยังห่าง migration พังหนึ่งตัวจาก production database ที่พังอยู่ดี มีสองอย่างที่ควรอยู่ก่อนหน้ามัน ไม่ทำลายอะไรและจริงทั้งคู่ อย่างแรก `--dry-run` — list ว่าจะ apply อะไรบ้างโดยไม่แตะอะไรเลย:
+
+```text
+$ supabase db push --db-url "postgresql://...127.0.0.1:55322/postgres?sslmode=disable" --dry-run --yes
+DRY RUN: migrations will *not* be pushed to the database.
+Would push these migrations:
+ • 20260929070903_fnd_capture_courses.sql
+ • 20260929072708_fnd_add_note_to_widgets.sql
+{"upToDate":false,"dryRun":true,"migrations":[...],"message":"Finished supabase db push."}
+```
+
+ยืนยันกับ database จริงทีหลังแล้วว่า — migration ที่ list ไว้ **ไม่ได้** ถูก apply เลย column ที่หนึ่งในนั้นเพิ่มเข้าไปยังไม่มีอยู่ [คู่บทใน Foundations](/supabase/th/foundations/tables-schema-and-migrations/) พิสูจน์ migration workflow เต็มรูปแบบ (`migration new`, `db diff -f`, `db push`, `migration list`) และ output ของ `db lint` แบบครบวงจรกับ local stack เดียวกันนี้แล้ว — บทนี้ไม่พิสูจน์ซ้ำ แค่เติมส่วนที่เป็น shape ของ CI เพิ่มเข้าไป: step `--dry-run` และ step `db lint --fail-on error` ทั้งคู่รัน *ก่อน* `db push` จริงใน pipeline เดียวกัน เพื่อให้ migration ที่พังหรือใหญ่เกินคาดถูกจับได้ใน CI output แทนที่จะจับได้จากสิ่งที่ migration นั้นทำกับ production จริง ๆ
+
+```bash
+# scripts/ci-migration-check.sh
+supabase db push --db-url "$SUPABASE_DB_URL" --dry-run
+supabase db lint --db-url "$SUPABASE_DB_URL" --fail-on error
+supabase db push --db-url "$SUPABASE_DB_URL"
+```
+
+<Mermaid title="Git branch ไหลผ่าน Supabase preview branch ที่แยกออกมา แล้ว merge เข้า production" code={branchingDiagram} />
 
 export const branchingDiagram = `flowchart LR
   pr["Git branch / pull request"] --> branch["Supabase preview branch (isolated schema copy)"]
@@ -68,6 +91,34 @@ export const branchingDiagram = `flowchart LR
   mig --> merge["Pull request merged"]
   merge --> ci["CI runs supabase db push"]
   ci --> prod[("Production Postgres")]`;
+
+## อ่านโค้ดที่ AI สร้าง
+
+AI assistant ถูกขอให้ "set up the CI step that deploys database changes" แล้วสร้างสิ่งนี้:
+
+<SpotTheBug lang="bash" code={`# scripts/ai-ci-deploy-db.sh
+# An AI assistant's suggested CI step for shipping migrations
+supabase link --project-ref "$SUPABASE_PROJECT_REF"
+supabase db push --yes
+`}>
+สิ่งนี้รันโดยไม่ถามอะไรเลย ซึ่งใน CI pipeline คือ property ที่ผิดที่สุดสำหรับ step ที่ไม่มีการเช็คมาก่อน flag `--yes` ข้าม confirmation แบบ interactive "do you want to push these migrations?" ที่ตัวอย่างก่อนหน้าในบทนี้แสดงเป็น default — สมเหตุสมผลสำหรับ pipeline แบบ non-interactive แต่ต้องมีบางอย่างเช็คก่อนแล้วว่าสิ่งที่กำลังจะ ship คืออะไร ตรงนี้ไม่มีเลย: ไม่มี `--dry-run` เพื่อ print ว่าจะเกิดอะไรขึ้น ไม่มี `db lint` เพื่อจับ typing error ก่อนที่มันจะไปถึง production และไม่มีการแยกแยะระหว่าง migration ที่เคยรันปลอดภัยบน preview branch แล้ว กับตัวที่ไม่เคย test เลย ทางแก้คือ pipeline สามบรรทัดที่พิสูจน์ไว้ข้างบน: `--dry-run` ก่อน (print อย่างเดียว ไม่ apply) `db lint --fail-on error` ต่อ (ทำให้ build fail ถ้ามี schema error จริงก่อนที่จะแตะ database) แล้วค่อย `db push` จริง — เปลี่ยนจาก "เชื่อ CLI แล้วหวังว่าจะรอด" เป็น "verify แล้วค่อย apply" การเปลี่ยนจาก ClickOps เป็น process ที่ review ได้แบบเดียวกับที่ module นี้ทั้งหมดวนกลับมาย้ำตลอด
+</SpotTheBug>
+
+## Mental Model
+
+ปฏิบัติกับ step `db push` ของ CI เหมือนกับที่คุณปฏิบัติกับการ deploy application code: ต้องมีอะไรบางอย่าง verify change *ก่อน* ที่มันจะรันกับของจริง และการเช็คนั้นควร fail แบบดัง ๆ แล้วหยุด pipeline แทนที่จะปล่อย migration พังผ่านไปเพราะ "ปกติมันก็ใช้ได้" `--dry-run` กับ `db lint` คือ verification step สำหรับ schema change โดยเฉพาะ — ถูก ไม่ทำลายอะไร และทั้งคู่พิสูจน์ข้างบนแล้วว่ารันกับ database จริงตัวเดียวกับที่ push จริงจะเล็งไป ไม่ใช่ simulation ของมัน
+
+## Trade-offs
+
+- **Branching ให้ database ที่แยกเต็มรูปแบบสำหรับ test migration เสี่ยง ๆ** — **แลกมาด้วยต้องมี hosted project ที่ link ไว้** (พิสูจน์ตลอดคอร์สนี้: local CLI stack เดี่ยว ๆ จำลอง branching เองไม่ได้ เพราะไม่มีแนวคิดของ hosted preview environment)
+- **`--dry-run` เร็วและปลอดภัยเต็มที่ที่จะรันทุก CI run** — **แลกมาด้วยเช็คแค่ "จะ apply อะไร" ไม่ใช่ "สิ่งนี้จะสำเร็จจริงไหม"** — migration ที่ผ่าน dry-run ก็ยังพังตอน `db push` จริงได้ ถ้าเช่นว่า table ที่มัน depend อยู่ถูกลบไปตั้งแต่ตอนเขียน migration file
+- **การ automate `db push` ผ่าน CI ตัด human error ของ ad hoc production SQL ออกไป** — **แลกมาด้วยทำให้ CI pipeline เองกลายเป็น target ที่ต้อง trust สูง**: credential ไหนก็ตามที่ให้ CI รัน `db push` เข้า production ได้ ทำอะไรก็ได้เหมือน migration file ไหนก็ทำได้ ซึ่งเป็นเหตุผลตรงที่ credential พวกนั้นควรได้รับความระมัดระวังเท่า service_role key ที่อื่นในคอร์สนี้
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"`--dry-run` test จริง ๆ ว่า migration จะสำเร็จไหม"** ถูกหักล้างด้วยสิ่งที่มันทำจริงข้างบน: มัน print แค่ว่า migration file ไหน pending อยู่ โดยไม่เชื่อมกับ Postgres เพื่อรันจริง — `db lint` กับ `db push` จริงในที่สุดต่างหากที่รัน SQL จริง
+- **"`--yes` เป็นแค่ shortcut ที่ข้ามอะไรที่ optional"** มันข้าม confirmation แบบ interactive หนึ่งตัวที่กั้นระหว่าง CI pipeline กับการ apply migration โดยไม่มี human review เลย — เหมาะแค่ตอนที่ `--dry-run`/`db lint` ทำหน้าที่นั้นแบบ programmatic ไปแล้วเท่านั้น อย่างที่ SpotTheBug ข้างบนแสดงว่าพังยังไงถ้าไม่มี
+- **"Branching กับ migration เป็น feature ของ CLI สองอันที่ไม่เกี่ยวกัน บังเอิญอยู่ module เดียวกัน"** มันคือ workflow เดียวกันคนละขั้นตอน: migration ถูก test แบบแยกส่วนบน branch แล้วไฟล์เดิมเป๊ะ ๆ — ไม่เปลี่ยน — คือสิ่งที่ CI apply เข้า production branching ที่ไม่มี migration ให้ test ก็จะไม่มีอะไรที่ replay ต่อไปได้
 
 <Callout title="สรุปหนึ่งบรรทัด">
 Supabase **branch** คือ preview copy ของ project ที่แยกจริง ๆ ผูกกับ Git branch หรือ pull request ไม่ใช่ feature flag ข้างใน database ที่ใช้ร่วมกัน **Migration** — ไฟล์ SQL ธรรมดาที่สร้างด้วย `supabase migration new` หรือจับจาก change ที่ทำผ่าน GUI ด้วย `supabase db diff` — คือสิ่งที่ทำให้ schema change ที่ test บน branch เอาไป replay ซ้ำที่อื่นได้อย่างน่าเชื่อถือ และการรัน `supabase db push` จาก **CI** แทนที่จะรันเองด้วยมือ คือสิ่งที่ทำให้การ replay นั้นสม่ำเสมอ, ตามลำดับ และไม่มี ad hoc SQL เข้า production เลย
@@ -83,6 +134,7 @@ export const quizBranchingMigrations = [
       'frontend deployment แยกต่างหากที่ไม่เกี่ยวกับ database เลย',
     ],
     answer: 1,
+    explain: 'local CLI stack เดี่ยว ๆ จำลองสิ่งนี้เองไม่ได้ — branching ต้องการ hosted project ที่ link ไว้จริง ๆ ต่างจาก migration workflow ที่พิสูจน์ไว้ที่อื่นในคอร์สนี้',
   },
   {
     q: '`supabase db diff` มีไว้ทำอะไร',
@@ -93,6 +145,7 @@ export const quizBranchingMigrations = [
       'list preview branch ทั้งหมดของ project ที่ link ไว้',
     ],
     answer: 1,
+    explain: 'พิสูจน์เต็มรูปแบบ พร้อม output จริงรวมถึงปัญหาจริงเรื่อง shared database ไว้ในบท Tables, Schema, and Migrations ของ module Foundations',
   },
   {
     q: 'ทำไมการรัน `supabase db push` ผ่าน CI ถึงสำคัญกว่าการรันเองด้วยมือเข้า production',
@@ -103,6 +156,7 @@ export const quizBranchingMigrations = [
       'สำคัญเฉพาะ project ที่ไม่ได้ใช้ branching เท่านั้น',
     ],
     answer: 1,
+    explain: 'SpotTheBug แบบ bash ที่ AI สร้างข้างบนแสดงชัดว่าการรันแบบเปล่า ๆ ไม่มีเช็คก่อนหน้าเป็นยังไง — และทำไม --dry-run กับ db lint ควรอยู่ก่อนมัน',
   },
   {
     q: '`supabase db push` ทำอะไร',
@@ -113,6 +167,18 @@ export const quizBranchingMigrations = [
       'ลบ project ที่ link ไว้อย่างถาวร',
     ],
     answer: 1,
+    explain: 'นี่คือคำสั่งที่ทั้ง --dry-run (print อย่างเดียว ไม่ apply) และ push จริงที่พิสูจน์ข้างบนเล็งไปที่ — คำสั่งเดียวกัน แค่มีหรือไม่มี flag',
+  },
+  {
+    q: '`db push --dry-run` จริงกับ local stack ของคอร์สนี้ list migration ที่ pending อยู่สองตัว และ report `"dryRun":true` การเช็ค `psql` ตามหลังยืนยันอะไร และทำไมมันสำคัญกับ CI pipeline',
+    options: [
+      'migration ทั้งสองถูก apply ทันทีไม่สนใจ flag',
+      'ยังไม่มี migration ไหนถูก apply เลย — --dry-run แค่ report ว่าจะเกิดอะไรขึ้น ทำให้ปลอดภัยที่จะรันทุกครั้งที่ CI invoke ก่อน db push จริง',
+      'คำสั่ง dry-run ลบ migration ที่ pending อยู่ทิ้ง',
+      '--dry-run ต้องการ database แยกจาก database จริง',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ข้างบนแล้ว: column ที่ migration หนึ่งจะเพิ่มถูกยืนยันว่ายังไม่มีอยู่หลังจากนั้น — --dry-run เป็นแค่ข้อมูลล้วน ๆ ซึ่งเป็นสิ่งที่ทำให้มันปลอดภัยที่จะรันแบบไม่มีเงื่อนไขใน CI',
   },
 ];
 
