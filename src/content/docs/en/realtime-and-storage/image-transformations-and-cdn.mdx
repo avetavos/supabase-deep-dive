@@ -1,6 +1,6 @@
 ---
 title: 'Image Transformations and the CDN'
-description: 'How Supabase Storage resizes and reprocesses images on the fly from URL parameters, and why letting the CDN cache each transformed variant beats pre-generating every size yourself.'
+description: 'How Supabase Storage resizes images on the fly via imgproxy, why this local stack has it disabled by default, and how cache-control, the Smart CDN, and signed vs public URLs actually behave.'
 sidebar:
   order: 4
 ---
@@ -8,65 +8,155 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
 
-Supabase Storage can resize and reprocess an image **on the fly** at request time using plain query parameters, so you never have to pre-generate and store a thumbnail, medium, and large copy of every image yourself.
+Supabase Storage can resize and reprocess an image **on the fly** at request time using plain query parameters, backed by an `imgproxy` container — but this specific local stack has that container's feature flag **disabled by default**, which is itself worth understanding precisely, since it is the same gate hosted Supabase uses to paywall the feature.
 
 ## Requesting a transformed image
 
 Instead of uploading one `photo.png` and separately uploading `photo-thumb.png`, `photo-medium.png`, and so on, you upload the image once and ask for whatever size you need when you serve it. Both `getPublicUrl` and `createSignedUrl` accept a `transform` option:
 
-```typescript
+```ts
+// src/rt-transform-url.ts
+import { createClient } from '@supabase/supabase-js';
+
+declare const process: { env: Record<string, string | undefined> };
+
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!);
+
 const { data } = supabase.storage
-  .from('avatars')
+  .from('rt-images')
   .getPublicUrl('user123/photo.png', {
     transform: {
-      width: 200,
-      height: 200,
+      width: 100,
+      height: 100,
       resize: 'cover',
     },
   });
+
+console.log(data.publicUrl);
+// http://127.0.0.1:55321/storage/v1/render/image/public/rt-images/user123/photo.png?width=100&height=100&resize=cover
 ```
 
-`width` and `height` set the target dimensions in pixels. `resize` controls how the image fits those dimensions: `cover` (the default) fills the target size and crops any excess, `contain` fits the whole image inside the target size while preserving aspect ratio, and `fill` stretches the image to the exact dimensions without preserving aspect ratio. A `quality` option is also available to control compression. Requesting three different sizes of the same source file is just three different query strings against the same underlying object:
+`width` and `height` set the target dimensions in pixels. `resize` controls how the image fits those dimensions: `cover` (the default) fills the target size and crops any excess, `contain` fits the whole image inside the target size while preserving aspect ratio, and `fill` stretches the image to the exact dimensions without preserving aspect ratio. `getPublicUrl` builds this URL client-side with no network call at all — it is just string construction — so the real question is what happens when a client actually requests that URL.
 
-```typescript
-const thumb = supabase.storage.from('avatars').getPublicUrl('user123/photo.png', {
-  transform: { width: 64, height: 64, resize: 'cover' },
-});
-const medium = supabase.storage.from('avatars').getPublicUrl('user123/photo.png', {
-  transform: { width: 400, height: 400, resize: 'contain' },
-});
+## Proof: this local stack has image transformation disabled — and exactly why
+
+A real 600×400 PNG (351,741 bytes, generated on this Mac with `sips`) uploaded to a real bucket, then requested through the exact URL `getPublicUrl`'s `transform` option produced above:
+
+```text
+--- transformed: width=100&height=100&resize=cover ---
+HTTP_STATUS:404
+{"statusCode":"404","error":"Not Found","message":"Route GET:/render/image/public/rt-images/.../photo.png?width=100&height=100&resize=cover not found","code":"InvalidRequest"}
 ```
 
-No new upload happened for either of those — the same stored original serves both.
+Not a transform failure — the `/render/image/...` route itself does not exist on this stack's Kong gateway at all. Checking the storage container's own environment confirms why:
 
-## Why the CDN cache matters here
+```bash
+# scripts/rt-check-imgproxy-config.sh
+docker exec supabase_storage_probe env | grep -i "IMAGE_TRANSFORM\|IMGPROXY"
+```
 
-The first request for a given file plus a given set of transform parameters does real work: Storage decodes the original, resizes it, and returns the result. That would be slow if it happened on every single request. It does not, because the transformed output is cached at the **CDN edge**, keyed by the file and the exact transform parameters used. The next request for the same `width`/`height`/`resize` combination on the same object is served straight from the edge cache, without reprocessing the image again. Change any parameter, though, and it is a new cache key — a fresh variant gets generated and cached on its first request.
+```text
+ENABLE_IMAGE_TRANSFORMATION=false
+IMAGE_TRANSFORMATION_ENABLED=false
+IMGPROXY_URL=http://supabase_imgproxy_probe:5001
+```
 
-Worth noting factually: on hosted Supabase, image transformations are a feature gated to paid plans rather than something available on every project tier, so it is worth checking your plan before relying on it in production.
+`IMGPROXY_URL` is configured (the storage-api knows where an `imgproxy` container *would* live), but `ENABLE_IMAGE_TRANSFORMATION=false` means storage-api never registers the `/render/image` route in the first place — and confirmed by `docker ps -a`, no `supabase_imgproxy_probe` container exists at all yet (it would be created lazily on first *enabled* use). This traces directly to the probe's own `supabase/config.toml`:
 
-## The tradeoff against pre-generating sizes yourself
+```text
+# tools/probe/supabase/config.toml (excerpt — NOT part of this lesson's migration; shown for reference only)
+[storage]
+enabled = true
+file_size_limit = "50MiB"
 
-The alternative — resizing images yourself at upload time and storing a `photo-thumb.png`, `photo-medium.png`, and `photo-large.png` — avoids any transform cost at read time, but it comes with real costs of its own: you store N copies of every image forever, you have to pick your fixed sizes up front, and if you ever need a size you did not anticipate you have to reprocess and re-upload everything retroactively. On-the-fly transformation flips that trade: you pay a small amount of latency on the *first* request for a given size, in exchange for storing exactly **one** original per image and being able to request any size, at any time, without touching the upload path again.
+# [storage.image_transformation]
+# enabled = true
+```
 
-<Mermaid title="One original image serves any number of transform variants, cached at the CDN edge after first request" code={imageTransformDiagram} />
+The `[storage.image_transformation]` block is present but **commented out** — the local CLI's own scaffolded default. This is not a bug in this course's probe; it is the CLI's documented default, and it mirrors hosted Supabase exactly: image transformations are a feature gated to **Pro plan and above** on hosted projects ([supabase.com/docs/guides/storage/serving/image-transformations](https://supabase.com/docs/guides/storage/serving/image-transformations)), so a fresh local project defaulting to "off" matches a fresh free-tier hosted project defaulting to "off" too. Enabling it locally is a one-line `config.toml` change (`enabled = true` under `[storage.image_transformation]`) followed by `supabase stop && supabase start` — not applied in this lesson because it is a shared setting across this course's whole probe stack (other lessons' proofs must not be disrupted by a stack restart), per this course's own harness rules.
+
+<Callout title="What enabling it would prove, per the docs">
+With the flag on, the identical request above would return `200` with `Content-Type: image/webp` (or `image/png` depending on `Accept`/format negotiation) and a byte size smaller than the 351,741-byte original — `imgproxy` decodes, resizes to 100×100 with `cover` cropping, and re-encodes. The mechanism is real and identically documented for self-hosted deployments (`IMGPROXY_URL` pointing at a real `imgproxy` container, `ENABLE_IMAGE_TRANSFORMATION=true` — [supabase.com/docs/guides/storage/serving/image-transformations](https://supabase.com/docs/guides/storage/serving/image-transformations)); this local stack simply ships it off by default, exactly like a hosted free-tier project would.
+</Callout>
+
+## `cache-control`: what is actually provable locally, and a real surprise in it
+
+Independent of image transformation, every Storage object carries a real `Cache-Control` HTTP header, controllable at upload time via the `cacheControl` option — and this part works today, transform flag or not. Default (no `cacheControl` passed) versus an explicit value:
+
+```text
+--- default upload, no cacheControl option ---
+cache-control: no-cache
+
+--- upload with cacheControl: '3600' ---
+cache-control: 3600
+```
+
+Both are real response headers from the same `supabase_storage_probe` container. The second one is worth pausing on: the docs' own examples pass `cacheControl: '3600'` as a bare numeric string (`cacheControl: '86400', // Cache for 24 hours` — [supabase.com/docs](https://github.com/supabase/supabase/blob/master/apps/docs/content/guides/functions/storage-caching.mdx)), and that string is written into the `Cache-Control` header **verbatim** — the real response above is literally `cache-control: 3600`, not the HTTP-spec-correct `cache-control: max-age=3600`. A bare number is not a valid `Cache-Control` directive per HTTP semantics; whether a given CDN or browser honors it, ignores it, or falls back to a default is implementation-dependent behavior you should not rely on. If you need an unambiguous, correct header, set the full directive yourself where your stack allows it, rather than assuming `cacheControl: '3600'` alone produces standards-correct caching.
+
+## The CDN edge cache — Smart CDN, invalidation, and the trade-off it replaces
+
+On hosted Supabase, the first request for a given file plus a given set of transform parameters does real work: Storage decodes, resizes, and returns the result; the transformed output is then cached at the CDN edge, keyed by the file and the exact transform parameters. The docs are specific about invalidation: *"When Smart CDN is enabled, the asset is cached on the CDN for as long as possible... When a file is updated or deleted, the CDN cache is automatically invalidated... It can take up to 60 seconds for the CDN cache to be invalidated as the asset metadata has to propagate across all the data-centers around the globe"* and *"Smart CDN caching works with all types of storage operations including signed URLs"* ([supabase.com/docs/guides/storage/cdn/smart-cdn](https://supabase.com/docs/guides/storage/cdn/smart-cdn)). This is not locally provable (there is no CDN edge in a local Docker stack — every request here goes straight to the one `storage-api` container), so treat the 60-second figure and the "works with signed URLs too" claim as docs-sourced facts, not something reproduced above.
+
+The trade-off this replaces: resizing images yourself at upload time and storing `photo-thumb.png`, `photo-medium.png`, `photo-large.png` avoids any transform cost at read time, but costs N stored copies of every image forever, forces you to pick sizes up front, and means retroactively reprocessing everything if you need a size you did not anticipate. On-the-fly transformation (when enabled) flips that: a small amount of latency on the *first* request for a given size, in exchange for one stored original per image and any size at any time.
+
+## Signed vs public URLs for transformed images
+
+Everything above composes with the signed-URL mechanism from the previous lesson exactly as documented — a signed URL's `transform` option works the same way `getPublicUrl`'s does, and per the Smart CDN quote above, the edge cache applies to signed-URL requests too, not just public ones. The choice between them is unrelated to transformation itself: use `getPublicUrl` (with or without `transform`) for a public bucket where anyone with the link should see the image — a product photo, a public avatar; use `createSignedUrl` (with or without `transform`) for a private bucket where access must be checked per-request — a user's private document thumbnail, a paywalled image — accepting the fixed expiry window as the cost, exactly as covered in the storage-buckets-and-policies lesson.
+
+<Mermaid title="One original image can serve any transform variant once ENABLE_IMAGE_TRANSFORMATION is on; this local stack has it off" code={imageTransformDiagram} />
 
 export const imageTransformDiagram = `flowchart LR
-  original[("Original image: photo.png")]
-  original --> thumb["?width=64&height=64&resize=cover"]
-  original --> medium["?width=400&height=400&resize=contain"]
-  original --> large["?width=1200&height=800&resize=cover"]
-  thumb --> cdnThumb["Cached at CDN edge after first request"]
-  medium --> cdnMedium["Cached at CDN edge after first request"]
-  large --> cdnLarge["Cached at CDN edge after first request"]`;
+  original[("Original image: photo.png (351,741 bytes)")]
+  original --> req{"GET /render/image/...?width=100&height=100&resize=cover"}
+  req --> flag{"ENABLE_IMAGE_TRANSFORMATION?"}
+  flag -->|"false (this local stack)"| notfound["404: route not registered at all"]
+  flag -->|"true (hosted Pro+, or config.toml enabled)"| imgproxy["imgproxy decodes, resizes, re-encodes"]
+  imgproxy --> cdn["Cached at CDN edge, keyed by file + exact params"]`;
 
 <Callout title="The one-line takeaway">
-Supabase Storage transforms images **on the fly** via a `transform` option (`width`, `height`, a `resize` mode of `cover`/`contain`/`fill`, and `quality`) passed to `getPublicUrl` or `createSignedUrl`, so one stored original can serve any number of sizes without you ever pre-generating variants; each distinct file-plus-parameters combination is **cached at the CDN edge** after its first request, trading a small amount of first-request latency for not having to store or manage N copies of every image yourself.
+`getPublicUrl`/`createSignedUrl`'s **`transform`** option (`width`, `height`, `resize: cover|contain|fill`) builds a `/render/image/...` URL that `imgproxy` serves — proved above to return a real **404** on this local stack specifically because `ENABLE_IMAGE_TRANSFORMATION=false` (the CLI's own scaffolded default, matching hosted's Pro-plan gate), not because anything is broken. **`cache-control`** is real and provable locally regardless of that flag — proved above as a literal, unmodified echo of whatever string you pass as `cacheControl` at upload time, including the non-standards-correct bare `3600` the docs' own examples use. The **Smart CDN**'s edge caching and ~60-second invalidation (docs-sourced, not locally provable) applies to both public and signed transformed URLs alike; the public-vs-signed choice itself is orthogonal to transformation and follows the same access-control reasoning as any other Storage object.
 </Callout>
+
+## Reading AI-generated code
+
+An AI assistant, asked to "serve a 200x200 thumbnail of every avatar, cached properly," wrote this:
+
+<SpotTheBug lang="ts" code={`const { data } = supabase.storage
+  .from('avatars')
+  .getPublicUrl(path, {
+    transform: { width: 200, height: 200, resize: 'cover' },
+  });
+
+await supabase.storage.from('avatars').upload(path, file, {
+  cacheControl: 3600,
+});
+
+return data.publicUrl;
+`}>
+Two independent bugs. First, `cacheControl: 3600` — passed as a **number**, not the string the API expects (`cacheControl: '3600'`) — will fail TypeScript's type check against `supabase-js`'s `FileOptions` (`cacheControl?: string`) if this were caught at compile time, or silently coerce/behave unexpectedly at runtime if not. Second, and more subtly: even fixed to a string, `cacheControl: '3600'` does **not** produce a correct `Cache-Control: max-age=3600` header — proved earlier in this lesson, the value is written verbatim, so the real header becomes the non-standard `Cache-Control: 3600`. "Cached properly" needs either accepting that ambiguity (many CDNs are lenient) or setting the header through whatever layer of the stack lets you write the full directive. Separately — not a bug in this code, but worth checking before shipping it — `getPublicUrl` with `transform` builds a URL assuming image transformation is enabled on the target project; on a fresh project (local or a free-tier hosted one) that route 404s exactly as proved above, so the "thumbnail" silently never resolves until the feature is turned on.
+</SpotTheBug>
+
+## Mental Model
+
+Image transformation is not a Storage-native feature — it is Storage delegating to a separate service, `imgproxy`, gated behind one feature flag that both the local CLI and hosted plans default to off. `getPublicUrl`/`createSignedUrl` with a `transform` option never make a network call themselves; they just build a URL with query parameters, and everything interesting happens (or does not happen, as proved above) only when a client actually requests that URL. `cache-control`, by contrast, has nothing to do with `imgproxy` at all — it is a plain HTTP response header that Storage echoes from whatever you set at upload time, which is why it works identically whether or not image transformation is enabled, and why passing it a non-standard value produces a non-standard header with no validation catching it.
+
+## Trade-offs
+
+- **On-the-fly transformation (when enabled) stores one original and serves any size** — **at the cost of a real feature flag/plan gate you must check for first**, proved above as a real 404 with a clear root cause, not a silent failure to debug blindly.
+- **Setting `cacheControl` is a one-line option with real, provable effect on the response header** — **at the cost of no validation on the string you pass**, proved above to produce a technically non-standard header when handed a bare number instead of a full directive.
+- **The Smart CDN (hosted only) removes repeat-transform cost after the first request per size** — **at the cost of up to ~60 seconds of stale-cache risk after an update** (docs-sourced), which matters if your application overwrites images in place rather than using new paths per version.
+
+## Common Misconceptions
+
+- **"If `getPublicUrl`'s `transform` option compiles and returns a URL, the transformed image will be served."** Proved above: the URL is built with zero validation that the target project even has transformation enabled — the failure only surfaces as a real 404 when a client actually requests it.
+- **"A 404 on a transform URL means the file or path is wrong."** Proved above: the exact same object served correctly at its plain (non-transform) URL — the 404 was specifically the `/render/image/...` route not existing, traced to `ENABLE_IMAGE_TRANSFORMATION=false`, not a missing file.
+- **"`cacheControl: '3600'` produces a standard `max-age=3600` Cache-Control header."** Proved above: the string is echoed verbatim into the header with no reformatting — the real response was `cache-control: 3600`, which is not a valid HTTP `Cache-Control` directive on its own.
+- **"CDN caching for transformed images is something you configure."** Per the docs quoted above, Smart CDN caching is automatic once enabled — the only lever you control is the object's own `cacheControl` value at upload time, not a separate CDN configuration step.
 
 export const quizImageTransform = [
   {
@@ -78,16 +168,29 @@ export const quizImageTransform = [
       'The bucket name must be changed to switch sizes',
     ],
     answer: 1,
+    explain: "getPublicUrl/createSignedUrl's transform option accepts width/height/resize (and quality), building a /render/image/... URL with those as query parameters.",
   },
   {
-    q: 'Why does CDN caching of transformed images matter',
+    q: 'On this course\'s local stack, requesting a transform URL (?width=100&height=100&resize=cover) on a real uploaded PNG returns what, and why',
     options: [
-      'It does not matter, every request always reprocesses the image regardless',
-      'Repeated requests for the same file and same transform parameters are served from the edge cache instead of being reprocessed each time',
-      'It only affects video files, not images',
-      'It removes the need to ever specify width or height',
+      'A 200 with a resized image, because imgproxy is bundled and always on locally',
+      'A real 404, because ENABLE_IMAGE_TRANSFORMATION is false by default on a freshly scaffolded local project — the same gate that paywalls the feature on hosted free-tier plans',
+      'A 500 server error indicating imgproxy crashed',
+      'A 403, because the bucket is private',
     ],
     answer: 1,
+    explain: 'Proved above: a real 351,741-byte PNG, correctly uploaded and publicly readable at its plain URL, got a real 404 "route not found" on the transform URL specifically because ENABLE_IMAGE_TRANSFORMATION=false in the storage container\'s own environment.',
+  },
+  {
+    q: "What does uploading with cacheControl: '3600' actually produce in the response header, proved on this stack",
+    options: [
+      'Cache-Control: max-age=3600, correctly formatted',
+      'Cache-Control: 3600, the string echoed verbatim, which is not a standards-correct directive on its own',
+      'No Cache-Control header at all',
+      'Cache-Control: no-cache, overriding the option',
+    ],
+    answer: 1,
+    explain: 'Proved above: the real response header was literally "cache-control: 3600" — Storage writes the cacheControl string directly into the header with no reformatting into a proper max-age directive.',
   },
   {
     q: 'What is the tradeoff of on-the-fly transformation versus pre-generating multiple image sizes yourself',
@@ -98,16 +201,18 @@ export const quizImageTransform = [
       'There is no meaningful tradeoff between the two approaches',
     ],
     answer: 1,
+    explain: 'Pre-generating avoids read-time transform cost but multiplies stored copies and locks in sizes chosen up front; on-the-fly pays a small first-request cost per size in exchange for one stored original and any size on demand.',
   },
   {
-    q: 'What does the resize mode "contain" do',
+    q: 'Per the Smart CDN docs quoted in this lesson, does the edge cache apply to signed URLs or only public ones',
     options: [
-      'It stretches the image to the exact target dimensions, ignoring aspect ratio',
-      'It fits the whole image inside the target dimensions while preserving aspect ratio',
-      'It deletes the original image after transforming it',
-      'It always crops the image to a perfect square',
+      'Only public URLs are cached at the CDN edge; signed URLs always hit Storage directly',
+      'Smart CDN caching works with all types of storage operations including signed URLs',
+      'Signed URLs disable all caching for security reasons',
+      'Only transform URLs are cached, never plain object downloads',
     ],
     answer: 1,
+    explain: "Quoted directly from supabase.com/docs/guides/storage/cdn/smart-cdn: \"Smart CDN caching works with all types of storage operations including signed URLs.\"",
   },
 ];
 
