@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
@@ -55,6 +56,278 @@ if (error) {
 
 นี่คือภาพรวมว่า RPC คุ้มค่าตอนไหน **`.from()` query เหมาะกับการเข้าถึง table/view ตรง ๆ ส่วน `.rpc()` เหมาะกับ function** — logic เฉพาะทางที่อาจมีหลาย statement หรือต้องเป็น transaction ซึ่งควรอยู่ในฐานข้อมูลจริง ๆ ใช้ RPC เมื่อ logic ต้องการ guarantee แบบนี้ ไม่ใช่ใช้แทน query ธรรมดาเป็น default
 
+## `security invoker` คือ default และ RLS ยังทำงานอยู่ข้างในเสมอ
+
+function ทุกตัวที่เห็นมาก่อนหน้านี้ไม่ได้ใส่ `security` clause เลย ซึ่ง default เป็น **`security invoker`**: function รันด้วยสิทธิ์ — และที่สำคัญคือ Row Level Security policy — ของ role ที่ *เรียก* มัน ไม่ใช่ role ที่สร้างมันขึ้นมา พิสูจน์: function ที่ select ทุก row ของ table ที่มี RLS policy รันโดย authenticated user สองคนที่ต่างกัน:
+
+```sql
+-- supabase/migrations/4103_agapi_rpc_shapes_and_invoker.sql
+create table public.agapi_notes (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null,
+  body text not null
+);
+
+alter table public.agapi_notes enable row level security;
+
+create policy "agapi_notes_own_rows"
+on public.agapi_notes
+for select
+to authenticated
+using (auth.uid() = user_id);
+
+create function public.agapi_my_notes()
+returns setof public.agapi_notes
+language sql
+security invoker
+stable
+as $$
+  select * from public.agapi_notes;
+$$;
+
+grant execute on function public.agapi_my_notes() to authenticated;
+
+create function public.agapi_notes_table_shape()
+returns table (note_id uuid, note_body text)
+language sql
+security invoker
+stable
+as $$
+  select id, body from public.agapi_notes;
+$$;
+
+grant execute on function public.agapi_notes_table_shape() to authenticated;
+```
+
+user จริงสองคน สมัครผ่าน GoTrue แล้ว seed note ให้คนละใบด้วย `service_role` (RLS เปิดอยู่แต่มีแค่ policy `select` เท่านั้น ดังนั้นมันปฏิเสธ insert ทุกอันจาก `anon`/`authenticated` โดย default — ขั้นตอน seed ต้อง bypass มันโดยตั้งใจ เหมือนกับ setup script ฝั่ง server ทั่วไป):
+
+```bash
+# scripts/agapi-signup-two-users.sh
+curl -X POST "$API_URL/auth/v1/signup" -H "apikey: $ANON_KEY" -H "Content-Type: application/json" \
+  -d '{"email":"agapi-alice@example.com","password":"agapi-pw-12345"}'
+curl -X POST "$API_URL/auth/v1/signup" -H "apikey: $ANON_KEY" -H "Content-Type: application/json" \
+  -d '{"email":"agapi-bob@example.com","password":"agapi-pw-12345"}'
+```
+
+```sql
+-- sql/agapi_seed_notes.sql
+insert into public.agapi_notes (user_id, body) values ('ed6bb035-ff42-4e7a-874d-a310b84b7b8a', 'alice private note');
+insert into public.agapi_notes (user_id, body) values ('35d617f6-e0ed-4528-b090-e8b8d43e64c8', 'bob private note');
+```
+
+`select proname, prosecdef from pg_proc where proname = 'agapi_my_notes'` ยืนยันเรื่องนี้ — `prosecdef` (**s**ecurity **def**iner) เป็น `f` แปลว่านี่คือ invoker function:
+
+```text
+    proname     | prosecdef
+----------------+-----------
+ agapi_my_notes | f
+(1 row)
+```
+
+function body **ไม่มี `where` clause เลย** — `select * from public.agapi_notes` ทุก row แบบไม่มีเงื่อนไข เรียกด้วย user จริงสองคน (ผ่าน `/auth/v1/token` ตัด password ออก) พิสูจน์ว่า RLS ยังกรองผลลัพธ์เหลือแค่ row ของแต่ละคนเอง:
+
+```bash
+# scripts/agapi-rpc-invoker.sh
+curl -X POST "$API_URL/rest/v1/rpc/agapi_my_notes" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ALICE_TOKEN"
+
+curl -X POST "$API_URL/rest/v1/rpc/agapi_my_notes" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $BOB_TOKEN"
+```
+
+```text
+[{"id":"83af46f4-...","user_id":"ed6bb035-...","body":"alice private note"}]
+[{"id":"febac053-...","user_id":"35d617f6-...","body":"bob private note"}]
+```
+
+alice เรียกแล้วได้ note ของตัวเองเท่านั้น bob ก็เช่นกัน — function ไม่เคย filter ด้วย `user_id` เองเลย Postgres เป็นคน apply `using` clause ทีละ row ตามที่มันทำเสมอสำหรับ role ที่เรียก นี่คืออีกด้านของประเด็น `service_role`/`BYPASSRLS` จากบทก่อนหน้า: **security invoker function ไม่ใช่ทางหลบ RLS** — มันรันเป็นตัวผู้เรียก ดังนั้น policy ของผู้เรียกยังทำงานอยู่ ไม่ว่า function body จะเขียนยังไง
+
+เทียบกับ query เดียวกันแบบ `security definer` เป็นเจ้าของโดย `postgres` (role ที่ Postgres ถือว่า bypass RLS):
+
+```sql
+-- sql/agapi_definer_contrast.sql
+create function public.agapi_all_notes_definer()
+returns setof public.agapi_notes
+language sql
+security definer
+set search_path = ''
+as $$
+  select * from public.agapi_notes;
+$$;
+
+grant execute on function public.agapi_all_notes_definer() to authenticated;
+```
+
+```bash
+# scripts/agapi-rpc-definer-contrast.sh
+curl -X POST "$API_URL/rest/v1/rpc/agapi_all_notes_definer" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ALICE_TOKEN"
+```
+
+```text
+[{"id":"83af46f4-...","user_id":"ed6bb035-...","body":"alice private note"}, {"id":"febac053-...","user_id":"35d617f6-...","body":"bob private note"}]
+```
+
+function body เดียวกัน ผู้เรียกคนเดียวกัน (alice) แต่คราวนี้เธอได้ **ทั้งสอง** row — รวม note ของ bob ด้วย — เพราะ function รันเป็น `postgres` ไม่ใช่เป็นเธอ `security definer` คือทางออกที่ตั้งใจให้ function bypass RLS ของผู้เรียกได้ (มีประโยชน์ เช่น admin report หรือ cross-user aggregate ที่ควบคุมได้) แต่มันต้องเป็นการเลือกใช้อย่างตั้งใจ ไม่ใช่สิ่งที่เกิดขึ้นเพราะลืม
+
+## `security definer` โดยไม่มี `set search_path = ''` คือช่องโหว่ schema-injection
+
+คำแนะนำทางการพูดตรง ๆ ว่า *"It is best practice to use `security invoker` (which is also the default). If you ever use `security definer`, you must set the `search_path`"* ([supabase.com/docs/guides/database/functions](https://supabase.com/docs/guides/database/functions)) นี่คือเหตุผล พิสูจน์ตั้งแต่ต้นจนจบ function แบบ `security definer` ที่อ่านชื่อ table แบบไม่ระบุ schema โดยไม่ปักหมุด `search_path`:
+
+```sql
+-- supabase/migrations/4101_agapi_schema_injection.sql
+create table public.agapi_accounts (
+  id int primary key,
+  balance numeric
+);
+
+insert into public.agapi_accounts values (1, 1000);
+
+create function public.agapi_get_balance(acct int)
+returns numeric
+language plpgsql
+security definer
+as $$
+declare
+  bal numeric;
+begin
+  select balance into bal from agapi_accounts where id = acct;
+  return bal;
+end;
+$$;
+
+grant execute on function public.agapi_get_balance(int) to authenticated;
+
+-- The "attacker" (any role that can reach a session/connection where it
+-- controls search_path — see the caveat below) plants a same-named table
+-- in a schema it owns:
+create schema agapi_attacker;
+
+create table agapi_attacker.agapi_accounts (
+  id int,
+  balance numeric
+);
+
+insert into agapi_attacker.agapi_accounts values (1, 999999999);
+```
+
+<Callout title="ช่องโหว่นี้เข้าถึงได้จริงจากทางไหน">
+PostgREST เองปักหมุด `search_path` ต่อ request จาก `[api] extra_search_path` ใน `config.toml` — client เปลี่ยนมันผ่าน header ทาง Data API ไม่ได้ ดังนั้น function นี้เป๊ะ ๆ **ไม่ได้** ถูกโจมตีผ่าน `curl`/`supabase-js` โดยตรงในวันนี้ แต่มันยังเป็นช่องโหว่จริงที่เข้าถึงได้จากที่อื่นที่รัน SQL กับฐานข้อมูลนี้โดยคุม `search_path` เองได้: connection แบบ `psql`/Supavisor session-mode ตรง ๆ, migration tool, `pg_cron`, หรือ — กรณีที่สำคัญที่สุด — **security definer function อีกตัวที่เรียก function นี้** การแก้ไม่มีต้นทุนอะไรเลยและปิดทุกทางเข้าเหล่านี้พร้อมกัน นี่คือเหตุผลที่ docs บอกว่ามันจำเป็น ไม่ใช่แค่ทางเลือก
+</Callout>
+
+พิสูจน์ รันตรงกับ Postgres ด้วย session ที่คุม `search_path` ของตัวเองได้ (กรณีที่เข้าถึงได้จริงด้านบน):
+
+```text
+=# set search_path = agapi_attacker, public;
+SET
+=# select agapi_get_balance(1);
+ agapi_get_balance
+-------------------
+         999999999
+(1 row)
+```
+
+`agapi_get_balance` ควรจะอ่าน `public.agapi_accounts` (balance `1000`) แต่กลับคืน row ที่ attacker ปลูกไว้ (`999999999`) — เพราะ function ไม่ได้ปักหมุด `search_path` Postgres จึง resolve ชื่อ `agapi_accounts` ที่ไม่ระบุ schema ด้วย `search_path` ที่ active อยู่ใน session ของ *ผู้เรียก* ตอนรัน และ `agapi_attacker` มาก่อน ทางแก้คือ `set search_path = ''` บวกกับระบุ schema ให้ทุก relation ใน body:
+
+```sql
+-- supabase/migrations/4102_agapi_schema_injection_fixed.sql
+create function public.agapi_get_balance_fixed(acct int)
+returns numeric
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  bal numeric;
+begin
+  select balance into bal from public.agapi_accounts where id = acct;
+  return bal;
+end;
+$$;
+
+grant execute on function public.agapi_get_balance_fixed(int) to authenticated;
+```
+
+session เดียวกัน table ของ attacker ยังอยู่ที่เดิม คราวนี้เรียก function ที่แก้แล้ว:
+
+```text
+=# set search_path = agapi_attacker, public;
+SET
+=# select agapi_get_balance_fixed(1);
+ agapi_get_balance_fixed
+--------------------------
+                     1000
+(1 row)
+```
+
+`search_path = ''` แปลว่าไม่มี schema โดยนัยให้ค้นหาเลย — `public.agapi_accounts` ถูกเขียนระบุชัดใน body แล้ว จึงไม่มีชื่อที่ไม่ระบุ schema เหลือให้ schema อื่นมาแอบสวมรอยได้ นี่คือทางแก้ทั้งหมด: ปักหมุด `search_path` ระบุ schema ให้ทุกชื่อ
+
+## `stable`/`immutable` เทียบกับ `volatile` — GET ไม่ได้ใช้ได้เสมอไป
+
+PostgREST ยังอ่าน **volatility** ที่ function ประกาศไว้เพื่อตัดสินว่า HTTP method ไหนใช้ได้บ้าง ตาม docs ของมันเอง: *"a function labeled `VOLATILE` will only accept `POST` requests... [the others] also allow GET"* เพราะ PostgREST รันทุก `GET` ใน read-only transaction ([postgrest.org — Transactions](https://postgrest.org/en/stable/references/transactions.html)) พิสูจน์ด้วย function แบบ `immutable` ล้วน ๆ กับอีกตัวที่เป็น `volatile` และเขียนข้อมูล:
+
+```sql
+-- supabase/migrations/4104_agapi_volatility.sql
+create function public.agapi_add(a int, b int)
+returns int
+language sql
+immutable
+as $$
+  select a + b;
+$$;
+
+grant execute on function public.agapi_add(int, int) to anon;
+
+create table public.agapi_counter (id int primary key default 1, hits int not null default 0);
+insert into public.agapi_counter (id, hits) values (1, 0);
+
+create function public.agapi_bump_counter()
+returns int
+language plpgsql
+volatile
+as $$
+declare
+  new_hits int;
+begin
+  update public.agapi_counter set hits = hits + 1 where id = 1 returning hits into new_hits;
+  return new_hits;
+end;
+$$;
+
+grant execute on function public.agapi_bump_counter() to anon;
+```
+
+```bash
+# scripts/agapi-curl-volatility.sh
+curl "$API_URL/rest/v1/rpc/agapi_add?a=1&b=2" -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY"
+curl "$API_URL/rest/v1/rpc/agapi_bump_counter" -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY"
+curl -X POST "$API_URL/rest/v1/rpc/agapi_bump_counter" -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY"
+```
+
+```text
+GET  /rpc/agapi_add?a=1&b=2            -> 200  3
+GET  /rpc/agapi_bump_counter           -> 405  {"code":"25006","details":null,"hint":null,"message":"cannot execute UPDATE in a read-only transaction"}
+POST /rpc/agapi_bump_counter           -> 200  1
+```
+
+`agapi_add` เป็น `immutable` (input เดิม output เดิม ไม่มี side effect) PostgREST จึงยอมรันเป็น `GET` — มีประโยชน์เพราะ `GET` RPC cache ได้และแปะเป็น URL ได้เหมือน resource อื่น `agapi_bump_counter` เป็น `volatile` (มันเขียนข้อมูล) เรียกแบบ `GET` มันยังไปถึง Postgres แต่ข้างใน read-only transaction ของ PostgREST คำสั่ง `update` เองล้มเหลวด้วย Postgres error จริง `25006` คือ `cannot execute UPDATE in a read-only transaction` — ไม่ใช่การปฏิเสธแบบ "verb ผิด" ทั่วไป แต่เป็นการเขียนที่ล้มเหลวจริงที่ฐานข้อมูลจับได้ เรียกแบบเดียวกันด้วย `POST` (read/write transaction) สำเร็จและคืนค่า count ใหม่ การประกาศ function ที่มี side effect จริงเป็น `stable`/`immutable` เพื่อ "ทำให้ GET ได้" ใช้ไม่ได้ผล: Postgres ไม่ได้ตรวจ label กับ body ตอนสร้าง แต่ read-only transaction ของ PostgREST ตรวจ — function จะล้มเหลวตรงจุดที่พยายามเขียนพอดี เหมือนด้านบน
+
+## `returns setof` กับ `returns table` — shape ที่ curl เห็นจริง
+
+`agapi_my_notes` ด้านบน return `setof public.agapi_notes`: PostgREST serialize ผลลัพธ์เป็น JSON array ของ object ที่มี shape ตรงกับ column ของ table เป๊ะ `returns table (...)` ให้ function return shape กำหนดเองแบบ ad hoc โดยไม่ต้องมี table หรือ view รองรับ — `agapi_notes_table_shape` ด้านบนประกาศ `table (note_id uuid, note_body text)` และ response ของ PostgREST ตรงกับชื่อ column เหล่านั้นเป๊ะ ไม่ใช่ชื่อของ table ต้นทาง:
+
+```bash
+# scripts/agapi-curl-table-shape.sh
+curl -X POST "$API_URL/rest/v1/rpc/agapi_notes_table_shape" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ALICE_TOKEN"
+```
+
+```text
+[{"note_id":"83af46f4-...","note_body":"alice private note"}]
+```
+
+สังเกต key ที่เปลี่ยนชื่อ (`note_id`, `note_body` ไม่ใช่ `id`/`body`) — `returns table` คือวิธี shape response ของ RPC ให้เป็นอิสระจาก table ที่มันอ่าน ซึ่งสำคัญเมื่อโค้ด client มี type ที่คาดหวังไว้แล้ว (module ถัดไปที่ `supabase gen types` อ่าน signature พวกนี้ด้วย)
+
 <Mermaid title="Postgres function ที่ expose เป็น RPC endpoint ที่เรียกได้" code={rpcDiagram} />
 
 export const rpcDiagram = `flowchart LR
@@ -64,8 +337,50 @@ export const rpcDiagram = `flowchart LR
   call --> atomic["Single atomic UPDATE in Postgres"]`;
 
 <Callout title="สรุปหนึ่งบรรทัด">
-Postgres function ถูก PostgREST expose ให้อัตโนมัติเป็น endpoint แบบ **RPC** ภายใต้ `/rpc/<function_name>` เรียกได้จาก `supabase-js` ด้วย **`.rpc(name, args)`** — ใช้ RPC เมื่อ logic ต้องรันแบบ **atomic** หรือเป็นหลายขั้นตอนในฐานข้อมูล (เช่น เพิ่ม counter แบบ atomic ที่หลีกเลี่ยง race condition ของ read-then-write ฝั่ง client) ส่วน **`.from()`** ธรรมดายังคงเป็นเครื่องมือสำหรับเข้าถึง table และ view ตรง ๆ
+Postgres function ถูก PostgREST expose ให้อัตโนมัติเป็น endpoint แบบ **RPC** ภายใต้ `/rpc/<function_name>` เรียกได้จาก `supabase-js` ด้วย **`.rpc(name, args)`** — ใช้ RPC เมื่อ logic ต้องรันแบบ **atomic** หรือเป็นหลายขั้นตอนในฐานข้อมูล (เช่น เพิ่ม counter แบบ atomic ที่หลีกเลี่ยง race condition ของ read-then-write ฝั่ง client) ส่วน **`.from()`** ธรรมดายังคงเป็นเครื่องมือสำหรับเข้าถึง table และ view ตรง ๆ ใช้ **`security invoker`** เป็น default (RLS ยังทำงานอยู่ พิสูจน์แล้วด้านบน) หันไปใช้ `security definer` เฉพาะตอนตั้งใจเท่านั้น และทันทีที่ใช้ ต้อง `set search_path = ''` และระบุ schema ให้ทุกอย่างใน body — พิสูจน์แล้วด้านบนว่าคือความต่างทั้งหมดระหว่างช่องโหว่ schema-injection จริงกับ function ที่ปลอดภัย function แบบ `stable`/`immutable` เรียกผ่าน `GET` ได้ ส่วน `volatile` ต้องใช้ `POST` เพราะ PostgREST รันทุก `GET` ใน read-only transaction
 </Callout>
+
+## Reading AI-generated code
+
+AI assistant ที่ถูกขอให้ทำ "admin function ที่ดู order total รวมของ user คนไหนก็ได้ เพื่อให้ support staff ตอบคำถามเรื่องบิลได้" สร้างโค้ดนี้ขึ้นมา:
+
+<SpotTheBug lang="sql" code={`create or replace function public.agapi_user_order_total(target_user uuid)
+returns numeric
+security definer
+language plpgsql
+as $$
+declare
+  total numeric;
+begin
+  select sum(amount) into total
+  from orders
+  where user_id = target_user;
+
+  return coalesce(total, 0);
+end;
+$$;
+
+grant execute on function public.agapi_user_order_total(uuid) to authenticated;
+`}>
+บั๊กสองอันซ้อนกัน ทั้งคู่เป็น AI output แบบคลาสสิก อันแรก: grant `execute` ให้ `authenticated` (ทุกคนที่ login ไม่ใช่แค่ support staff) แปลว่า user *คนไหนก็ได้* ส่ง `uuid` ของคนอื่นแล้วดึง order total ของเขาได้เลย ไม่มีการเช็คเลยว่าผู้เรียกเป็น support staff จริงไหม และ `security definer` แปลว่าจุดประสงค์ทั้งหมดของ function นี้ (อ่านผ่าน RLS policy รายบุคคลบน `orders`) ทำงานตาม "ที่ออกแบบไว้" เป๊ะ แค่ผิดกลุ่มเป้าหมาย อันที่สอง แยกกันไปเลย: `orders` ไม่ระบุ schema และไม่ได้ปักหมุด `search_path` ดังนั้นความเสี่ยง schema-injection ที่พิสูจน์แล้วด้านบนก็ใช้ได้กับที่นี่เหมือนกัน — schema ที่เป็นอันตรายที่มาก่อนใน search_path ของใครก็ตามที่เรียก function นี้สามารถแทนที่ relation `orders` ปลอมทั้งหมดได้ ทางแก้ต้องมีทั้งสองอย่าง: `set search_path = ''` บวก `from public.orders` *และ* เช็คสิทธิ์จริงข้างใน body ของ function (เช่น `if not exists (select 1 from public.staff where user_id = auth.uid()) then raise exception 'not authorized'; end if;`) ก่อนจะเชื่อสิทธิ์ที่สูงขึ้นของ `security definer` — grant อย่างเดียวไม่เคยเป็น access control จริง
+</SpotTheBug>
+
+## Mental Model
+
+function ของ Postgres ที่เรียกผ่าน `/rpc` ก็แค่ Postgres รัน query — `security invoker` เทียบกับ `security definer` เป็นแค่คำถามว่า **Postgres ใช้ identity ของ role ไหนสำหรับการเช็คสิทธิ์ทุกอันที่ function body กระตุ้น** รวมถึง RLS ด้วย invoker คือ "รันเป็นคนที่ถามมา" เหมือนเขาพิมพ์ SQL เองผ่านประตูที่แคบมาก definer คือ "รันเป็นเจ้าของ function" การแอบอ้างตัวตนที่คุณเลือกใช้อย่างตั้งใจ `search_path` เป็นเรื่องแยกต่างหากล้วน ๆ เชิง text — มันคือวิธีที่ Postgres resolve ชื่อเปล่า ๆ อย่าง `orders` ให้กลายเป็น relation จริง — แต่มันกลายเป็นคำถามด้านความปลอดภัยทันทีที่ function รันด้วยสิทธิ์ของคนอื่น (definer) พร้อมกับ resolve ชื่อด้วยลำดับการค้นหาของคนอื่น (ที่ไม่ปักหมุดและผู้เรียกคุมได้) Volatility (`stable`/`immutable`/`volatile`) เป็นแกนที่สามที่ไม่เกี่ยวกันเลย: คำสัญญาเรื่อง side effect ที่ PostgREST ใช้แค่ตัดสินว่า HTTP verb ไหนปลอดภัยพอจะให้ใช้ บังคับด้วยการรัน `GET` ใน transaction ที่เขียนไม่ได้ทางกายภาพ
+
+## Trade-offs
+
+- **`security invoker` (default) ทำงานร่วมกับ RLS ได้ฟรี ๆ อย่างปลอดภัย** — policy ทุกอันที่เขียนไว้แล้วยังทำงานอยู่ข้างใน function — **แลกกับการต้องใช้ definer เมื่อต้องข้าม RLS อย่างตั้งใจ** (admin report ที่ครอบคลุมหลาย user, leaderboard สาธารณะแบบ aggregate, counter ที่ visitor แบบ anonymous ทุกคนกดเพิ่มได้)
+- **`security definer` เป็นวิธีเดียวที่ bypass RLS ของผู้เรียกจากข้างใน function ได้อย่างตั้งใจ** — **แลกกับการกลายเป็นขอบเขต access-control ที่ต้องทำเอง**: ไม่มีอะไรหยุดไม่ให้ใครก็ตามที่มี `execute` เรียกมันได้ ดังนั้น function body เองต้อง implement การเช็คที่ RLS เคยทำให้ใหม่ทั้งหมด และต้องปักหมุด `search_path` ทุกครั้ง
+- **การประกาศ function เป็น `stable`/`immutable` ปลดล็อก `GET` call ที่ถูกกว่าและ cache ได้** — **แลกกับการที่ PostgREST บังคับใช้คำสัญญานั้นที่ระดับ transaction**: function ที่ label ผิดไม่ได้พังแบบเงียบ ๆ มันล้มเหลวทันทีที่พยายามเขียนข้างใน read-only transaction ซึ่งเป็นเรื่องที่ทำให้งงถ้าไม่รู้กลไก
+
+## Common Misconceptions
+
+- **"`security definer` แค่แปลว่า 'function ทรงพลังกว่า' ไม่มีข้อเสียถ้าให้แค่คนที่เชื่อถือได้เรียก"** ใครก็ตามที่มี `execute` เรียกได้ — ประสบการณ์ user ใหม่ default ของ Supabase เอง grant `execute` กว้าง ๆ ให้ `authenticated` แล้ว เว้นแต่คุณจะจำกัดมันเองอย่างตั้งใจ ดังนั้น "แค่คนที่เชื่อถือได้" เป็นแค่สมมติฐาน ไม่ใช่ข้อเท็จจริงที่ถูกบังคับ เว้นแต่ function จะเช็คเอง
+- **"`security invoker` function ทำอะไรที่ RLS จะบล็อกไม่ได้เลย เลยปลอดภัยเสมอ"** จริงในแง่ที่มันสืบทอดข้อจำกัดของผู้เรียก — แต่นั่นเป็นเหตุผลที่ควรเลือกใช้มัน ไม่ใช่เหตุผลที่เลิกคิดว่าผู้เรียกทำอะไรได้บ้าง ผู้เรียกที่มี policy กว้างเกินไปก็เสี่ยงพอกันไม่ว่าจะอยู่ข้างในหรือข้างนอก invoker function
+- **"ตั้ง `search_path = 'public'` ก็ดีพอ ๆ กับ `search_path = ''`"** มันลดพื้นที่โจมตีแต่ไม่ได้ปิดมัน — อะไรก็ตามที่ attacker ใส่ *เข้าไปใน* `public` (หรือ schema ที่ปักหมุดไว้) ก็ยัง resolve ได้อยู่ดี string ว่างบวกกับระบุ schema ให้ครบเท่านั้นที่ตัดความกำกวมออกไปทั้งหมด นี่คือเหตุผลที่ docs แนะนำแบบนั้นโดยเฉพาะ
+- **"ถ้า function เขียนข้อมูล PostgREST จะปฏิเสธไม่ให้เรียกผ่าน GET อย่างปลอดภัยเอง"** PostgREST ปฏิเสธที่ระดับ *transaction* ไม่ใช่ที่ route — request ยังไปถึง Postgres แล้วล้มเหลวที่นั่น (`25006` พิสูจน์แล้วด้านบน) แทนที่จะถูกปฏิเสธไปก่อนด้วยข้อความ "verb ผิด" ที่เป็นมิตร ปลอดภัยในทางปฏิบัติ แต่ error หน้าตาเหมือน database bug ถ้าไม่รู้เหตุผล
 
 export const quizRpcFunctions = [
   {
@@ -77,6 +392,7 @@ export const quizRpcFunctions = [
       'ต้องเขียนใหม่เป็น REST controller ด้วย TypeScript ก่อน',
     ],
     answer: 1,
+    explain: 'กลไกเดียวกับ table — ไม่มีไฟล์ route ไม่มีขั้นตอน deploy PostgREST อ่าน schema แล้วสร้าง /rpc/<name> endpoint ให้เองอัตโนมัติ',
   },
   {
     q: 'ทำไมการเพิ่ม view-count แบบ atomic ถึงเหมาะกับ RPC function มากกว่า read-then-write ฝั่ง client',
@@ -87,6 +403,7 @@ export const quizRpcFunctions = [
       'เพราะ RPC function เป็นวิธีเดียวที่ filter row ใน Postgres ได้',
     ],
     answer: 1,
+    explain: 'ฐานข้อมูลทำ read-modify-write เป็น statement เดียว ผู้เรียกพร้อมกันสองคนจึงไม่มีทางเห็นค่าเก่าเดียวกันแล้วเขียนทับกันเงียบ ๆ',
   },
   {
     q: 'ความต่างเชิงแนวคิดระหว่าง query .from() กับการเรียก .rpc() คืออะไร',
@@ -97,6 +414,7 @@ export const quizRpcFunctions = [
       '.from() ถูก deprecate ให้ใช้ .rpc() แทนในทุก query',
     ],
     answer: 1,
+    explain: 'from() ชี้ไปที่ endpoint ของ table/view ของ PostgREST ส่วน rpc() ชี้ไปที่ endpoint /rpc/<function> สำหรับ function ที่เขียนเอง — คนละ endpoint กันเลย',
   },
   {
     q: 'จาก supabase-js เรียก Postgres function ชื่อ increment_view_count พร้อม argument อย่างไร',
@@ -107,6 +425,40 @@ export const quizRpcFunctions = [
       'supabase.exec("increment_view_count(post_id)")',
     ],
     answer: 1,
+    explain: '.rpc(name, args) เป็น method เดียวใน supabase-js ที่ชี้ไปที่ /rpc — .from() ชี้ไปที่ table หรือ view endpoint เสมอ',
+  },
+  {
+    q: 'function แบบ `security invoker` ทำ `select * from notes` ไม่มี WHERE clause และ `notes` มี RLS policy `using (auth.uid() = user_id)` user ที่ login แล้วเรียกมันจะเห็นอะไร',
+    options: [
+      'ทุก row ในตาราง เพราะ function เองไม่มี filter',
+      'แค่ row ของตัวเอง เพราะ RLS ยังทำงานด้วย identity ของผู้เรียก',
+      'ไม่เห็น row เลย เพราะ RPC call bypass RLS โดย default',
+      'ได้ error เพราะ security invoker function อ่าน table ที่มี RLS ไม่ได้',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วด้านบนด้วย user จริงสองคนเรียก function ที่ไม่มี filter ตัวเดียวกัน — แต่ละคนได้แค่ note ของตัวเอง เพราะ security invoker แปลว่า Postgres ประเมิน RLS ด้วย identity ของผู้เรียก',
+  },
+  {
+    q: 'ทำไม `security definer` function ต้องตั้ง `search_path = \'\'` และระบุ schema ให้ relation ของมัน',
+    options: [
+      'เป็นแค่ความชอบเรื่อง style ไม่มีผลอะไรเชิงการทำงาน',
+      'ถ้าไม่ตั้ง Postgres จะ resolve ชื่อที่ไม่ระบุ schema ด้วย search_path ของผู้เรียก ทำให้ schema ที่เป็นอันตรายมาแอบสวมรอย table/function ที่ตั้งใจไว้ แล้วรันด้วยสิทธิ์ที่สูงกว่าของ definer ได้',
+      'ทำให้ function รันเร็วขึ้น',
+      'จำเป็นแค่กับ function ที่เขียนด้วย plpgsql เท่านั้น ไม่ใช่ SQL',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วด้านบน: function ที่ไม่ระบุ schema ตัวเดียวกันคืนค่า balance ที่ attacker ปลูกไว้ (999999999) ทันทีที่ผู้เรียกคุม search_path ได้ — การปักหมุด search_path เป็น \'\' และระบุ schema ทุกชื่อปิดช่องนี้',
+  },
+  {
+    q: 'function หนึ่งถูก label เป็น `stable` แต่ body มีคำสั่ง UPDATE อยู่ เกิดอะไรขึ้นเมื่อเรียกผ่าน GET',
+    options: [
+      'PostgREST แปลง GET เป็น POST ให้เองเงียบ ๆ',
+      'UPDATE ล้มเหลวข้างใน read-only transaction ของ PostgREST ด้วย Postgres error จริง แม้ Postgres เองจะยอมให้ประกาศ STABLE ผิดแบบนั้นได้',
+      'Postgres บล็อกคำสั่ง CREATE FUNCTION ไปเลยเพราะไม่ตรงกัน',
+      'ทำงานเหมือนเป็น volatile ทุกอย่าง',
+    ],
+    answer: 1,
+    explain: 'Postgres ไม่ตรวจ label volatility กับ body ตอนสร้างเลย — read-only transaction ของ PostgREST สำหรับ GET ต่างหากที่จับได้จริง เป็น error "cannot execute UPDATE in a read-only transaction" จริง',
   },
 ];
 

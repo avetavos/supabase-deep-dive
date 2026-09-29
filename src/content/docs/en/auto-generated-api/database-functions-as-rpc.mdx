@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
@@ -55,6 +56,278 @@ Imagine incrementing the same counter from the client instead: read the current 
 
 This is the general shape of when RPC earns its place: **`.from()` queries are for direct table/view access, and `.rpc()` is for functions** — custom logic, potentially multi-statement or transactional, that genuinely belongs inside the database. Reach for RPC when the logic needs that guarantee, not as a default replacement for ordinary queries.
 
+## `security invoker` is the default, and RLS still applies inside it
+
+Every function you have seen so far ran with no `security` clause at all, which defaults to **`security invoker`**: the function executes with the privileges — and, critically, the Row Level Security policies — of whichever role *called* it, not the role that created it. Proof: a function that selects every row of a table with an RLS policy, run by two different authenticated users:
+
+```sql
+-- supabase/migrations/4103_agapi_rpc_shapes_and_invoker.sql
+create table public.agapi_notes (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null,
+  body text not null
+);
+
+alter table public.agapi_notes enable row level security;
+
+create policy "agapi_notes_own_rows"
+on public.agapi_notes
+for select
+to authenticated
+using (auth.uid() = user_id);
+
+create function public.agapi_my_notes()
+returns setof public.agapi_notes
+language sql
+security invoker
+stable
+as $$
+  select * from public.agapi_notes;
+$$;
+
+grant execute on function public.agapi_my_notes() to authenticated;
+
+create function public.agapi_notes_table_shape()
+returns table (note_id uuid, note_body text)
+language sql
+security invoker
+stable
+as $$
+  select id, body from public.agapi_notes;
+$$;
+
+grant execute on function public.agapi_notes_table_shape() to authenticated;
+```
+
+Two real users, signed up through GoTrue, then one note each seeded as `service_role` (RLS is enabled with only a `select` policy, so it denies **every** insert from `anon`/`authenticated` by default — the seed step has to bypass it deliberately, same as any server-side setup script would):
+
+```bash
+# scripts/agapi-signup-two-users.sh
+curl -X POST "$API_URL/auth/v1/signup" -H "apikey: $ANON_KEY" -H "Content-Type: application/json" \
+  -d '{"email":"agapi-alice@example.com","password":"agapi-pw-12345"}'
+curl -X POST "$API_URL/auth/v1/signup" -H "apikey: $ANON_KEY" -H "Content-Type: application/json" \
+  -d '{"email":"agapi-bob@example.com","password":"agapi-pw-12345"}'
+```
+
+```sql
+-- sql/agapi_seed_notes.sql
+insert into public.agapi_notes (user_id, body) values ('ed6bb035-ff42-4e7a-874d-a310b84b7b8a', 'alice private note');
+insert into public.agapi_notes (user_id, body) values ('35d617f6-e0ed-4528-b090-e8b8d43e64c8', 'bob private note');
+```
+
+`select proname, prosecdef from pg_proc where proname = 'agapi_my_notes'` confirms it — `prosecdef` (**s**ecurity **def**iner) is `f`, i.e. this is an invoker function:
+
+```text
+    proname     | prosecdef
+----------------+-----------
+ agapi_my_notes | f
+(1 row)
+```
+
+The function body has **no `where` clause at all** — `select * from public.agapi_notes`, every row, unconditionally. Calling it as two different real users (via `/auth/v1/token`, passwords trimmed) proves RLS still filtered the result down to each caller's own row:
+
+```bash
+# scripts/agapi-rpc-invoker.sh
+curl -X POST "$API_URL/rest/v1/rpc/agapi_my_notes" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ALICE_TOKEN"
+
+curl -X POST "$API_URL/rest/v1/rpc/agapi_my_notes" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $BOB_TOKEN"
+```
+
+```text
+[{"id":"83af46f4-...","user_id":"ed6bb035-...","body":"alice private note"}]
+[{"id":"febac053-...","user_id":"35d617f6-...","body":"bob private note"}]
+```
+
+Alice's call returns only Alice's note, Bob's only Bob's — the function never filtered by `user_id` itself; Postgres applied the `using` clause per row as it always does for the calling role. This is the flip side of the previous lesson's `service_role`/`BYPASSRLS` point: **security invoker functions are not a way around RLS** — they run as the caller, so the caller's policies still apply, function body or not.
+
+Contrast with the same query as `security definer`, owned by `postgres` (a role Postgres treats as bypassing RLS):
+
+```sql
+-- sql/agapi_definer_contrast.sql
+create function public.agapi_all_notes_definer()
+returns setof public.agapi_notes
+language sql
+security definer
+set search_path = ''
+as $$
+  select * from public.agapi_notes;
+$$;
+
+grant execute on function public.agapi_all_notes_definer() to authenticated;
+```
+
+```bash
+# scripts/agapi-rpc-definer-contrast.sh
+curl -X POST "$API_URL/rest/v1/rpc/agapi_all_notes_definer" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ALICE_TOKEN"
+```
+
+```text
+[{"id":"83af46f4-...","user_id":"ed6bb035-...","body":"alice private note"}, {"id":"febac053-...","user_id":"35d617f6-...","body":"bob private note"}]
+```
+
+Same function body, same caller (Alice), and now she gets **both** rows — Bob's note included — because the function ran as `postgres`, not as her. `security definer` is exactly the escape hatch that lets a function intentionally bypass a caller's RLS (useful — e.g. an admin report, or a controlled cross-user aggregate) but it must be a deliberate choice, not something that happens by omission.
+
+## `security definer` without `set search_path = ''` is a schema-injection hole
+
+The official guidance is blunt: *"It is best practice to use `security invoker` (which is also the default). If you ever use `security definer`, you must set the `search_path`"* ([supabase.com/docs/guides/database/functions](https://supabase.com/docs/guides/database/functions)). Here is why, proved end to end. A `security definer` function that reads an unqualified table name, with no `search_path` pinned:
+
+```sql
+-- supabase/migrations/4101_agapi_schema_injection.sql
+create table public.agapi_accounts (
+  id int primary key,
+  balance numeric
+);
+
+insert into public.agapi_accounts values (1, 1000);
+
+create function public.agapi_get_balance(acct int)
+returns numeric
+language plpgsql
+security definer
+as $$
+declare
+  bal numeric;
+begin
+  select balance into bal from agapi_accounts where id = acct;
+  return bal;
+end;
+$$;
+
+grant execute on function public.agapi_get_balance(int) to authenticated;
+
+-- The "attacker" (any role that can reach a session/connection where it
+-- controls search_path — see the caveat below) plants a same-named table
+-- in a schema it owns:
+create schema agapi_attacker;
+
+create table agapi_attacker.agapi_accounts (
+  id int,
+  balance numeric
+);
+
+insert into agapi_attacker.agapi_accounts values (1, 999999999);
+```
+
+<Callout title="Where this is actually reachable">
+PostgREST itself pins `search_path` per request from `[api] extra_search_path` in `config.toml` — a client cannot change it through the Data API with a header, so this exact function is **not** directly exploitable over `curl`/`supabase-js` today. It is still a real hole reachable from anywhere else that runs SQL against this database with a caller-controlled `search_path`: a direct `psql`/Supavisor session-mode connection, a migration tool, `pg_cron`, or — the case that matters most — **another `security definer` function calling this one**. The fix costs nothing and closes every one of those paths at once, which is why the docs call it mandatory rather than conditional.
+</Callout>
+
+Proof, run directly against Postgres with a session that controls its own `search_path` (the reachable case above):
+
+```text
+=# set search_path = agapi_attacker, public;
+SET
+=# select agapi_get_balance(1);
+ agapi_get_balance
+-------------------
+         999999999
+(1 row)
+```
+
+`agapi_get_balance` was supposed to read `public.agapi_accounts` (balance `1000`) and instead returned the attacker's planted row (`999999999`) — because the function has no `search_path` pinned, Postgres resolved the unqualified `agapi_accounts` using whatever `search_path` was active in the *caller's* session at execution time, and `agapi_attacker` came first. The fix is `set search_path = ''` plus schema-qualifying every relation in the body:
+
+```sql
+-- supabase/migrations/4102_agapi_schema_injection_fixed.sql
+create function public.agapi_get_balance_fixed(acct int)
+returns numeric
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  bal numeric;
+begin
+  select balance into bal from public.agapi_accounts where id = acct;
+  return bal;
+end;
+$$;
+
+grant execute on function public.agapi_get_balance_fixed(int) to authenticated;
+```
+
+Same hostile session, same attacker table already in place, now calling the fixed function:
+
+```text
+=# set search_path = agapi_attacker, public;
+SET
+=# select agapi_get_balance_fixed(1);
+ agapi_get_balance_fixed
+--------------------------
+                     1000
+(1 row)
+```
+
+`search_path = ''` means there is no implicit schema to search at all — `public.agapi_accounts` was written out explicitly in the body, so there is no unqualified name left for a hostile schema to shadow. This is the entire fix: pin `search_path`, qualify every name.
+
+## `stable`/`immutable` vs `volatile` — GET is not always available
+
+PostgREST also reads a function's declared **volatility** to decide which HTTP methods are even allowed, per its own docs: *"a function labeled `VOLATILE` will only accept `POST` requests... [the others] also allow GET"*, because PostgREST runs every `GET` in a read-only transaction ([postgrest.org — Transactions](https://postgrest.org/en/stable/references/transactions.html)). Proof with a pure `immutable` function and a `volatile` one that writes:
+
+```sql
+-- supabase/migrations/4104_agapi_volatility.sql
+create function public.agapi_add(a int, b int)
+returns int
+language sql
+immutable
+as $$
+  select a + b;
+$$;
+
+grant execute on function public.agapi_add(int, int) to anon;
+
+create table public.agapi_counter (id int primary key default 1, hits int not null default 0);
+insert into public.agapi_counter (id, hits) values (1, 0);
+
+create function public.agapi_bump_counter()
+returns int
+language plpgsql
+volatile
+as $$
+declare
+  new_hits int;
+begin
+  update public.agapi_counter set hits = hits + 1 where id = 1 returning hits into new_hits;
+  return new_hits;
+end;
+$$;
+
+grant execute on function public.agapi_bump_counter() to anon;
+```
+
+```bash
+# scripts/agapi-curl-volatility.sh
+curl "$API_URL/rest/v1/rpc/agapi_add?a=1&b=2" -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY"
+curl "$API_URL/rest/v1/rpc/agapi_bump_counter" -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY"
+curl -X POST "$API_URL/rest/v1/rpc/agapi_bump_counter" -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY"
+```
+
+```text
+GET  /rpc/agapi_add?a=1&b=2            -> 200  3
+GET  /rpc/agapi_bump_counter           -> 405  {"code":"25006","details":null,"hint":null,"message":"cannot execute UPDATE in a read-only transaction"}
+POST /rpc/agapi_bump_counter           -> 200  1
+```
+
+`agapi_add` is `immutable` (same inputs, same output, no side effects), so PostgREST is willing to run it as a `GET` — useful, because a `GET` RPC can be cached and linked like any other URL. `agapi_bump_counter` is `volatile` (it writes); called as `GET` it still reaches Postgres, but inside PostgREST's own read-only transaction the `update` itself fails with real Postgres error `25006`, `cannot execute UPDATE in a read-only transaction` — not a generic "wrong verb" rejection, an actual failed write caught by the database. The same call as `POST` (a read/write transaction) succeeds and returns the new count. Marking a genuinely side-effecting function `stable`/`immutable` to "make it GET-able" does not work: Postgres does not enforce the label against the body, but PostgREST's read-only transaction does — the function would simply fail at the point it tries to write, exactly like above.
+
+## `returns setof` and `returns table` — the shapes curl actually sees
+
+`agapi_my_notes` above returns `setof public.agapi_notes`: PostgREST serializes the result as a JSON array of objects shaped exactly like the table's columns. `returns table (...)` lets a function return a custom, ad hoc shape without a backing table or view — `agapi_notes_table_shape` above declares `table (note_id uuid, note_body text)` and PostgREST's response matches those column names exactly, not the underlying table's:
+
+```bash
+# scripts/agapi-curl-table-shape.sh
+curl -X POST "$API_URL/rest/v1/rpc/agapi_notes_table_shape" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ALICE_TOKEN"
+```
+
+```text
+[{"note_id":"83af46f4-...","note_body":"alice private note"}]
+```
+
+Note the renamed keys (`note_id`, `note_body`, not `id`/`body`) — `returns table` is how you shape an RPC response independent of any table it reads from, which matters once client code has typed expectations (the next module's `supabase gen types` reads these signatures too).
+
 <Mermaid title="A Postgres function exposed as a callable RPC endpoint" code={rpcDiagram} />
 
 export const rpcDiagram = `flowchart LR
@@ -64,8 +337,50 @@ export const rpcDiagram = `flowchart LR
   call --> atomic["Single atomic UPDATE in Postgres"]`;
 
 <Callout title="The one-line takeaway">
-Postgres functions are automatically exposed by PostgREST as **RPC** endpoints under `/rpc/<function_name>`, callable from `supabase-js` with **`.rpc(name, args)`** — reach for RPC when logic needs to run **atomically** or as multiple steps inside the database (like an atomic counter increment, which avoids the race condition of a client-side read-then-write), while plain **`.from()`** stays the tool for direct table and view access.
+Postgres functions are automatically exposed by PostgREST as **RPC** endpoints under `/rpc/<function_name>`, callable from `supabase-js` with **`.rpc(name, args)`** — reach for RPC when logic needs to run **atomically** or as multiple steps inside the database (like an atomic counter increment, which avoids the race condition of a client-side read-then-write), while plain **`.from()`** stays the tool for direct table and view access. Default to **`security invoker`** (RLS still applies, proved above); reach for `security definer` only deliberately, and the moment you do, `set search_path = ''` and schema-qualify everything in the body — proved above as the entire difference between a real schema-injection hole and a safe one. `stable`/`immutable` functions are callable via `GET`; `volatile` ones need `POST`, because PostgREST runs every `GET` in a read-only transaction.
 </Callout>
+
+## Reading AI-generated code
+
+An AI assistant asked for "an admin function that looks up any user's total order value, so support staff can answer billing questions" produced this:
+
+<SpotTheBug lang="sql" code={`create or replace function public.agapi_user_order_total(target_user uuid)
+returns numeric
+security definer
+language plpgsql
+as $$
+declare
+  total numeric;
+begin
+  select sum(amount) into total
+  from orders
+  where user_id = target_user;
+
+  return coalesce(total, 0);
+end;
+$$;
+
+grant execute on function public.agapi_user_order_total(uuid) to authenticated;
+`}>
+Two bugs stacked on top of each other, both classic AI output. First, granting `execute` to `authenticated` (every logged-in user, not just support staff) means *any* user can pass any other user's `uuid` and pull their order total — there is no check that the caller is support staff at all, and `security definer` means this function's whole purpose (reading past a per-user RLS policy on `orders`) works exactly as "designed," just for the wrong audience. Second, and independently: `orders` is unqualified and no `search_path` is pinned, so the schema-injection risk proved above applies here too — a hostile schema earlier in whoever's search_path calls this could substitute a fake `orders` relation entirely. The fix needs both: `set search_path = ''` plus `from public.orders`, *and* an actual authorization check inside the function body (e.g. `if not exists (select 1 from public.staff where user_id = auth.uid()) then raise exception 'not authorized'; end if;`) before trusting `security definer`'s elevated privileges — the grant alone was never the access control.
+</SpotTheBug>
+
+## Mental Model
+
+A Postgres function called over `/rpc` is just Postgres executing a query — `security invoker` vs `security definer` is only ever a question of **which role's identity Postgres uses for every permission check the function body triggers**, RLS included. Invoker is "run this as whoever is asking," the same as if they typed the SQL themselves through a very narrow door; definer is "run this as whoever owns the function," a deliberate impersonation you are opting into. `search_path` is a separate, purely textual concern — it is how Postgres resolves a bare name like `orders` into an actual relation — but it becomes a security question the instant the function runs with someone else's privileges (definer) while resolving names using someone else's search order (an unpinned caller-controlled one). Volatility (`stable`/`immutable`/`volatile`) is a third, unrelated axis entirely: a promise about side effects that PostgREST uses only to decide which HTTP verbs are safe to allow, enforced by running `GET` in a transaction that physically cannot write.
+
+## Trade-offs
+
+- **`security invoker` (default) composes safely with RLS for free** — every policy you have already written keeps applying inside the function — **at the cost of needing definer for anything that must cross RLS on purpose** (an admin report spanning users, a public leaderboard aggregate, a counter every anonymous visitor bumps).
+- **`security definer` is the only way to intentionally bypass a caller's RLS from inside a function** — **at the cost of becoming a manual access-control boundary**: nothing stops it from being called by anyone with `execute`, so the function body itself must re-implement whatever check RLS would otherwise have done, and `search_path` must be pinned every time.
+- **Marking a function `stable`/`immutable` unlocks cheaper, cacheable `GET` calls** — **at the cost of PostgREST enforcing that promise at the transaction level**: a mislabeled function does not silently misbehave, it fails outright the moment it tries to write inside a read-only transaction, which is a debugging surprise if you did not know the mechanism.
+
+## Common Misconceptions
+
+- **"`security definer` just means 'more powerful function,' with no downside if only trusted people can call it."** Anyone with `execute` can call it — Supabase's own default new-user experience already grants broad `execute` to `authenticated` unless you deliberately narrow it, so "only trusted people" is an assumption, not an enforced fact, unless the function checks it itself.
+- **"`security invoker` functions can't do anything RLS would block, so they're always safe."** True in the sense that they inherit the caller's restrictions — but that is a reason to prefer them, not a reason to stop thinking about what the caller is allowed to do; a caller with an overly broad policy is just as exposed inside an invoker function as outside one.
+- **"Setting `search_path = 'public'` is just as good as `search_path = ''`."** It narrows the attack surface but does not close it — anything an attacker can put *into* `public` (or whatever schema is pinned) still resolves. Empty string plus full qualification removes the ambiguity entirely, which is why the docs recommend it specifically.
+- **"If a function updates the database, PostgREST will just refuse to expose it via GET, safely."** PostgREST does refuse the *transaction*, not the route — the call reaches Postgres and fails there (`25006`, proved above) rather than being rejected earlier with a friendly "wrong verb" message. Functionally safe, but the error looks like a database bug if you do not know why.
 
 export const quizRpcFunctions = [
   {
@@ -77,6 +392,7 @@ export const quizRpcFunctions = [
       'You must rewrite it as a REST controller in TypeScript first',
     ],
     answer: 1,
+    explain: 'Same mechanism as tables — no routes file, no deploy step. PostgREST reads the schema and generates the /rpc/<name> endpoint automatically.',
   },
   {
     q: 'Why is an atomic view-count increment a good candidate for an RPC function rather than a client-side read-then-write?',
@@ -87,6 +403,7 @@ export const quizRpcFunctions = [
       'Because RPC functions are the only way to filter rows in Postgres',
     ],
     answer: 1,
+    explain: 'The database does the read-modify-write as one atomic statement, so two concurrent callers can never both read the same stale value and silently overwrite each other.',
   },
   {
     q: 'What is the conceptual difference between .from() queries and .rpc() calls?',
@@ -97,6 +414,7 @@ export const quizRpcFunctions = [
       '.from() is deprecated in favor of .rpc() for all queries',
     ],
     answer: 1,
+    explain: 'from() maps to PostgREST table/view endpoints; rpc() maps to the /rpc/<function> endpoints for custom Postgres functions — different endpoints entirely.',
   },
   {
     q: 'From supabase-js, how do you call a Postgres function named increment_view_count with an argument?',
@@ -107,6 +425,40 @@ export const quizRpcFunctions = [
       'supabase.exec("increment_view_count(post_id)")',
     ],
     answer: 1,
+    explain: '.rpc(name, args) is the only supabase-js method that targets /rpc — .from() always targets a table or view endpoint.',
+  },
+  {
+    q: 'A `security invoker` function does `select * from notes` with no WHERE clause, and `notes` has an RLS policy `using (auth.uid() = user_id)`. What does a logged-in user see when they call it?',
+    options: [
+      'Every row in the table, because the function itself has no filter',
+      'Only their own rows, because RLS still applies using the caller\'s identity',
+      'No rows at all, because RPC calls bypass RLS by default',
+      'An error, because security invoker functions cannot read RLS-protected tables',
+    ],
+    answer: 1,
+    explain: 'Proved above with two real users calling the exact same unfiltered function — each only got their own note, because security invoker means Postgres evaluates RLS using the CALLER\'s identity.',
+  },
+  {
+    q: 'Why must a `security definer` function set `search_path = \'\'` and schema-qualify its relations?',
+    options: [
+      'It is only a style preference with no functional effect',
+      'Without it, Postgres resolves unqualified names using the CALLER\'s search_path, letting a hostile schema shadow the intended table/function and run with the definer\'s elevated privileges',
+      'It makes the function run faster',
+      'It is required only for functions written in plpgsql, not SQL',
+    ],
+    answer: 1,
+    explain: 'Proved above: the same unqualified function returned an attacker-planted balance (999999999) once the caller controlled search_path — pinning search_path to \'\' and qualifying every name closed it.',
+  },
+  {
+    q: 'A function is marked `stable` but its body contains an UPDATE statement. What happens when it is called via GET?',
+    options: [
+      'PostgREST silently converts the GET into a POST',
+      'The UPDATE fails inside PostgREST\'s read-only transaction with a real Postgres error, even though Postgres itself allowed the mislabeled STABLE declaration',
+      'Postgres blocks the CREATE FUNCTION statement outright for the mismatch',
+      'It works exactly the same as if it were volatile',
+    ],
+    answer: 1,
+    explain: 'Postgres does not validate the volatility label against the body at creation time — PostgREST\'s read-only transaction for GET is what actually catches it, as a real "cannot execute UPDATE in a read-only transaction" error.',
   },
 ];
 
