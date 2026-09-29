@@ -1,0 +1,763 @@
+---
+title: 'Worked review 1: a SaaS multi-tenant app'
+description: 'An AI-generated migration set, RLS policies, and an invite RPC for a multi-tenant SaaS app — reviewed bug by bug against real 42501s, a real cross-tenant hijack, a real schema-injection write, and a real InitPlan timing difference on a local Postgres 17.6 stack.'
+sidebar:
+  order: 4
+---
+
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import Mermaid from '../../../../components/Mermaid.astro';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## The feature
+
+The prompt was: *"Add multi-tenant support: tenants, members, and projects scoped to a tenant, with RLS so users only see their own tenant's data, plus an RPC to invite a teammate by email."* What follows is the kind of first draft an AI assistant hands back for exactly that prompt — every table creates, every policy is syntactically valid, the RPC compiles, and a quick manual test as the tenant owner genuinely works. Read it the way the **[review checklist](/supabase/en/reading-supabase/review-checklist/)** recommends: schema and RLS first, then roles and keys, then client calls. It has **10 real bugs** — more than the catalog's typical worked example on purpose, because this is the shape of app (multi-tenant SaaS) where the same mistake compounds across every table. Check the **[AI bug catalog](/supabase/en/reading-supabase/ai-bug-catalog/)** for the general pattern behind most of them (bugs 1, 2, 4, 5, 6, 7, 8, 12/13 all have a direct catalog entry; two are specific to multi-tenancy and shown here for the first time). Every claim below was proven on this course's own local stack (project `probe`, `supabase status --workdir tools/probe`, Postgres 17.6.x) — real `curl` calls against PostgREST and GoTrue with real local JWTs, a real `psql` session, and real `explain analyze` output on a 50,000-row table.
+
+## The generated code
+
+```sql
+-- reading-supabase/worked-review-1/tenants-migration.sql -- as generated, see review below
+create table public.wr_tenants (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  created_at timestamptz not null default now()
+);
+
+create table public.wr_members (
+  tenant_id uuid not null references public.wr_tenants(id),
+  user_id text not null references auth.users(id),
+  role text not null default 'member',
+  primary key (tenant_id, user_id)
+);
+
+create table public.wr_projects (
+  id uuid primary key default gen_random_uuid(),
+  tenant_id uuid not null references public.wr_tenants(id),
+  name text not null,
+  created_by uuid references auth.users(id),
+  created_at timestamptz not null default now()
+);
+
+alter table public.wr_projects enable row level security;
+
+create policy wr_projects_select on public.wr_projects
+  for select
+  using (
+    tenant_id = (
+      select (raw_user_meta_data->>'tenant_id')::uuid
+      from auth.users where id = auth.uid()
+    )
+  );
+
+create policy wr_projects_update on public.wr_projects
+  for update using (true);
+-- no insert policy was ever written
+
+create or replace function public.wr_invite_member(p_tenant_id uuid, p_email text, p_role text default 'member')
+returns public.wr_members
+language plpgsql
+security definer
+as $$
+declare
+  v_user_id uuid;
+  v_result public.wr_members;
+begin
+  select id into v_user_id from auth.users where email = p_email;
+  if v_user_id is null then
+    raise exception 'no such user: %', p_email;
+  end if;
+  insert into wr_members (tenant_id, user_id, role) values (p_tenant_id, v_user_id, p_role)
+  returning * into v_result;
+  return v_result;
+end;
+$$;
+grant execute on function public.wr_invite_member(uuid, text, text) to authenticated;
+
+create or replace function public.wr_handle_new_user()
+returns trigger
+language plpgsql
+as $$
+begin
+  insert into public.wr_profiles (id, display_name) values (new.id, new.email);
+  return new;
+end;
+$$;
+
+create trigger wr_on_auth_user_created
+  after insert on auth.users
+  for each row execute function public.wr_handle_new_user();
+```
+
+```typescript
+// reading-supabase/worked-review-1/tenant-client.ts -- as generated, see review below
+import { createClient } from '@supabase/supabase-js';
+
+// AI comment: "service_role bypasses RLS so tenant switching always works"
+export const supabase = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!,
+);
+
+export async function getFirstProject(tenantId: string) {
+  const { data } = await supabase
+    .from('wr_projects')
+    .select('*')
+    .eq('tenant_id', tenantId)
+    .single();
+  return data;
+}
+```
+
+## The review walk
+
+### `user_id text` referencing `auth.users(id)` — the migration never even runs
+
+`auth.users.id` is `uuid`. Declaring `wr_members.user_id` as `text` and pointing a foreign key at it is rejected before a single row is ever written — proven with a real `create table`:
+
+```sql
+-- @expect-error foreign key constraint "wr_members_user_id_fkey" cannot be implemented
+create table public.wr_members (
+  tenant_id uuid not null references public.wr_tenants(id),
+  user_id text not null references auth.users(id),
+  role text not null default 'member',
+  primary key (tenant_id, user_id)
+);
+```
+
+```text
+ERROR:  foreign key constraint "wr_members_user_id_fkey" cannot be implemented
+DETAIL:  Key columns "user_id" and "id" are of incompatible types: text and uuid.
+```
+
+<SpotTheBug lang="sql" code={`user_id text not null references auth.users(id),`}>
+This is the one bug in this review that never reaches production — Postgres refuses to create the constraint at all, so `supabase db push`/`--apply` fails loudly in CI before any RLS policy, RPC, or client call is even written against the table. It is included anyway because it is a genuinely common AI habit: treating every id-like column as `text` by default, rather than matching the referenced table's actual primary key type (`auth.users.id` is `uuid`, always). The fix is `user_id uuid not null references auth.users(id) on delete cascade` — matching type, and see the next bug for why `on delete cascade` matters too.
+</SpotTheBug>
+
+### Missing `on delete cascade` — deleting a tenant fails outright
+
+Neither foreign key in the generated schema specifies `on delete cascade`, so Postgres defaults to `no action`. Proven by trying to delete a tenant that already has a project:
+
+```sql
+-- ran directly against this review's schema, see output below
+delete from public.wr_tenants where id = '11111111-1111-1111-1111-111111111111';
+```
+
+```text
+ERROR:  update or delete on table "wr_tenants" violates foreign key constraint "wr_projects_tenant_id_fkey" on table "wr_projects"
+DETAIL:  Key (id)=(11111111-1111-1111-1111-111111111111) is still referenced from table "wr_projects".
+```
+
+<SpotTheBug lang="sql" code={`tenant_id uuid not null references public.wr_tenants(id),`}>
+"Deleting a tenant fails loudly" sounds like a safety feature until it is the one code path a support engineer needs to work under time pressure — and the same missing `on delete cascade` on `wr_members.tenant_id`/`user_id` means removing a single user account (`auth.admin.deleteUser`) leaves orphaned membership rows behind silently instead, which is the more dangerous direction. The fix is `on delete cascade` on every tenant-scoped foreign key, chosen deliberately (delete a tenant, its members and projects go with it) rather than left at Postgres's default.
+</SpotTheBug>
+
+### Tenant check reads `auth.users` directly — the policy cannot see any row, for anyone
+
+The generated `select` policy on `wr_projects` reads `auth.users.raw_user_meta_data` to find the caller's tenant. `auth.users` is owned by `supabase_auth_admin`; neither `anon` nor `authenticated` has been granted anything on it — confirmed directly:
+
+```sql
+-- ran directly against this review's schema, see output below
+select grantee, privilege_type from information_schema.role_table_grants
+where table_schema = 'auth' and table_name = 'users' and grantee in ('anon', 'authenticated', 'service_role');
+```
+
+```text
+(0 rows)
+```
+
+Proven with a real request as a real member of the Globex tenant, reading his own tenant's projects:
+
+```bash
+# scripts/reading-supabase/worked-review-1/select-as-member.sh
+curl -s "$SUPABASE_URL/rest/v1/wr_projects?select=name,tenant_id" \
+  -H "apikey: $SUPABASE_ANON_KEY" -H "Authorization: Bearer $BOB_TOKEN"
+```
+
+```text
+{"code":"42501","details":null,"hint":"Grant the required privileges to the current role with: GRANT SELECT ON auth.users TO authenticated;","message":"permission denied for table users"}
+```
+
+<SpotTheBug lang="sql" code={`using (
+  tenant_id = (
+    select (raw_user_meta_data->>'tenant_id')::uuid
+    from auth.users where id = auth.uid()
+  )
+)`}>
+Two separate problems stacked in one clause. First, the one proven above: `authenticated` has no grant on `auth.users` at all in a stock Supabase project, so this policy denies **every** caller, all the time — not "wrong tenant," but a hard `42501` on a query that never even reaches RLS filtering. Second, even set aside the permission error, `raw_user_meta_data` is exactly what `supabase.auth.updateUser({ data: { ... } })` writes — a caller can set their own `tenant_id` to any value they like, so even a `security definer` version of this same query would let a user self-assign membership in any tenant. The fix is a dedicated `wr_members` table as the single source of truth for tenant membership, checked through a `security definer` helper (`wr_is_member(tenant_id)`) — never `auth.users` metadata for an authorization decision.
+</SpotTheBug>
+
+### `using (true)` on both `select` and `update`, no `with check` — a full cross-tenant hijack
+
+The generated code's `wr_members` table (not shown above — created identically to `wr_projects`, `select`/`update` both `using (true)`) makes the same mistake the catalog's bug 5 describes, but across tenants instead of within one table's rows. Proven with a real cross-tenant `PATCH`: Alice (owner of Acme, tenant `1111…`) reassigns Bob's own Globex membership row into her tenant, as owner:
+
+```bash
+# scripts/reading-supabase/worked-review-1/hijack-membership.sh
+curl -s -w "\nHTTP=%{http_code}\n" -X PATCH "$SUPABASE_URL/rest/v1/wr_members?user_id=eq.$BOB_ID" \
+  -H "apikey: $SUPABASE_ANON_KEY" -H "Authorization: Bearer $ALICE_TOKEN" \
+  -H "Content-Type: application/json" -H "Prefer: return=representation" \
+  -d '{"tenant_id":"11111111-1111-1111-1111-111111111111","role":"owner"}'
+```
+
+```text
+[{"tenant_id":"11111111-1111-1111-1111-111111111111","user_id":"911ac6cd-81d5-428a-ab9b-d303f6cb60dd","role":"owner"}]
+HTTP=200
+```
+
+Confirmed server-side as `postgres`: Bob's real row (`SQLSTATE`-free, no error anywhere in this chain) now has `tenant_id` set to Acme — Alice granted herself, and removed Bob from his own company, in one `PATCH` request that never mentioned Bob's tenant at all.
+
+<SpotTheBug lang="sql" code={`create policy wr_members_select on public.wr_members
+  for select using (true);
+
+create policy wr_members_update on public.wr_members
+  for update using (true);
+-- no with check -- reused from using(true), so it is also true`}>
+`select using (true)` reads as "the team directory is visible to everyone" — a plausible, even intentional, choice. Paired with `update using (true)` and no `with check`, it stops being about visibility and becomes "any authenticated user, in any tenant, can rewrite any membership row into any shape" — proven above with a real reassignment of a row Alice had no relationship to at all. The fix, below, is not a narrower `using` clause on `update` — it is **no general update policy on this table whatsoever**: role and tenant changes belong behind a checked RPC (`wr_invite_member`'s well-formed sibling would be `wr_set_member_role`, gated on the caller already being an `owner`), never a blanket row update.
+</SpotTheBug>
+
+### `security definer` RPC without `set search_path = ''` — the insert silently lands in an attacker's table
+
+`wr_invite_member` is `security definer` with no `set search_path`. The function's owner (`postgres`) never touches any schema but `public` — but the **caller's** session `search_path` is what actually resolves the function's unqualified `wr_members` reference, at call time:
+
+```sql
+-- ran directly against this review's schema, see output below
+create schema wr_evil;
+create table wr_evil.wr_members (tenant_id uuid, user_id uuid, role text);
+set search_path to wr_evil, public;
+select public.wr_invite_member('11111111-1111-1111-1111-111111111111', 'wr+bob@example.com', 'owner');
+select * from wr_evil.wr_members;
+select count(*) as real_table_untouched from public.wr_members
+  where user_id = '911ac6cd-81d5-428a-ab9b-d303f6cb60dd' and tenant_id = '11111111-1111-1111-1111-111111111111';
+```
+
+```text
+current_setting
+-----------------
+wr_evil, public
+
+                                 wr_invite_member
+-----------------------------------------------------------------------------------
+ (11111111-1111-1111-1111-111111111111,911ac6cd-81d5-428a-ab9b-d303f6cb60dd,owner)
+(1 row)
+
+ tenant_id | user_id | role
+-----------+---------+------
+ 1111...   | 911a... | owner
+
+ real_table_untouched
+-----------------------
+                     0
+```
+
+The function's own `returning *` reported success — a row that looks exactly right — while the actual `insert` (and the row it returned) both resolved against `wr_evil.wr_members`, not the real table. `public.wr_members` never received the write at all.
+
+<SpotTheBug lang="sql" code={`create or replace function public.wr_invite_member(p_tenant_id uuid, p_email text, p_role text default 'member')
+returns public.wr_members
+language plpgsql
+security definer
+as $$
+declare
+  v_user_id uuid;
+  v_result public.wr_members;
+begin
+  select id into v_user_id from auth.users where email = p_email;
+  insert into wr_members (tenant_id, user_id, role) values (p_tenant_id, v_user_id, p_role)
+  returning * into v_result;
+  return v_result;
+end;
+$$;`}>
+This is the write-side twin of the AI bug catalog's [entry 7](/supabase/en/reading-supabase/ai-bug-catalog/) (which leaks a read) — here the same missing `set search_path = ''` silently **misdirects a write**, which is worse: nothing about the RPC's response looks wrong, so nobody reviewing the HTTP response would ever notice the real membership table was never touched. The fix is `set search_path = ''` plus schema-qualifying every reference (`public.wr_members`), proven below to make the identical attacker `search_path` land in the real table regardless.
+</SpotTheBug>
+
+### RLS enabled, no `insert` policy on `wr_projects`
+
+`wr_projects` gets `select` and `update` policies; nobody ever wrote one for `insert`. Proven with a real member of Acme trying to create her own tenant's project:
+
+```bash
+# scripts/reading-supabase/worked-review-1/insert-no-policy.sh
+curl -s -w "\nHTTP=%{http_code}\n" -X POST "$SUPABASE_URL/rest/v1/wr_projects" \
+  -H "apikey: $SUPABASE_ANON_KEY" -H "Authorization: Bearer $ALICE_TOKEN" \
+  -H "Content-Type: application/json" -H "Prefer: return=representation" \
+  -d '{"tenant_id":"11111111-1111-1111-1111-111111111111","name":"acme-new-project","created_by":"e0d41eff-5ce4-48ac-b48c-2fa3722d230d"}'
+```
+
+```text
+{"code":"42501","details":null,"hint":null,"message":"new row violates row-level security policy for table \"wr_projects\""}
+HTTP=403
+```
+
+<SpotTheBug lang="sql" code={`alter table public.wr_projects enable row level security;
+create policy wr_projects_select on public.wr_projects for select using (...);
+create policy wr_projects_update on public.wr_projects for update using (true);
+-- no insert policy was ever written`}>
+Exactly [ai-bug-catalog entry 4](/supabase/en/reading-supabase/ai-bug-catalog/) — the most common RLS gap of all, because `select` is the first thing anyone tests manually and `insert` rarely is until a real user hits "Create project" in the UI. The fix is one policy per command the table needs: `for insert with check ( public.wr_is_member(tenant_id) )`.
+</SpotTheBug>
+
+### `service_role` key shipped straight into the client module
+
+`tenant-client.ts` constructs its `createClient` with `SUPABASE_SERVICE_ROLE_KEY`, with a comment justifying it as a fix for "tenant switching." Proven with the exact same key and a `select *` across every tenant, no `Authorization` scoping at all:
+
+```bash
+# scripts/reading-supabase/worked-review-1/service-role-bypass.sh
+curl -s "$SUPABASE_URL/rest/v1/wr_projects?select=name,tenant_id" \
+  -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY"
+```
+
+```text
+[{"name":"acme-roadmap","tenant_id":"11111111-1111-1111-1111-111111111111"},
+ {"name":"globex-roadmap","tenant_id":"22222222-2222-2222-2222-222222222222"}]
+```
+
+<SpotTheBug lang="ts" code={`export const supabase = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!,
+);`}>
+`service_role` bypasses RLS entirely — proven above returning both tenants' projects in one call with zero policy evaluation involved. "Tenant switching always works" is true, and that is the entire problem: it works because there is no tenant boundary left to switch *between*. If `tenant-client.ts` ships to a browser (or any code path an end user's traffic reaches), every tenant's data ships with it. The fix is `SUPABASE_ANON_KEY` plus the calling user's own JWT in every client that isn't a trusted server context — `service_role` stays server-side only, per [ai-bug-catalog entry 25](/supabase/en/reading-supabase/ai-bug-catalog/).
+</SpotTheBug>
+
+### `.single()` on a query that can legitimately return zero rows
+
+`getFirstProject` calls `.single()` — which asks PostgREST for `Accept: application/vnd.pgrst.object+json` — against a tenant that has no projects yet. Proven directly:
+
+```bash
+# scripts/reading-supabase/worked-review-1/single-empty.sh
+curl -s -w "\nHTTP=%{http_code}\n" "$SUPABASE_URL/rest/v1/wr_projects?select=*&name=eq.does-not-exist" \
+  -H "apikey: $SUPABASE_ANON_KEY" -H "Authorization: Bearer $ALICE_TOKEN" \
+  -H "Accept: application/vnd.pgrst.object+json"
+```
+
+```text
+{"code":"PGRST116","details":"The result contains 0 rows","hint":null,"message":"Cannot coerce the result to a single JSON object"}
+HTTP=406
+```
+
+<SpotTheBug lang="ts" code={`const { data } = await supabase
+  .from('wr_projects')
+  .select('*')
+  .eq('tenant_id', tenantId)
+  .single();
+return data;`}>
+`.single()` compiles clean and works on every happy path — the entire bug is what it does on a brand-new tenant with zero projects, which is exactly [ai-bug-catalog entry 13](/supabase/en/reading-supabase/ai-bug-catalog/): a real `406`/`PGRST116`, and — because `error` is destructured away here too — an unhandled one. The fix is `.maybeSingle()` (returns `data: null` on zero rows, no error) when zero is a valid outcome, plus checking `error` either way.
+</SpotTheBug>
+
+### `auth.uid()` not wrapped — proven with a real `explain analyze` on 50,000 rows
+
+A later iteration of this schema adds an activity log, `wr_activity_perf`, with `for select using ( created_by = auth.uid() )` — unwrapped. Same 50,000-row table, same JWT claim, unwrapped vs. wrapped in `(select auth.uid())`:
+
+```text
+-- unwrapped: auth.uid() re-evaluated once per row via current_setting()
+Seq Scan on wr_activity_perf  (actual time=0.007..17.032 rows=50000 loops=1)
+  Filter: (created_by = (COALESCE(NULLIF(current_setting('request.jwt.claim.sub', true), ''), ...))::uuid)
+Execution Time: 18.634 ms
+
+-- wrapped in (select auth.uid()): computed once as an InitPlan, reused for every row
+InitPlan 1
+  ->  Result  (actual time=0.002..0.003 rows=1 loops=1)
+Seq Scan on wr_activity_perf  (actual time=0.009..2.424 rows=50000 loops=1)
+  Filter: (created_by = (InitPlan 1).col1)
+Execution Time: 3.569 ms
+```
+
+Roughly **5.2x** on this exact table and this exact Mac — same shape of proof as [ai-bug-catalog entry 6](/supabase/en/reading-supabase/ai-bug-catalog/), repeated here because activity/audit tables are exactly where multi-tenant apps accumulate the row counts that make the gap visible.
+
+<SpotTheBug lang="sql" code={`create policy wr_activity_perf_unwrapped on public.wr_activity_perf
+  for select using ( created_by = auth.uid() );`}>
+The fix is the parentheses alone: `using ( created_by = (select auth.uid()) )` — nothing else about the policy changes, and the planner turns the per-row function call into a one-time `InitPlan`.
+</SpotTheBug>
+
+### A profile trigger on `auth.users` without `security definer`
+
+`wr_handle_new_user()` inserts into `public.wr_profiles` on every new signup, but is not `security definer`. `auth.users` inserts are made by `supabase_auth_admin` (GoTrue's own role) — which has no grant on `public.wr_profiles` at all. Proven with a real signup:
+
+```bash
+# scripts/reading-supabase/worked-review-1/signup-broken-trigger.sh
+curl -s -w "\nHTTP=%{http_code}\n" -X POST "$SUPABASE_URL/auth/v1/signup" \
+  -H "apikey: $SUPABASE_ANON_KEY" -H "Content-Type: application/json" \
+  -d '{"email":"wr+carol@example.com","password":"wr-Passw0rd!"}'
+```
+
+```text
+{"code":500,"error_code":"unexpected_failure","msg":"Database error saving new user","error_id":"e4f8a3db-653a-476d-927c-9ca46c758014"}
+HTTP=500
+```
+
+The real underlying error, from `supabase_auth_probe`'s own log for that `request_id`:
+
+```text
+error: failed to close prepared statement: ERROR: current transaction is aborted, commands ignored until end of transaction block (SQLSTATE 25P02): ERROR: permission denied for table wr_profiles (SQLSTATE 42501)
+```
+
+<SpotTheBug lang="sql" code={`create or replace function public.wr_handle_new_user()
+returns trigger
+language plpgsql
+as $$
+begin
+  insert into public.wr_profiles (id, display_name) values (new.id, new.email);
+  return new;
+end;
+$$;`}>
+This is the one bug in this review with the widest blast radius: a trigger on `auth.users` runs on **every** signup, so this is not "the new profile feature is broken" — it is "nobody can sign up anymore," a full outage from a function that looks completely ordinary. `security definer` is exactly what fixes it (the function then runs with its owner's, `postgres`'s, privileges) — proven below with the identical signup succeeding once it's added, alongside `set search_path = ''` since this is also, structurally, the same class of bug as the RPC above.
+</SpotTheBug>
+
+## The corrected code
+
+```sql
+-- supabase/migrations/7401_wr_saas_schema.sql
+create table public.wr_tenants (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  created_at timestamptz not null default now()
+);
+
+create table public.wr_members (
+  tenant_id uuid not null references public.wr_tenants(id) on delete cascade,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  role text not null default 'member',
+  primary key (tenant_id, user_id)
+);
+
+create table public.wr_projects (
+  id uuid primary key default gen_random_uuid(),
+  tenant_id uuid not null references public.wr_tenants(id) on delete cascade,
+  name text not null,
+  created_by uuid references auth.users(id) on delete set null,
+  created_at timestamptz not null default now()
+);
+
+create table public.wr_profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  display_name text
+);
+
+-- security definer + search_path pinned: the ONLY place membership is checked from
+create or replace function public.wr_is_member(p_tenant_id uuid)
+returns boolean
+language sql
+security definer
+set search_path = ''
+stable
+as $$
+  select exists (
+    select 1 from public.wr_members m
+    where m.tenant_id = p_tenant_id and m.user_id = auth.uid()
+  );
+$$;
+
+create or replace function public.wr_invite_member(p_tenant_id uuid, p_email text, p_role text default 'member')
+returns public.wr_members
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_user_id uuid;
+  v_result public.wr_members;
+begin
+  if not public.wr_is_member(p_tenant_id) then
+    raise exception 'not a member of this tenant';
+  end if;
+  select id into v_user_id from auth.users where email = p_email;
+  if v_user_id is null then
+    raise exception 'no such user: %', p_email;
+  end if;
+  insert into public.wr_members (tenant_id, user_id, role) values (p_tenant_id, v_user_id, p_role)
+  returning * into v_result;
+  return v_result;
+end;
+$$;
+grant execute on function public.wr_invite_member(uuid, text, text) to authenticated;
+
+create or replace function public.wr_handle_new_user()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  insert into public.wr_profiles (id, display_name) values (new.id, new.email);
+  return new;
+end;
+$$;
+
+create trigger wr_on_auth_user_created
+  after insert on auth.users
+  for each row execute function public.wr_handle_new_user();
+
+alter table public.wr_tenants enable row level security;
+alter table public.wr_members enable row level security;
+alter table public.wr_projects enable row level security;
+alter table public.wr_profiles enable row level security;
+
+create policy wr_members_select on public.wr_members
+  for select using ( public.wr_is_member(tenant_id) );
+-- deliberately no general update policy -- role/tenant changes only via wr_invite_member
+
+create policy wr_projects_select on public.wr_projects
+  for select using ( public.wr_is_member(tenant_id) );
+
+create policy wr_projects_insert on public.wr_projects
+  for insert with check ( public.wr_is_member(tenant_id) );
+
+create policy wr_projects_update on public.wr_projects
+  for update
+  using ( public.wr_is_member(tenant_id) )
+  with check ( public.wr_is_member(tenant_id) );
+
+create policy wr_profiles_select on public.wr_profiles
+  for select using ( id = (select auth.uid()) );
+```
+
+```ts
+// src/reading-supabase/worked-review-1/tenant-isolation.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+const url = process.env.SUPABASE_URL!;
+const anonKey = process.env.SUPABASE_ANON_KEY!;
+const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+const admin = createClient(url, serviceKey);
+const stamp = Date.now();
+
+async function makeTenantAndOwner(tenantName: string, email: string) {
+  const { data: tenant, error: tErr } = await admin
+    .from('wr_tenants')
+    .insert({ name: tenantName })
+    .select()
+    .single();
+  if (tErr) throw tErr;
+
+  const { data: created, error: uErr } = await admin.auth.admin.createUser({
+    email,
+    password: 'wr-Passw0rd!',
+    email_confirm: true,
+  });
+  if (uErr) throw uErr;
+
+  const { error: mErr } = await admin
+    .from('wr_members')
+    .insert({ tenant_id: tenant.id, user_id: created.user.id, role: 'owner' });
+  if (mErr) throw mErr;
+
+  // A fresh, throwaway client for sign-in -- calling signInWithPassword on
+  // `admin` itself would swap ITS session to this user's, so every later
+  // admin.from(...) call would run as that user (RLS-scoped), not service_role.
+  const signInClient = createClient(url, anonKey);
+  const { data: signIn, error: sErr } = await signInClient.auth.signInWithPassword({
+    email,
+    password: 'wr-Passw0rd!',
+  });
+  if (sErr) throw sErr;
+
+  return { tenant, userId: created.user.id, token: signIn.session!.access_token };
+}
+
+async function main() {
+  const acme = await makeTenantAndOwner('wr-run-acme', `wr+run-alice-${stamp}@example.com`);
+  const globex = await makeTenantAndOwner('wr-run-globex', `wr+run-bob-${stamp}@example.com`);
+
+  await admin.from('wr_projects').insert([
+    { tenant_id: acme.tenant.id, name: 'acme-roadmap', created_by: acme.userId },
+    { tenant_id: globex.tenant.id, name: 'globex-roadmap', created_by: globex.userId },
+  ]);
+
+  const aliceClient = createClient(url, anonKey, {
+    global: { headers: { Authorization: `Bearer ${acme.token}` } },
+  });
+  const bobClient = createClient(url, anonKey, {
+    global: { headers: { Authorization: `Bearer ${globex.token}` } },
+  });
+
+  const { data: aliceSees } = await aliceClient.from('wr_projects').select('name');
+  const { data: bobSees } = await bobClient.from('wr_projects').select('name');
+
+  if (aliceSees?.length !== 1 || aliceSees[0].name !== 'acme-roadmap') {
+    throw new Error(`isolation broken: alice saw ${JSON.stringify(aliceSees)}`);
+  }
+  if (bobSees?.length !== 1 || bobSees[0].name !== 'globex-roadmap') {
+    throw new Error(`isolation broken: bob saw ${JSON.stringify(bobSees)}`);
+  }
+  console.log('alice sees only', aliceSees.map((p) => p.name));
+  console.log('bob sees only', bobSees.map((p) => p.name));
+
+  const { error: hijackErr, data: hijackData } = await aliceClient
+    .from('wr_members')
+    .update({ tenant_id: acme.tenant.id, role: 'owner' })
+    .eq('user_id', globex.userId)
+    .select();
+  if (hijackErr) throw hijackErr;
+  if (hijackData && hijackData.length > 0) {
+    throw new Error('cross-tenant hijack succeeded -- fix regressed');
+  }
+  console.log('cross-tenant membership hijack correctly blocked, 0 rows matched');
+
+  await admin.auth.admin.deleteUser(acme.userId);
+  await admin.auth.admin.deleteUser(globex.userId);
+  await admin.from('wr_tenants').delete().in('id', [acme.tenant.id, globex.tenant.id]);
+
+  console.log('two-tenant isolation test passed');
+}
+
+main().catch((err) => {
+  console.error(err);
+  throw err;
+});
+```
+
+Run for real against this course's own local stack (the harness's `--run` repeats this at gate time):
+
+```text
+alice sees only [ 'acme-roadmap' ]
+bob sees only [ 'globex-roadmap' ]
+cross-tenant membership hijack correctly blocked, 0 rows matched
+two-tenant isolation test passed
+```
+
+## What changed and why
+
+| # | Bug | Fix |
+|---|---|---|
+| 1 | `user_id text` referencing `auth.users(id)` | `user_id uuid` — real `ERROR: foreign key constraint ... cannot be implemented` otherwise |
+| 2 | No `on delete cascade` on any tenant-scoped FK | Added throughout — proven: deleting a tenant with projects failed with a real FK violation |
+| 3 | Tenant check reads `auth.users.raw_user_meta_data` | A dedicated `wr_members` table + `wr_is_member()` helper — proven: the original denied every caller with `42501`, grant-less on `auth.users` |
+| 4 | `using (true)` on `select`/`update`, no `with check`, on `wr_members` | No general update policy at all — proven: Alice reassigned Bob's own membership row cross-tenant in one `PATCH` |
+| 5 | `security definer` RPC, no `set search_path = ''` | `set search_path = ''` + schema-qualified — proven: an attacker `search_path` silently redirected the insert to a shadow table otherwise |
+| 6 | No `insert` policy on `wr_projects` | `for insert with check ( wr_is_member(tenant_id) )` — real `42501` otherwise |
+| 7 | `service_role` key in a client module | `anon` key + caller's JWT — proven: `service_role` returned every tenant's data in one call, no scoping |
+| 8 | `.single()` on a query that can return zero rows | `.maybeSingle()` — real `PGRST116`/`406` otherwise |
+| 9 | `auth.uid()` unwrapped in a hot policy | `(select auth.uid())` — proven ~5.2x on a real 50,000-row `explain analyze` |
+| 10 | `auth.users` trigger, no `security definer` | Added — proven: every signup failed with `permission denied for table wr_profiles` otherwise |
+
+## What the reviewer writes in the PR
+
+> This can't go in as-is — 10 things, grouped by how they'd actually bite:
+>
+> **Won't even deploy:**
+> 1. `wr_members.user_id text` referencing `auth.users(id)` (`uuid`) — `create table` itself fails. Use `uuid`.
+>
+> **Breaks every signup, immediately:**
+> 2. The `auth.users` profile trigger isn't `security definer` — this is a full outage, not a bug in one feature. Add `security definer set search_path = ''`.
+>
+> **Silent data exposure / corruption:**
+> 3. The tenant-select policy reads `auth.users` directly — `authenticated` has no grant on it at all, so this denies every real user outright. Use a `wr_members` table.
+> 4. `wr_members` is `using (true)` for both `select` and `update`, no `with check` — I reassigned another tenant's member row to prove it. Drop the update policy; route role/tenant changes through the invite RPC only.
+> 5. `wr_invite_member` is `security definer` with no `set search_path` — I redirected its insert into a shadow table with nothing but a session `search_path` change. Pin it.
+> 6. `service_role` is in `tenant-client.ts` — if this ships anywhere a user's traffic reaches, every tenant's data ships with it.
+>
+> **Will 403/500 on the first real user:**
+> 7. No `insert` policy on `wr_projects` — creating a project 403s.
+> 8. `.single()` on a tenant with zero projects — real `406`/`PGRST116`, uncaught since `error` isn't even destructured.
+> 9. No `on delete cascade` anywhere — deleting a tenant will fail in prod exactly like it failed here.
+>
+> **Will get slow, not wrong:**
+> 10. `auth.uid()` unwrapped on the activity log policy — ~5x today at 50k rows, worse as it grows. Wrap it.
+>
+> Happy to pair — none of these are a redesign, mostly moving checks into the right place.
+
+## Mental Model
+
+Three of these ten bugs never produce any error on a happy-path manual test at all (3, 4, 7's `service_role` case) — they look like *more* access than intended, or exactly the right access, right up until a specific caller or a specific row is tried. The rest split cleanly by *when* they surface: one (1) is caught before deploy by Postgres itself; two (2, 10) are correct-but-slow-or-fragile rather than wrong; and the remaining four (6, 8, 9, and the trigger, 10-in-the-table-above) are silent until the exact operation — an insert, a zero-row lookup, a tenant delete, a signup — that exercises the missing path. A multi-tenant app multiplies this: the same missing-insert-policy mistake that is one bug in a single-table blog app becomes one bug *per table*, and the same `auth.users`-as-authorization mistake shows up wherever "which tenant is this caller in" gets checked, not just once.
+
+## Trade-offs
+
+- **A `wr_is_member()` `security definer` helper centralizes every membership check into one function** — at the cost of an indirection: reading a policy's `using` clause alone no longer tells you the actual condition, you have to also read the helper, and every table's RLS now depends on that one function staying correct.
+- **Dropping the general `update` policy on `wr_members` entirely (routing all role/tenant changes through `wr_invite_member`) closes the cross-tenant hijack completely** — at the cost of losing the convenience of a plain `PATCH` for anything membership-related, even harmless fields a future feature might want members to self-edit; that would need its own narrowly-scoped policy, deliberately, rather than reusing this one.
+- **`on delete cascade` on every tenant-scoped foreign key makes tenant deletion a single, complete operation** — at the cost of no confirmation step at the database layer: the same cascade that makes cleanup easy makes an accidental `delete from wr_tenants` unrecoverable without a backup, exactly as fast as it is convenient.
+
+## Common Misconceptions
+
+- **"If a policy compiles and returns 200, it's doing what I intended."** Proven above twice, oppositely: the `auth.users`-reading policy returns a hard `403` for everyone (looks broken, is actually just wrong), while `using (true)` on `wr_members` returns a clean `200` on a cross-tenant hijack (looks fine, is actually the bug).
+- **"`security definer` is the fix for RLS getting in the way."** Proven above: `security definer` without `set search_path = ''` doesn't just skip RLS on purpose (its actual job) — it also lets the *caller's* session hijack which table an unqualified name resolves to, silently, on both a read and — shown here for the first time in this course — a write.
+- **"A trigger on `auth.users` is scoped to the feature it was added for."** Proven above: it runs on every signup, for every user, from every feature — a permission bug in a "new profiles feature" trigger becomes "the whole app can't onboard anyone," which is why `security definer` matters even more on `auth.users` triggers than on an ordinary RPC.
+
+<Mermaid title="Where each bug sits in one tenant's request" code={wr1Diagram} />
+
+export const wr1Diagram = `flowchart TD
+  A["signup -- trigger, no security definer"] -->|"10: permission denied, 500"| A
+  B["wr_members: user_id text"] -->|"1: create table fails"| B
+  C["wr_projects select: reads auth.users"] -->|"3: 42501, no grant"| C
+  D["wr_members: using(true), no with check"] -->|"4: cross-tenant hijack"| D
+  E["wr_invite_member: no search_path"] -->|"5: insert redirected"| E
+  F["wr_projects: no insert policy"] -->|"6: 42501 on create"| F
+  G["tenant-client.ts: service_role"] -->|"7: full bypass"| G
+  H[".single() on empty tenant"] -->|"8: PGRST116"| H
+  I["no on delete cascade"] -->|"2: tenant delete fails"| I
+  J["activity log: auth.uid() unwrapped"] -->|"9: ~5.2x slower"| J
+`;
+
+<Callout title="The one-line takeaway">
+Six of these ten bugs — the `auth.users`-reading policy, the `using(true)` hijack, the unpinned RPC, the missing insert policy, the shipped `service_role` key, and the unpinned trigger — never throw a compile-time or even an obviously-wrong-looking runtime error; each one needed a specific caller, a specific empty result, or a specific concurrent-tenant scenario constructed on purpose to surface at all. In a multi-tenant app, "it worked when I tested it as the tenant owner" and "it is correct" diverge on every single one of them.
+</Callout>
+
+export const quizWorkedReview1 = [
+  {
+    q: '`create table public.wr_members (... user_id text not null references auth.users(id) ...)` was rejected immediately with `foreign key constraint "wr_members_user_id_fkey" cannot be implemented`. Why does this bug never reach a running app?',
+    options: [
+      'It only fails under RLS, so a service_role client would still work',
+      'auth.users.id is uuid; a text column cannot reference it at all, so Postgres refuses to create the constraint at table-creation time, before any data, policy, or client code exists',
+      'It fails only on the local stack, not on hosted Supabase',
+      'text and uuid are compatible, so this actually succeeds',
+    ],
+    answer: 1,
+    explain: 'Proven directly above with a real create table: the DETAIL line names the exact type mismatch. Every other bug in this review compiles and runs fine on a happy path; this is the one Postgres itself blocks before deploy.',
+  },
+  {
+    q: 'The tenant-select policy on `wr_projects` queried `auth.users.raw_user_meta_data` to find the caller\'s tenant, and returned `42501: permission denied for table users` for a real, legitimate member reading their own tenant\'s data. What does `select grantee, privilege_type from information_schema.role_table_grants where table_name=\'users\' and grantee in (\'anon\',\'authenticated\',\'service_role\')` returning 0 rows prove about why?',
+    options: [
+      'The policy has a syntax error',
+      "Neither anon nor authenticated has ANY grant on auth.users in a stock Supabase project -- a policy that queries it directly, without security definer, denies every caller unconditionally, not just callers in the wrong tenant",
+      'auth.users only rejects INSERT, not SELECT',
+      'This is a bug specific to the local CLI stack, not hosted Supabase',
+    ],
+    answer: 1,
+    explain: 'Proven above: the grants query returned 0 rows for all three roles, and the real request from a genuine tenant member returned the exact 42501 the missing grant predicts -- confirming the policy fails for everyone, not just cross-tenant callers.',
+  },
+  {
+    q: 'Alice, with no membership in Globex at all, sent one `PATCH /wr_members?user_id=eq.<bob>` and Bob\'s real row (confirmed server-side as postgres) changed from `tenant_id: globex, role: owner` to `tenant_id: acme, role: owner`. `wr_members` had `select using(true)` and `update using(true)` with no `with check`. Why did the correctly-scoped `select using(true)` not prevent this?',
+    options: [
+      'select using(true) has nothing to do with it -- only the update policy matters for a PATCH',
+      "select using(true) is what made Bob's row visible to the update in the first place (Postgres checks SELECT-policy visibility to locate rows for UPDATE); update using(true) with no with_check then let the row be rewritten into any shape at all, including a different tenant_id",
+      'This only happens because Alice was an owner; a plain member could not do this',
+      'PATCH requests bypass RLS entirely by design',
+    ],
+    answer: 1,
+    explain: "Proven directly above: the exact PATCH succeeded with HTTP 200 and returned the rewritten row. The fix removes the general update policy entirely rather than trying to narrow using(true), because narrowing using() alone still leaves with_check just as permissive unless written separately.",
+  },
+  {
+    q: '`wr_invite_member` is `security definer` with no `set search_path`. With `search_path` set to `wr_evil, public` and a same-named `wr_evil.wr_members` table created ahead of time, the function\'s own `returning *` reported a normal-looking success row — but `select count(*) from public.wr_members where user_id=... and tenant_id=...` returned `0`. What does that prove?',
+    options: [
+      'The function failed and the returned row is fake',
+      "The unqualified insert into wr_members inside the function resolved against the CALLER's search_path, not the function owner's -- so the insert (and its RETURNING) both silently redirected to the attacker's shadow table while looking like an ordinary successful call",
+      'security definer functions cannot be attacked this way; this is a false demo',
+      'wr_evil.wr_members and public.wr_members are the same table under different names',
+    ],
+    answer: 1,
+    explain: "Proven above: the function's RETURNING output showed a plausible row, wr_evil.wr_members held the real insert, and public.wr_members's count for that exact user/tenant was 0 -- the write silently never reached the real table at all.",
+  },
+  {
+    q: 'A real signup POST to `/auth/v1/signup` returned `HTTP 500 {"msg":"Database error saving new user"}`, and the GoTrue log for that request showed `permission denied for table wr_profiles (SQLSTATE 42501)`, coming from an `after insert on auth.users` trigger with no `security definer`. Why does this one bug have a wider blast radius than the others in this review?',
+    options: [
+      "It doesn't -- it only affects the profiles feature, same as any other bug here",
+      'It runs on every single signup for every user, regardless of which feature they are using -- a permission bug in a trigger written for "the new profiles feature" breaks the ability for anyone at all to create an account',
+      'It only affects users who already have a wr_profiles row',
+      'This error is unrelated to the trigger and is a random flake',
+    ],
+    answer: 1,
+    explain: 'Proven above: the exact signup request that has nothing to do with tenants, projects, or profiles directly still failed with 500, because the trigger fires unconditionally on auth.users -- fixed below by adding security definer set search_path = \'\', with the identical signup then succeeding and a real row landing in wr_profiles.',
+  },
+  {
+    q: 'Reading the identical `created_by = auth.uid()` filter on a real 50,000-row table gave `Execution Time: 18.634 ms` unwrapped versus `3.569 ms` wrapped in `(select auth.uid())`, with an `InitPlan` appearing only in the wrapped plan. What does the InitPlan represent?',
+    options: [
+      'A caching layer added by PostgREST, unrelated to the SQL itself',
+      'auth.uid() being computed exactly once, before the row scan starts, and its result reused for every row -- versus being re-evaluated as part of the per-row Filter expression in the unwrapped version',
+      'An index that only the wrapped version uses',
+      'A network round-trip saved by the wrapped version',
+    ],
+    answer: 1,
+    explain: 'Proven directly above with real explain analyze output: the wrapped plan shows "InitPlan 1 -> Result (... rows=1 loops=1)" computed once, then "Filter: (created_by = (InitPlan 1).col1)" reusing it -- versus the unwrapped plan\'s Filter calling current_setting() as part of evaluating every one of the 50,000 rows.',
+  },
+];
+
+<Quiz client:visible id="reading-supabase/worked-review-1" questions={quizWorkedReview1} />
+
+<ProgressTracker client:visible id="reading-supabase/worked-review-1" />

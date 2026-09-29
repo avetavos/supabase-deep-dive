@@ -1,0 +1,763 @@
+---
+title: 'Worked review 1: แอป SaaS multi-tenant'
+description: 'migration set, RLS policy และ invite RPC ที่ AI สร้างให้แอป SaaS แบบ multi-tenant -- รีวิวทีละบั๊กกับ 42501 จริง, cross-tenant hijack จริง, การเขียนข้อมูลผิดที่จาก schema injection จริง และผลต่างเวลาแบบ InitPlan จริงบน local Postgres 17.6 stack'
+sidebar:
+  order: 4
+---
+
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import Mermaid from '../../../../components/Mermaid.astro';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## ฟีเจอร์
+
+prompt ที่ให้ไปคือ: *"เพิ่ม multi-tenant support: tenants, members และ projects ที่ scope ตาม tenant พร้อม RLS ให้ user เห็นแต่ข้อมูล tenant ตัวเอง บวก RPC สำหรับเชิญเพื่อนร่วมทีมด้วย email"* สิ่งที่ตามมาคือ draft แรกแบบที่ AI assistant มักส่งกลับมาให้ตาม prompt นี้เป๊ะ -- ทุก table สร้างได้, ทุก policy syntax ถูกต้อง, RPC compile ผ่าน และ manual test เร็ว ๆ ในฐานะ tenant owner ก็ทำงานได้จริง อ่านมันแบบที่ **[review checklist](/supabase/th/reading-supabase/review-checklist/)** แนะนำ: schema กับ RLS ก่อน แล้วค่อย roles กับ keys แล้วค่อย client calls มันมี **บั๊กจริง 10 ตัว** -- มากกว่าตัวอย่าง worked review ทั่วไปของ catalog โดยตั้งใจ เพราะแอปทรงนี้ (multi-tenant SaaS) คือที่ที่ความผิดพลาดแบบเดียวกันทบต้นข้าม table ได้ ดูที่ **[AI bug catalog](/supabase/th/reading-supabase/ai-bug-catalog/)** สำหรับ pattern ทั่วไปเบื้องหลังส่วนใหญ่ (บั๊ก 1, 2, 4, 5, 6, 7, 8, 12/13 มี entry ตรงใน catalog อยู่แล้ว; สองตัวเป็นเรื่องเฉพาะของ multi-tenancy ที่โผล่ครั้งแรกที่นี่) ทุกข้อกล่าวอ้างด้านล่างถูกพิสูจน์บน local stack ของคอร์สนี้เอง (โปรเจกต์ `probe`, `supabase status --workdir tools/probe`, Postgres 17.6.x) -- `curl` จริงยิง PostgREST กับ GoTrue ด้วย local JWT จริง, session `psql` จริง และ output `explain analyze` จริงบน table 50,000 แถว
+
+## โค้ดที่ AI สร้าง
+
+```sql
+-- reading-supabase/worked-review-1/tenants-migration.sql -- as generated, see review below
+create table public.wr_tenants (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  created_at timestamptz not null default now()
+);
+
+create table public.wr_members (
+  tenant_id uuid not null references public.wr_tenants(id),
+  user_id text not null references auth.users(id),
+  role text not null default 'member',
+  primary key (tenant_id, user_id)
+);
+
+create table public.wr_projects (
+  id uuid primary key default gen_random_uuid(),
+  tenant_id uuid not null references public.wr_tenants(id),
+  name text not null,
+  created_by uuid references auth.users(id),
+  created_at timestamptz not null default now()
+);
+
+alter table public.wr_projects enable row level security;
+
+create policy wr_projects_select on public.wr_projects
+  for select
+  using (
+    tenant_id = (
+      select (raw_user_meta_data->>'tenant_id')::uuid
+      from auth.users where id = auth.uid()
+    )
+  );
+
+create policy wr_projects_update on public.wr_projects
+  for update using (true);
+-- no insert policy was ever written
+
+create or replace function public.wr_invite_member(p_tenant_id uuid, p_email text, p_role text default 'member')
+returns public.wr_members
+language plpgsql
+security definer
+as $$
+declare
+  v_user_id uuid;
+  v_result public.wr_members;
+begin
+  select id into v_user_id from auth.users where email = p_email;
+  if v_user_id is null then
+    raise exception 'no such user: %', p_email;
+  end if;
+  insert into wr_members (tenant_id, user_id, role) values (p_tenant_id, v_user_id, p_role)
+  returning * into v_result;
+  return v_result;
+end;
+$$;
+grant execute on function public.wr_invite_member(uuid, text, text) to authenticated;
+
+create or replace function public.wr_handle_new_user()
+returns trigger
+language plpgsql
+as $$
+begin
+  insert into public.wr_profiles (id, display_name) values (new.id, new.email);
+  return new;
+end;
+$$;
+
+create trigger wr_on_auth_user_created
+  after insert on auth.users
+  for each row execute function public.wr_handle_new_user();
+```
+
+```typescript
+// reading-supabase/worked-review-1/tenant-client.ts -- as generated, see review below
+import { createClient } from '@supabase/supabase-js';
+
+// AI comment: "service_role bypasses RLS so tenant switching always works"
+export const supabase = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!,
+);
+
+export async function getFirstProject(tenantId: string) {
+  const { data } = await supabase
+    .from('wr_projects')
+    .select('*')
+    .eq('tenant_id', tenantId)
+    .single();
+  return data;
+}
+```
+
+## เดินรีวิวทีละจุด
+
+### `user_id text` อ้างอิง `auth.users(id)` — migration รันไม่ได้ตั้งแต่ต้น
+
+`auth.users.id` เป็น `uuid` การประกาศ `wr_members.user_id` เป็น `text` แล้วชี้ foreign key ไปหามัน ถูกปฏิเสธก่อนที่จะมีแถวไหนถูกเขียนเลยด้วยซ้ำ -- พิสูจน์ด้วย `create table` จริง:
+
+```sql
+-- @expect-error foreign key constraint "wr_members_user_id_fkey" cannot be implemented
+create table public.wr_members (
+  tenant_id uuid not null references public.wr_tenants(id),
+  user_id text not null references auth.users(id),
+  role text not null default 'member',
+  primary key (tenant_id, user_id)
+);
+```
+
+```text
+ERROR:  foreign key constraint "wr_members_user_id_fkey" cannot be implemented
+DETAIL:  Key columns "user_id" and "id" are of incompatible types: text and uuid.
+```
+
+<SpotTheBug lang="sql" code={`user_id text not null references auth.users(id),`}>
+นี่คือบั๊กเดียวในรีวิวนี้ที่ไม่มีวันไปถึง production -- Postgres ปฏิเสธการสร้าง constraint ไปเลย ทำให้ `supabase db push`/`--apply` fail ดัง ๆ ใน CI ก่อนที่ RLS policy, RPC หรือ client call ไหน ๆ จะถูกเขียนถึง table นี้ด้วยซ้ำ ใส่ไว้ในรีวิวนี้เพราะมันเป็นนิสัยของ AI ที่พบบ่อยจริง ๆ: ใช้ `text` เป็น default กับทุกคอลัมน์ที่หน้าตาเป็น id แทนที่จะ match กับ primary key type จริงของ table ที่อ้างถึง (`auth.users.id` เป็น `uuid` เสมอ) วิธีแก้คือ `user_id uuid not null references auth.users(id) on delete cascade` -- type ตรงกัน และดูบั๊กถัดไปว่าทำไม `on delete cascade` ถึงสำคัญด้วย
+</SpotTheBug>
+
+### ไม่มี `on delete cascade` — ลบ tenant แล้ว fail ทันที
+
+ไม่มี foreign key ไหนใน schema ที่ AI สร้างระบุ `on delete cascade` เลย Postgres เลย default เป็น `no action` พิสูจน์ด้วยการลอง delete tenant ที่มี project อยู่แล้ว:
+
+```sql
+-- ran directly against this review's schema, see output below
+delete from public.wr_tenants where id = '11111111-1111-1111-1111-111111111111';
+```
+
+```text
+ERROR:  update or delete on table "wr_tenants" violates foreign key constraint "wr_projects_tenant_id_fkey" on table "wr_projects"
+DETAIL:  Key (id)=(11111111-1111-1111-1111-111111111111) is still referenced from table "wr_projects".
+```
+
+<SpotTheBug lang="sql" code={`tenant_id uuid not null references public.wr_tenants(id),`}>
+"ลบ tenant แล้ว fail ดัง ๆ" ฟังดูเหมือน safety feature จนกว่าจะเป็น code path เดียวที่ support engineer ต้องรีบทำภายใต้ความกดดันเวลา -- และ `on delete cascade` ที่หายไปแบบเดียวกันบน `wr_members.tenant_id`/`user_id` หมายความว่าการลบ user account ตัวเดียว (`auth.admin.deleteUser`) จะทิ้ง membership row ที่กำพร้าไว้เงียบ ๆ แทน ซึ่งอันตรายกว่าในทิศทางตรงข้าม วิธีแก้คือใส่ `on delete cascade` บนทุก foreign key ที่ scope ตาม tenant อย่างตั้งใจ (ลบ tenant แล้ว member กับ project ของมันหายไปด้วย) แทนที่จะปล่อยไว้ที่ default ของ Postgres
+</SpotTheBug>
+
+### เช็ค tenant ด้วยการอ่าน `auth.users` ตรง ๆ — policy มองไม่เห็นแถวไหนเลย ไม่ว่าใครก็ตาม
+
+policy `select` ที่ AI สร้างบน `wr_projects` อ่าน `auth.users.raw_user_meta_data` เพื่อหา tenant ของผู้เรียก `auth.users` เป็นของ `supabase_auth_admin`; ทั้ง `anon` และ `authenticated` ไม่ได้รับสิทธิ์อะไรบนมันเลย -- ยืนยันตรง ๆ:
+
+```sql
+-- ran directly against this review's schema, see output below
+select grantee, privilege_type from information_schema.role_table_grants
+where table_schema = 'auth' and table_name = 'users' and grantee in ('anon', 'authenticated', 'service_role');
+```
+
+```text
+(0 rows)
+```
+
+พิสูจน์ด้วย request จริงในฐานะ member จริงของ tenant Globex ที่กำลังอ่าน project ของ tenant ตัวเอง:
+
+```bash
+# scripts/reading-supabase/worked-review-1/select-as-member.sh
+curl -s "$SUPABASE_URL/rest/v1/wr_projects?select=name,tenant_id" \
+  -H "apikey: $SUPABASE_ANON_KEY" -H "Authorization: Bearer $BOB_TOKEN"
+```
+
+```text
+{"code":"42501","details":null,"hint":"Grant the required privileges to the current role with: GRANT SELECT ON auth.users TO authenticated;","message":"permission denied for table users"}
+```
+
+<SpotTheBug lang="sql" code={`using (
+  tenant_id = (
+    select (raw_user_meta_data->>'tenant_id')::uuid
+    from auth.users where id = auth.uid()
+  )
+)`}>
+มีปัญหาแยกกันสองอย่างซ้อนอยู่ใน clause เดียว อย่างแรก อันที่พิสูจน์ไว้ข้างบน: `authenticated` ไม่มี grant อะไรเลยบน `auth.users` ในโปรเจกต์ Supabase มาตรฐาน ดังนั้น policy นี้ปฏิเสธ**ทุกคน**ที่เรียก ตลอดเวลา -- ไม่ใช่ "tenant ผิด" แต่คือ `42501` แข็ง ๆ บน query ที่ไม่ทันได้ไปถึงขั้น RLS filter ด้วยซ้ำ อย่างที่สอง ต่อให้ข้ามเรื่อง permission error ไป `raw_user_meta_data` ก็คือสิ่งที่ `supabase.auth.updateUser({ data: { ... } })` เขียนพอดี -- ผู้เรียกตั้ง `tenant_id` ของตัวเองเป็นค่าอะไรก็ได้ตามใจ ดังนั้นแม้แต่เวอร์ชัน `security definer` ของ query เดียวกันนี้ก็จะยอมให้ user self-assign membership เข้า tenant ไหนก็ได้ วิธีแก้คือ table `wr_members` เฉพาะที่เป็น single source of truth ของ tenant membership เช็คผ่าน helper `security definer` (`wr_is_member(tenant_id)`) -- ไม่ใช้ metadata ของ `auth.users` สำหรับการตัดสินใจเรื่อง authorization เด็ดขาด
+</SpotTheBug>
+
+### `using (true)` ทั้ง `select` และ `update` ไม่มี `with check` — cross-tenant hijack เต็มรูปแบบ
+
+table `wr_members` ที่ AI สร้าง (ไม่ได้โชว์ด้านบน -- สร้างเหมือน `wr_projects` เป๊ะ `select`/`update` เป็น `using (true)` ทั้งคู่) ทำผิดพลาดแบบเดียวกับที่ catalog บั๊ก 5 อธิบายไว้ แต่ข้าม tenant แทนที่จะข้ามแค่แถวใน table เดียว พิสูจน์ด้วย `PATCH` ข้าม tenant จริง: Alice (owner ของ Acme, tenant `1111…`) ย้าย membership row ของ Bob เองจาก Globex เข้ามาที่ tenant ของตัวเอง เป็น owner:
+
+```bash
+# scripts/reading-supabase/worked-review-1/hijack-membership.sh
+curl -s -w "\nHTTP=%{http_code}\n" -X PATCH "$SUPABASE_URL/rest/v1/wr_members?user_id=eq.$BOB_ID" \
+  -H "apikey: $SUPABASE_ANON_KEY" -H "Authorization: Bearer $ALICE_TOKEN" \
+  -H "Content-Type: application/json" -H "Prefer: return=representation" \
+  -d '{"tenant_id":"11111111-1111-1111-1111-111111111111","role":"owner"}'
+```
+
+```text
+[{"tenant_id":"11111111-1111-1111-1111-111111111111","user_id":"911ac6cd-81d5-428a-ab9b-d303f6cb60dd","role":"owner"}]
+HTTP=200
+```
+
+ยืนยันฝั่ง server ในฐานะ `postgres`: แถวจริงของ Bob (ไม่มี `SQLSTATE` ไม่มี error ตรงไหนใน chain นี้เลย) ตอนนี้มี `tenant_id` เป็น Acme -- Alice ให้สิทธิ์ตัวเอง และเอา Bob ออกจากบริษัทของเขาเอง ด้วย `PATCH` request เดียวที่ไม่ได้พูดถึง tenant ของ Bob เลยแม้แต่คำเดียว
+
+<SpotTheBug lang="sql" code={`create policy wr_members_select on public.wr_members
+  for select using (true);
+
+create policy wr_members_update on public.wr_members
+  for update using (true);
+-- no with check -- reused from using(true), so it is also true`}>
+`select using (true)` อ่านได้ว่า "team directory มองเห็นได้ทุกคน" -- เป็นทางเลือกที่ดูสมเหตุสมผล อาจถึงขั้นตั้งใจ แต่พอจับคู่กับ `update using (true)` และไม่มี `with check` มันไม่ใช่เรื่อง visibility อีกต่อไป กลายเป็น "authenticated user คนไหนก็ได้ ใน tenant ไหนก็ได้ เขียน membership row ไหนให้เป็นรูปร่างอะไรก็ได้" -- พิสูจน์ไว้ข้างบนด้วยการ reassign แถวที่ Alice ไม่มีความสัมพันธ์อะไรด้วยเลยจริง ๆ วิธีแก้ด้านล่างไม่ใช่การเขียน `using` clause ให้แคบลงบน `update` -- แต่คือ**ไม่มี update policy ทั่วไปบน table นี้เลย**: การเปลี่ยน role กับ tenant ต้องอยู่หลัง RPC ที่เช็คสิทธิ์ (คู่ที่เหมาะกับ `wr_invite_member` คือ `wr_set_member_role` ที่ gate ด้วยเงื่อนไขว่าผู้เรียกต้องเป็น `owner` อยู่แล้ว) ไม่ใช่ update ทั้ง row แบบเหมารวมเด็ดขาด
+</SpotTheBug>
+
+### `security definer` RPC ไม่มี `set search_path = ''` — insert ไปลงที่ table ของผู้โจมตีเงียบ ๆ
+
+`wr_invite_member` เป็น `security definer` ไม่มี `set search_path` owner ของ function (`postgres`) ไม่แตะ schema ไหนนอกจาก `public` เลย -- แต่ `search_path` ของ session **ฝั่งผู้เรียก** ต่างหากที่ resolve การอ้างอิง `wr_members` แบบไม่ qualify schema ของ function ตอนเรียกจริง:
+
+```sql
+-- ran directly against this review's schema, see output below
+create schema wr_evil;
+create table wr_evil.wr_members (tenant_id uuid, user_id uuid, role text);
+set search_path to wr_evil, public;
+select public.wr_invite_member('11111111-1111-1111-1111-111111111111', 'wr+bob@example.com', 'owner');
+select * from wr_evil.wr_members;
+select count(*) as real_table_untouched from public.wr_members
+  where user_id = '911ac6cd-81d5-428a-ab9b-d303f6cb60dd' and tenant_id = '11111111-1111-1111-1111-111111111111';
+```
+
+```text
+current_setting
+-----------------
+wr_evil, public
+
+                                 wr_invite_member
+-----------------------------------------------------------------------------------
+ (11111111-1111-1111-1111-111111111111,911ac6cd-81d5-428a-ab9b-d303f6cb60dd,owner)
+(1 row)
+
+ tenant_id | user_id | role
+-----------+---------+------
+ 1111...   | 911a... | owner
+
+ real_table_untouched
+-----------------------
+                     0
+```
+
+`returning *` ของ function เองรายงานว่าสำเร็จ -- แถวที่หน้าตาถูกต้องเป๊ะ -- ในขณะที่ `insert` จริง (และแถวที่มันคืนมา) ทั้งคู่ resolve ไปที่ `wr_evil.wr_members` ไม่ใช่ table จริง `public.wr_members` ไม่ได้รับการเขียนนี้เลยแม้แต่นิดเดียว
+
+<SpotTheBug lang="sql" code={`create or replace function public.wr_invite_member(p_tenant_id uuid, p_email text, p_role text default 'member')
+returns public.wr_members
+language plpgsql
+security definer
+as $$
+declare
+  v_user_id uuid;
+  v_result public.wr_members;
+begin
+  select id into v_user_id from auth.users where email = p_email;
+  insert into wr_members (tenant_id, user_id, role) values (p_tenant_id, v_user_id, p_role)
+  returning * into v_result;
+  return v_result;
+end;
+$$;`}>
+นี่คือฝาแฝดฝั่งเขียนของ [entry 7 ใน AI bug catalog](/supabase/th/reading-supabase/ai-bug-catalog/) (ที่รั่วข้อมูลตอนอ่าน) -- ที่นี่ `set search_path = ''` ที่หายไปตัวเดียวกันทำให้**การเขียนถูกเบี่ยงเงียบ ๆ** ซึ่งแย่กว่า: ไม่มีอะไรใน response ของ RPC ดูผิดปกติเลย ทำให้ไม่มีใคร review response แล้วจะสังเกตได้ว่า membership table จริงไม่เคยถูกแตะเลย วิธีแก้คือ `set search_path = ''` บวกกับ qualify schema ทุกจุดที่อ้างอิง (`public.wr_members`) พิสูจน์ด้านล่างว่า attacker `search_path` เดิมเป๊ะ ๆ ลงไปที่ table จริงได้ไม่ว่าจะยังไง
+</SpotTheBug>
+
+### เปิด RLS แล้วแต่ไม่มี `insert` policy บน `wr_projects`
+
+`wr_projects` มี `select` กับ `update` policy; ไม่มีใครเขียนของ `insert` เลย พิสูจน์ด้วย member จริงของ Acme ที่พยายามสร้าง project ของ tenant ตัวเอง:
+
+```bash
+# scripts/reading-supabase/worked-review-1/insert-no-policy.sh
+curl -s -w "\nHTTP=%{http_code}\n" -X POST "$SUPABASE_URL/rest/v1/wr_projects" \
+  -H "apikey: $SUPABASE_ANON_KEY" -H "Authorization: Bearer $ALICE_TOKEN" \
+  -H "Content-Type: application/json" -H "Prefer: return=representation" \
+  -d '{"tenant_id":"11111111-1111-1111-1111-111111111111","name":"acme-new-project","created_by":"e0d41eff-5ce4-48ac-b48c-2fa3722d230d"}'
+```
+
+```text
+{"code":"42501","details":null,"hint":null,"message":"new row violates row-level security policy for table \"wr_projects\""}
+HTTP=403
+```
+
+<SpotTheBug lang="sql" code={`alter table public.wr_projects enable row level security;
+create policy wr_projects_select on public.wr_projects for select using (...);
+create policy wr_projects_update on public.wr_projects for update using (true);
+-- no insert policy was ever written`}>
+ตรงกับ [ai-bug-catalog entry 4](/supabase/th/reading-supabase/ai-bug-catalog/) เป๊ะ -- ช่องโหว่ RLS ที่พบบ่อยที่สุด เพราะ `select` คือสิ่งแรกที่ทุกคน test ด้วยมือ ส่วน `insert` แทบไม่มีใคร test จนกว่า user จริงจะกด "Create project" บน UI วิธีแก้คือ policy หนึ่งอันต่อหนึ่งคำสั่งที่ table ต้องใช้จริง: `for insert with check ( public.wr_is_member(tenant_id) )`
+</SpotTheBug>
+
+### key `service_role` ถูกใส่เข้าไปใน client module ตรง ๆ
+
+`tenant-client.ts` สร้าง `createClient` ด้วย `SUPABASE_SERVICE_ROLE_KEY` พร้อม comment ให้เหตุผลว่าเป็นทางแก้ให้ "tenant switching" พิสูจน์ด้วย key เดียวกันเป๊ะ กับ `select *` ข้ามทุก tenant ไม่มีการ scope `Authorization` เลย:
+
+```bash
+# scripts/reading-supabase/worked-review-1/service-role-bypass.sh
+curl -s "$SUPABASE_URL/rest/v1/wr_projects?select=name,tenant_id" \
+  -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY"
+```
+
+```text
+[{"name":"acme-roadmap","tenant_id":"11111111-1111-1111-1111-111111111111"},
+ {"name":"globex-roadmap","tenant_id":"22222222-2222-2222-2222-222222222222"}]
+```
+
+<SpotTheBug lang="ts" code={`export const supabase = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!,
+);`}>
+`service_role` bypass RLS ทั้งหมด -- พิสูจน์ไว้ข้างบนว่าคืน project ของทั้งสอง tenant ในการเรียกครั้งเดียว ไม่มี policy ไหนถูกประเมินเลย "tenant switching always works" เป็นจริง และนั่นคือปัญหาทั้งหมด: มันทำงานเพราะไม่เหลือ boundary ของ tenant ให้ switch *ระหว่าง* กันแล้ว ถ้า `tenant-client.ts` ไปอยู่ใน browser (หรือ code path ไหนก็ตามที่ traffic ของ end user ไปถึง) ข้อมูลของทุก tenant ก็ไปด้วย วิธีแก้คือ key `anon` บวกกับ JWT ของผู้เรียกจริงในทุก client ที่ไม่ใช่ trusted server context -- `service_role` อยู่ฝั่ง server เท่านั้น ตาม [ai-bug-catalog entry 25](/supabase/th/reading-supabase/ai-bug-catalog/)
+</SpotTheBug>
+
+### `.single()` บน query ที่คืนศูนย์แถวได้อย่างถูกต้องตามปกติ
+
+`getFirstProject` เรียก `.single()` -- ซึ่งขอ PostgREST ด้วย `Accept: application/vnd.pgrst.object+json` -- กับ tenant ที่ยังไม่มี project เลย พิสูจน์ตรง ๆ:
+
+```bash
+# scripts/reading-supabase/worked-review-1/single-empty.sh
+curl -s -w "\nHTTP=%{http_code}\n" "$SUPABASE_URL/rest/v1/wr_projects?select=*&name=eq.does-not-exist" \
+  -H "apikey: $SUPABASE_ANON_KEY" -H "Authorization: Bearer $ALICE_TOKEN" \
+  -H "Accept: application/vnd.pgrst.object+json"
+```
+
+```text
+{"code":"PGRST116","details":"The result contains 0 rows","hint":null,"message":"Cannot coerce the result to a single JSON object"}
+HTTP=406
+```
+
+<SpotTheBug lang="ts" code={`const { data } = await supabase
+  .from('wr_projects')
+  .select('*')
+  .eq('tenant_id', tenantId)
+  .single();
+return data;`}>
+`.single()` compile ผ่านสะอาดและทำงานได้ทุก happy path -- บั๊กทั้งหมดอยู่ที่มันทำอะไรกับ tenant ใหม่เอี่ยมที่ยังไม่มี project เลย ซึ่งตรงกับ [ai-bug-catalog entry 13](/supabase/th/reading-supabase/ai-bug-catalog/) เป๊ะ: `406`/`PGRST116` จริง และ -- เพราะ `error` ถูก destructure ทิ้งไปด้วยที่นี่ -- เป็น error ที่ไม่ถูกจับด้วย วิธีแก้คือ `.maybeSingle()` (คืน `data: null` เมื่อศูนย์แถว ไม่มี error) เมื่อศูนย์แถวเป็นผลลัพธ์ที่ถูกต้องได้ บวกกับเช็ค `error` ไม่ว่าจะทางไหน
+</SpotTheBug>
+
+### `auth.uid()` ไม่ถูก wrap — พิสูจน์ด้วย `explain analyze` จริงบน 50,000 แถว
+
+iteration หลังของ schema นี้เพิ่ม activity log, `wr_activity_perf`, ด้วย `for select using ( created_by = auth.uid() )` -- ไม่ wrap table 50,000 แถวเดียวกัน, JWT claim เดียวกัน, ไม่ wrap เทียบกับ wrap ใน `(select auth.uid())`:
+
+```text
+-- unwrapped: auth.uid() re-evaluated once per row via current_setting()
+Seq Scan on wr_activity_perf  (actual time=0.007..17.032 rows=50000 loops=1)
+  Filter: (created_by = (COALESCE(NULLIF(current_setting('request.jwt.claim.sub', true), ''), ...))::uuid)
+Execution Time: 18.634 ms
+
+-- wrapped in (select auth.uid()): computed once as an InitPlan, reused for every row
+InitPlan 1
+  ->  Result  (actual time=0.002..0.003 rows=1 loops=1)
+Seq Scan on wr_activity_perf  (actual time=0.009..2.424 rows=50000 loops=1)
+  Filter: (created_by = (InitPlan 1).col1)
+Execution Time: 3.569 ms
+```
+
+ประมาณ **5.2 เท่า** บน table เดียวกันเป๊ะ กับ Mac เครื่องเดียวกันเป๊ะ -- พิสูจน์รูปแบบเดียวกับ [ai-bug-catalog entry 6](/supabase/th/reading-supabase/ai-bug-catalog/) ทำซ้ำที่นี่เพราะ table activity/audit คือจุดที่แอป multi-tenant สะสมจำนวนแถวจนช่องว่างนี้เห็นชัดพอดี
+
+<SpotTheBug lang="sql" code={`create policy wr_activity_perf_unwrapped on public.wr_activity_perf
+  for select using ( created_by = auth.uid() );`}>
+วิธีแก้คือวงเล็บล้วน ๆ: `using ( created_by = (select auth.uid()) )` -- ไม่มีอะไรอื่นใน policy เปลี่ยนเลย แล้ว planner ก็เปลี่ยนการเรียก function ต่อแถวให้กลายเป็น `InitPlan` ครั้งเดียว
+</SpotTheBug>
+
+### profile trigger บน `auth.users` ไม่มี `security definer`
+
+`wr_handle_new_user()` insert เข้า `public.wr_profiles` ทุกครั้งที่มีการ signup ใหม่ แต่ไม่ใช่ `security definer` การ insert เข้า `auth.users` ทำโดย `supabase_auth_admin` (role ของ GoTrue เอง) -- ซึ่งไม่มี grant อะไรบน `public.wr_profiles` เลย พิสูจน์ด้วยการ signup จริง:
+
+```bash
+# scripts/reading-supabase/worked-review-1/signup-broken-trigger.sh
+curl -s -w "\nHTTP=%{http_code}\n" -X POST "$SUPABASE_URL/auth/v1/signup" \
+  -H "apikey: $SUPABASE_ANON_KEY" -H "Content-Type: application/json" \
+  -d '{"email":"wr+carol@example.com","password":"wr-Passw0rd!"}'
+```
+
+```text
+{"code":500,"error_code":"unexpected_failure","msg":"Database error saving new user","error_id":"e4f8a3db-653a-476d-927c-9ca46c758014"}
+HTTP=500
+```
+
+error จริงเบื้องหลัง จาก log ของ `supabase_auth_probe` เองสำหรับ `request_id` นั้น:
+
+```text
+error: failed to close prepared statement: ERROR: current transaction is aborted, commands ignored until end of transaction block (SQLSTATE 25P02): ERROR: permission denied for table wr_profiles (SQLSTATE 42501)
+```
+
+<SpotTheBug lang="sql" code={`create or replace function public.wr_handle_new_user()
+returns trigger
+language plpgsql
+as $$
+begin
+  insert into public.wr_profiles (id, display_name) values (new.id, new.email);
+  return new;
+end;
+$$;`}>
+นี่คือบั๊กเดียวในรีวิวนี้ที่ blast radius กว้างที่สุด: trigger บน `auth.users` รันบน**ทุก**การ signup ดังนั้นนี่ไม่ใช่ "ฟีเจอร์ profile ใหม่พัง" -- แต่คือ "ไม่มีใคร signup ได้อีกต่อไป" outage เต็มรูปแบบจาก function ที่หน้าตาธรรมดาที่สุด `security definer` คือทางแก้ที่ตรงจุด (function จะรันด้วยสิทธิ์ของ owner คือ `postgres`) -- พิสูจน์ด้านล่างด้วย signup เดิมเป๊ะที่สำเร็จทันทีที่เพิ่มเข้าไป พร้อมกับ `set search_path = ''` เพราะโครงสร้างนี้เป็นบั๊กประเภทเดียวกับ RPC ด้านบนเป๊ะ
+</SpotTheBug>
+
+## โค้ดที่แก้แล้ว
+
+```sql
+-- supabase/migrations/7401_wr_saas_schema.sql
+create table public.wr_tenants (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  created_at timestamptz not null default now()
+);
+
+create table public.wr_members (
+  tenant_id uuid not null references public.wr_tenants(id) on delete cascade,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  role text not null default 'member',
+  primary key (tenant_id, user_id)
+);
+
+create table public.wr_projects (
+  id uuid primary key default gen_random_uuid(),
+  tenant_id uuid not null references public.wr_tenants(id) on delete cascade,
+  name text not null,
+  created_by uuid references auth.users(id) on delete set null,
+  created_at timestamptz not null default now()
+);
+
+create table public.wr_profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  display_name text
+);
+
+-- security definer + search_path pinned: the ONLY place membership is checked from
+create or replace function public.wr_is_member(p_tenant_id uuid)
+returns boolean
+language sql
+security definer
+set search_path = ''
+stable
+as $$
+  select exists (
+    select 1 from public.wr_members m
+    where m.tenant_id = p_tenant_id and m.user_id = auth.uid()
+  );
+$$;
+
+create or replace function public.wr_invite_member(p_tenant_id uuid, p_email text, p_role text default 'member')
+returns public.wr_members
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_user_id uuid;
+  v_result public.wr_members;
+begin
+  if not public.wr_is_member(p_tenant_id) then
+    raise exception 'not a member of this tenant';
+  end if;
+  select id into v_user_id from auth.users where email = p_email;
+  if v_user_id is null then
+    raise exception 'no such user: %', p_email;
+  end if;
+  insert into public.wr_members (tenant_id, user_id, role) values (p_tenant_id, v_user_id, p_role)
+  returning * into v_result;
+  return v_result;
+end;
+$$;
+grant execute on function public.wr_invite_member(uuid, text, text) to authenticated;
+
+create or replace function public.wr_handle_new_user()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  insert into public.wr_profiles (id, display_name) values (new.id, new.email);
+  return new;
+end;
+$$;
+
+create trigger wr_on_auth_user_created
+  after insert on auth.users
+  for each row execute function public.wr_handle_new_user();
+
+alter table public.wr_tenants enable row level security;
+alter table public.wr_members enable row level security;
+alter table public.wr_projects enable row level security;
+alter table public.wr_profiles enable row level security;
+
+create policy wr_members_select on public.wr_members
+  for select using ( public.wr_is_member(tenant_id) );
+-- deliberately no general update policy -- role/tenant changes only via wr_invite_member
+
+create policy wr_projects_select on public.wr_projects
+  for select using ( public.wr_is_member(tenant_id) );
+
+create policy wr_projects_insert on public.wr_projects
+  for insert with check ( public.wr_is_member(tenant_id) );
+
+create policy wr_projects_update on public.wr_projects
+  for update
+  using ( public.wr_is_member(tenant_id) )
+  with check ( public.wr_is_member(tenant_id) );
+
+create policy wr_profiles_select on public.wr_profiles
+  for select using ( id = (select auth.uid()) );
+```
+
+```ts
+// src/reading-supabase/worked-review-1/tenant-isolation.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+const url = process.env.SUPABASE_URL!;
+const anonKey = process.env.SUPABASE_ANON_KEY!;
+const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+const admin = createClient(url, serviceKey);
+const stamp = Date.now();
+
+async function makeTenantAndOwner(tenantName: string, email: string) {
+  const { data: tenant, error: tErr } = await admin
+    .from('wr_tenants')
+    .insert({ name: tenantName })
+    .select()
+    .single();
+  if (tErr) throw tErr;
+
+  const { data: created, error: uErr } = await admin.auth.admin.createUser({
+    email,
+    password: 'wr-Passw0rd!',
+    email_confirm: true,
+  });
+  if (uErr) throw uErr;
+
+  const { error: mErr } = await admin
+    .from('wr_members')
+    .insert({ tenant_id: tenant.id, user_id: created.user.id, role: 'owner' });
+  if (mErr) throw mErr;
+
+  // A fresh, throwaway client for sign-in -- calling signInWithPassword on
+  // `admin` itself would swap ITS session to this user's, so every later
+  // admin.from(...) call would run as that user (RLS-scoped), not service_role.
+  const signInClient = createClient(url, anonKey);
+  const { data: signIn, error: sErr } = await signInClient.auth.signInWithPassword({
+    email,
+    password: 'wr-Passw0rd!',
+  });
+  if (sErr) throw sErr;
+
+  return { tenant, userId: created.user.id, token: signIn.session!.access_token };
+}
+
+async function main() {
+  const acme = await makeTenantAndOwner('wr-run-acme', `wr+run-alice-${stamp}@example.com`);
+  const globex = await makeTenantAndOwner('wr-run-globex', `wr+run-bob-${stamp}@example.com`);
+
+  await admin.from('wr_projects').insert([
+    { tenant_id: acme.tenant.id, name: 'acme-roadmap', created_by: acme.userId },
+    { tenant_id: globex.tenant.id, name: 'globex-roadmap', created_by: globex.userId },
+  ]);
+
+  const aliceClient = createClient(url, anonKey, {
+    global: { headers: { Authorization: `Bearer ${acme.token}` } },
+  });
+  const bobClient = createClient(url, anonKey, {
+    global: { headers: { Authorization: `Bearer ${globex.token}` } },
+  });
+
+  const { data: aliceSees } = await aliceClient.from('wr_projects').select('name');
+  const { data: bobSees } = await bobClient.from('wr_projects').select('name');
+
+  if (aliceSees?.length !== 1 || aliceSees[0].name !== 'acme-roadmap') {
+    throw new Error(`isolation broken: alice saw ${JSON.stringify(aliceSees)}`);
+  }
+  if (bobSees?.length !== 1 || bobSees[0].name !== 'globex-roadmap') {
+    throw new Error(`isolation broken: bob saw ${JSON.stringify(bobSees)}`);
+  }
+  console.log('alice sees only', aliceSees.map((p) => p.name));
+  console.log('bob sees only', bobSees.map((p) => p.name));
+
+  const { error: hijackErr, data: hijackData } = await aliceClient
+    .from('wr_members')
+    .update({ tenant_id: acme.tenant.id, role: 'owner' })
+    .eq('user_id', globex.userId)
+    .select();
+  if (hijackErr) throw hijackErr;
+  if (hijackData && hijackData.length > 0) {
+    throw new Error('cross-tenant hijack succeeded -- fix regressed');
+  }
+  console.log('cross-tenant membership hijack correctly blocked, 0 rows matched');
+
+  await admin.auth.admin.deleteUser(acme.userId);
+  await admin.auth.admin.deleteUser(globex.userId);
+  await admin.from('wr_tenants').delete().in('id', [acme.tenant.id, globex.tenant.id]);
+
+  console.log('two-tenant isolation test passed');
+}
+
+main().catch((err) => {
+  console.error(err);
+  throw err;
+});
+```
+
+รันจริงกับ local stack ของคอร์สนี้เอง (`--run` ของ harness ทำซ้ำอันนี้ตอน gate):
+
+```text
+alice sees only [ 'acme-roadmap' ]
+bob sees only [ 'globex-roadmap' ]
+cross-tenant membership hijack correctly blocked, 0 rows matched
+two-tenant isolation test passed
+```
+
+## สิ่งที่เปลี่ยนและทำไม
+
+| # | บั๊ก | ทางแก้ |
+|---|---|---|
+| 1 | `user_id text` อ้างอิง `auth.users(id)` | `user_id uuid` -- ไม่งั้นได้ `ERROR: foreign key constraint ... cannot be implemented` จริง |
+| 2 | ไม่มี `on delete cascade` บน FK ที่ scope ตาม tenant | เพิ่มทั่วทุกจุด -- พิสูจน์แล้ว: ลบ tenant ที่มี project fail ด้วย FK violation จริง |
+| 3 | เช็ค tenant ด้วย `auth.users.raw_user_meta_data` | table `wr_members` เฉพาะ + helper `wr_is_member()` -- พิสูจน์แล้ว: ของเดิมปฏิเสธทุกคนด้วย `42501` เพราะไม่มี grant บน `auth.users` |
+| 4 | `using (true)` บน `select`/`update` ไม่มี `with check` บน `wr_members` | ไม่มี update policy ทั่วไปเลย -- พิสูจน์แล้ว: Alice ย้าย membership row ของ Bob ข้าม tenant ได้ใน `PATCH` เดียว |
+| 5 | `security definer` RPC ไม่มี `set search_path = ''` | `set search_path = ''` + qualify schema -- พิสูจน์แล้ว: attacker `search_path` เบี่ยง insert ไปที่ shadow table ได้เงียบ ๆ ถ้าไม่แก้ |
+| 6 | ไม่มี `insert` policy บน `wr_projects` | `for insert with check ( wr_is_member(tenant_id) )` -- ไม่งั้นได้ `42501` จริง |
+| 7 | key `service_role` อยู่ใน client module | key `anon` + JWT ของผู้เรียก -- พิสูจน์แล้ว: `service_role` คืนข้อมูลทุก tenant ในครั้งเดียว ไม่มี scope เลย |
+| 8 | `.single()` บน query ที่คืนศูนย์แถวได้ | `.maybeSingle()` -- ไม่งั้นได้ `PGRST116`/`406` จริง |
+| 9 | `auth.uid()` ไม่ wrap ใน policy ที่ถูกเรียกบ่อย | `(select auth.uid())` -- พิสูจน์แล้วประมาณ 5.2 เท่า จาก `explain analyze` จริงบน 50,000 แถว |
+| 10 | trigger บน `auth.users` ไม่มี `security definer` | เพิ่มแล้ว -- พิสูจน์แล้ว: ทุก signup fail ด้วย `permission denied for table wr_profiles` ถ้าไม่แก้ |
+
+## สิ่งที่ reviewer เขียนใน PR
+
+> อันนี้ merge ตามสภาพไม่ได้ -- มี 10 เรื่อง จัดกลุ่มตามว่ามันจะกัดตอนไหนจริง ๆ:
+>
+> **deploy ไม่ผ่านด้วยซ้ำ:**
+> 1. `wr_members.user_id text` อ้างอิง `auth.users(id)` (`uuid`) -- `create table` เองก็ fail ใช้ `uuid`
+>
+> **ทำให้ signup พังทุกครั้งทันที:**
+> 2. trigger สร้าง profile บน `auth.users` ไม่ใช่ `security definer` -- นี่คือ outage เต็มรูปแบบ ไม่ใช่บั๊กแค่ฟีเจอร์เดียว เพิ่ม `security definer set search_path = ''`
+>
+> **ข้อมูลรั่ว/เสียหายแบบเงียบ ๆ:**
+> 3. policy เลือก tenant อ่าน `auth.users` ตรง ๆ -- `authenticated` ไม่มี grant บนมันเลย ปฏิเสธ user จริงทุกคนตรง ๆ ใช้ table `wr_members`
+> 4. `wr_members` เป็น `using (true)` ทั้ง `select` และ `update` ไม่มี `with check` -- ผมย้าย member row ของอีก tenant มาพิสูจน์แล้ว ตัด update policy ทิ้ง แล้วเปลี่ยน role/tenant ผ่าน invite RPC เท่านั้น
+> 5. `wr_invite_member` เป็น `security definer` ไม่มี `set search_path` -- ผมเบี่ยง insert ของมันไปที่ shadow table ได้ด้วยแค่เปลี่ยน session `search_path` pin มันซะ
+> 6. `service_role` อยู่ใน `tenant-client.ts` -- ถ้าโค้ดนี้ไปอยู่ตรงไหนที่ traffic ของ user ไปถึง ข้อมูลทุก tenant ก็ไปด้วย
+>
+> **จะ 403/500 กับ user จริงคนแรก:**
+> 7. ไม่มี insert policy บน `wr_projects` -- สร้าง project แล้ว 403
+> 8. `.single()` กับ tenant ที่ไม่มี project เลย -- `406`/`PGRST116` จริง ไม่ถูกจับด้วยเพราะไม่ได้ destructure `error` เลยด้วยซ้ำ
+> 9. ไม่มี `on delete cascade` ที่ไหนเลย -- ลบ tenant จะ fail ใน prod เหมือนที่ fail ที่นี่เป๊ะ
+>
+> **จะช้าลง ไม่ใช่ผิด:**
+> 10. `auth.uid()` ไม่ wrap บน policy ของ activity log -- วันนี้ก็ช้าประมาณ 5 เท่าแล้วที่ 50k แถว แย่ลงเรื่อย ๆ ตามจำนวนแถว wrap มันซะ
+>
+> ยินดี pair ด้วย -- ไม่มีอันไหนต้อง redesign เลย ส่วนใหญ่แค่ย้ายจุดเช็คไปที่ถูกที่
+
+## Mental Model
+
+สามในสิบบั๊กนี้ไม่เคยแสดง error อะไรเลยตอน manual test แบบ happy-path (3, 4, และกรณี `service_role` ของ 7) -- มันดูเหมือนมี access *มากกว่า* ที่ตั้งใจ หรือ access ที่ถูกต้องเป๊ะ จนกว่าจะมีผู้เรียกคนใดคนหนึ่งหรือแถวใดแถวหนึ่งเฉพาะถูกลอง ที่เหลือแบ่งชัดเจนตาม *เวลา* ที่มันโผล่: ตัวหนึ่ง (1) ถูก Postgres เองจับก่อน deploy; สองตัว (2, 10) ถูกต้องแต่ช้าหรือเปราะบางมากกว่าจะผิด; และอีกสี่ตัวที่เหลือ (6, 8, 9 และ trigger ซึ่งคือ 10 ในตาราง) เงียบจนกว่า operation ตรงจุดนั้นจริง ๆ -- การ insert, การ lookup ที่ได้ศูนย์แถว, การลบ tenant, การ signup -- จะไปแตะ path ที่หายไป แอป multi-tenant คูณปัญหานี้ทวีคูณ: ความผิดพลาดแบบไม่มี insert policy ที่เป็นบั๊กเดียวในแอป blog table เดียว กลายเป็นบั๊ก *ต่อ table* และความผิดพลาดแบบใช้ `auth.users` เป็น authorization โผล่ทุกจุดที่เช็คว่า "ผู้เรียกคนนี้อยู่ tenant ไหน" ไม่ใช่แค่ครั้งเดียว
+
+## Trade-offs
+
+- **helper `security definer` อย่าง `wr_is_member()` รวมทุกการเช็ค membership ไว้ที่ function เดียว** -- แลกมาด้วยชั้นอ้อมเพิ่ม: อ่าน `using` clause ของ policy อย่างเดียวไม่บอกเงื่อนไขจริงอีกต่อไป ต้องไปอ่าน helper ด้วย และ RLS ของทุก table ตอนนี้ขึ้นกับ function ตัวนี้ตัวเดียวว่าถูกต้องอยู่เสมอ
+- **การตัด update policy ทั่วไปบน `wr_members` ออกทั้งหมด (ส่งการเปลี่ยน role/tenant ผ่าน `wr_invite_member` เท่านั้น) ปิด cross-tenant hijack ได้สมบูรณ์** -- แลกมาด้วยการเสียความสะดวกของ `PATCH` ธรรมดาสำหรับอะไรก็ตามที่เกี่ยวกับ membership แม้แต่ field ที่ไม่มีพิษภัยที่ฟีเจอร์ในอนาคตอาจอยากให้ member แก้เองได้ นั่นต้องมี policy scope แคบเฉพาะของตัวเอง อย่างตั้งใจ ไม่ใช่ใช้ตัวนี้ซ้ำ
+- **`on delete cascade` บนทุก foreign key ที่ scope ตาม tenant ทำให้การลบ tenant เป็น operation เดียวจบครบ** -- แลกมาด้วยการไม่มีขั้นตอนยืนยันที่ชั้น database เลย: cascade ตัวเดียวกันที่ทำให้ cleanup ง่าย ก็ทำให้ `delete from wr_tenants` ที่พลาดกู้คืนไม่ได้ถ้าไม่มี backup เร็วพอ ๆ กับที่มันสะดวก
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"ถ้า policy compile ผ่านแล้วคืน 200 แปลว่ามันทำตามที่ตั้งใจ"** พิสูจน์ไว้ข้างบนสองครั้งในทิศตรงข้ามกัน: policy ที่อ่าน `auth.users` คืน `403` แข็ง ๆ กับทุกคน (ดูเหมือนพัง แต่จริง ๆ แค่ผิด) ในขณะที่ `using (true)` บน `wr_members` คืน `200` สะอาด ๆ ตอน cross-tenant hijack (ดูเหมือนโอเค แต่จริง ๆ คือบั๊ก)
+- **"`security definer` คือทางแก้เวลา RLS มาขวาง"** พิสูจน์ไว้ข้างบน: `security definer` ที่ไม่มี `set search_path = ''` ไม่ได้แค่ข้าม RLS ตามที่ตั้งใจ (งานจริงของมัน) -- มันยังปล่อยให้ session ของ *ผู้เรียก* hijack ว่าชื่อที่ไม่ qualify schema จะ resolve ไปที่ table ไหน เงียบ ๆ ทั้งฝั่งอ่านและ -- โชว์ครั้งแรกในคอร์สนี้ที่นี่ -- ฝั่งเขียนด้วย
+- **"trigger บน `auth.users` ถูก scope อยู่แค่ฟีเจอร์ที่มันถูกเพิ่มเข้าไปให้"** พิสูจน์ไว้ข้างบน: มันรันทุกการ signup ทุก user จากทุกฟีเจอร์ -- บั๊ก permission ใน trigger ที่เขียนไว้ให้ "ฟีเจอร์ profile ใหม่" กลายเป็น "ทั้งแอป onboard ใครไม่ได้เลย" นี่คือเหตุผลที่ `security definer` สำคัญกับ trigger บน `auth.users` ยิ่งกว่า RPC ธรรมดาด้วยซ้ำ
+
+<Mermaid title="แต่ละบั๊กอยู่ตรงไหนใน request ของ tenant หนึ่ง" code={wr1Diagram} />
+
+export const wr1Diagram = `flowchart TD
+  A["signup -- trigger, no security definer"] -->|"10: permission denied, 500"| A
+  B["wr_members: user_id text"] -->|"1: create table fails"| B
+  C["wr_projects select: reads auth.users"] -->|"3: 42501, no grant"| C
+  D["wr_members: using(true), no with check"] -->|"4: cross-tenant hijack"| D
+  E["wr_invite_member: no search_path"] -->|"5: insert redirected"| E
+  F["wr_projects: no insert policy"] -->|"6: 42501 on create"| F
+  G["tenant-client.ts: service_role"] -->|"7: full bypass"| G
+  H[".single() on empty tenant"] -->|"8: PGRST116"| H
+  I["no on delete cascade"] -->|"2: tenant delete fails"| I
+  J["activity log: auth.uid() unwrapped"] -->|"9: ~5.2x slower"| J
+`;
+
+<Callout title="สรุปในบรรทัดเดียว">
+หกในสิบบั๊กนี้ -- policy ที่อ่าน `auth.users`, การ hijack ด้วย `using(true)`, RPC ที่ไม่ pin search_path, insert policy ที่หายไป, key `service_role` ที่หลุดไปกับ client, และ trigger ที่ไม่ pin search_path -- ไม่เคย throw error ตอน compile หรือแม้แต่ error ตอน runtime ที่ดูผิดปกติชัดเจนเลย แต่ละตัวต้องการผู้เรียกเฉพาะ, ผลลัพธ์ว่างเฉพาะ หรือ scenario ที่มี tenant พร้อมกันเฉพาะที่ถูกสร้างขึ้นมาโดยตั้งใจถึงจะโผล่ให้เห็น ในแอป multi-tenant "มันทำงานตอนผม test ในฐานะ tenant owner" กับ "มันถูกต้อง" ต่างกันในทุก ๆ ตัวเลย
+</Callout>
+
+export const quizWorkedReview1 = [
+  {
+    q: '`create table public.wr_members (... user_id text not null references auth.users(id) ...)` ถูกปฏิเสธทันทีด้วย `foreign key constraint "wr_members_user_id_fkey" cannot be implemented` ทำไมบั๊กนี้ไม่มีวันไปถึงแอปที่รันจริง?',
+    options: [
+      'มันจะ fail แค่ตอนมี RLS เท่านั้น service_role client ยังใช้ได้อยู่',
+      'auth.users.id เป็น uuid; คอลัมน์ text อ้างอิงมันไม่ได้เลย Postgres จึงปฏิเสธการสร้าง constraint ตั้งแต่ตอนสร้าง table ก่อนที่จะมีข้อมูล, policy หรือ client code ใด ๆ อยู่เลยด้วยซ้ำ',
+      'มัน fail แค่บน local stack เท่านั้น ไม่ fail บน hosted Supabase',
+      'text กับ uuid เข้ากันได้ นี่จริง ๆ สำเร็จ',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ตรง ๆ ข้างบนด้วย create table จริง: บรรทัด DETAIL ระบุ type mismatch ชัดเจน บั๊กอื่นทุกตัวในรีวิวนี้ compile และรันได้ปกติในเส้นทาง happy path นี่คือตัวเดียวที่ Postgres เองบล็อกก่อน deploy',
+  },
+  {
+    q: 'policy เลือก tenant บน `wr_projects` query `auth.users.raw_user_meta_data` เพื่อหา tenant ของผู้เรียก และคืน `42501: permission denied for table users` ให้กับ member จริงที่กำลังอ่านข้อมูล tenant ของตัวเอง `select grantee, privilege_type from information_schema.role_table_grants where table_name=\'users\' and grantee in (\'anon\',\'authenticated\',\'service_role\')` ที่คืน 0 rows พิสูจน์อะไรเกี่ยวกับสาเหตุ?',
+    options: [
+      'policy มี syntax error',
+      'ทั้ง anon และ authenticated ไม่มี grant อะไรเลยบน auth.users ในโปรเจกต์ Supabase มาตรฐาน -- policy ที่ query มันตรง ๆ โดยไม่มี security definer จะปฏิเสธทุกคนที่เรียกแบบไม่มีเงื่อนไข ไม่ใช่แค่คนที่อยู่ผิด tenant',
+      'auth.users ปฏิเสธแค่ INSERT ไม่ใช่ SELECT',
+      'นี่เป็นบั๊กเฉพาะ local CLI stack ไม่เกิดบน hosted Supabase',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ไว้ข้างบน: query grants คืน 0 rows ให้ทั้งสาม role และ request จริงจาก member ของ tenant จริงคืน 42501 ตรงตามที่ grant ที่หายไปทำนายไว้เป๊ะ -- ยืนยันว่า policy fail กับทุกคน ไม่ใช่แค่ผู้เรียกข้าม tenant',
+  },
+  {
+    q: 'Alice ที่ไม่มี membership ใน Globex เลย ส่ง `PATCH /wr_members?user_id=eq.<bob>` ครั้งเดียว แล้วแถวจริงของ Bob (ยืนยันฝั่ง server ในฐานะ postgres) เปลี่ยนจาก `tenant_id: globex, role: owner` เป็น `tenant_id: acme, role: owner` `wr_members` มี `select using(true)` และ `update using(true)` ไม่มี `with check` ทำไม `select using(true)` ที่ scope ถูกต้องถึงไม่ป้องกันเรื่องนี้?',
+    options: [
+      'select using(true) ไม่เกี่ยวอะไรเลย -- มีแค่ update policy เท่านั้นที่สำคัญสำหรับ PATCH',
+      'select using(true) คือสิ่งที่ทำให้แถวของ Bob มองเห็นได้สำหรับ update ตั้งแต่แรก (Postgres เช็ค visibility ของ SELECT-policy เพื่อหาแถวสำหรับ UPDATE); update using(true) ที่ไม่มี with_check เลยปล่อยให้แถวถูกเขียนใหม่เป็นรูปร่างอะไรก็ได้ รวมถึง tenant_id ที่ต่างออกไป',
+      'เกิดขึ้นได้เพราะ Alice เป็น owner เท่านั้น member ธรรมดาทำแบบนี้ไม่ได้',
+      'request PATCH bypass RLS ทั้งหมดโดยการออกแบบ',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ตรง ๆ ข้างบน: PATCH ตัวเดียวกันสำเร็จด้วย HTTP 200 และคืนแถวที่ถูกเขียนใหม่ ทางแก้คือลบ update policy ทั่วไปทิ้งทั้งหมด แทนที่จะพยายามเขียน using(true) ให้แคบลง เพราะแค่แคบ using() อย่างเดียวยังทิ้ง with_check ให้หย่อนเท่าเดิมถ้าไม่เขียนแยกต่างหาก',
+  },
+  {
+    q: '`wr_invite_member` เป็น `security definer` ไม่มี `set search_path` เมื่อตั้ง `search_path` เป็น `wr_evil, public` และสร้าง table `wr_evil.wr_members` ชื่อเดียวกันไว้ล่วงหน้า `returning *` ของ function เองรายงานแถวที่หน้าตาสำเร็จปกติ -- แต่ `select count(*) from public.wr_members where user_id=... and tenant_id=...` คืน `0` นี่พิสูจน์อะไร?',
+    options: [
+      'function fail และแถวที่คืนมาเป็นของปลอม',
+      'insert ที่ไม่ qualify schema เข้า wr_members ข้างใน function resolve ไปตาม search_path ของผู้เรียก ไม่ใช่ของ owner function -- ทำให้ insert (และ RETURNING ของมัน) ถูกเบี่ยงไปที่ shadow table ของผู้โจมตีเงียบ ๆ ในขณะที่ดูเหมือนการเรียกที่สำเร็จปกติ',
+      'function security definer ถูกโจมตีแบบนี้ไม่ได้ นี่เป็น demo ปลอม',
+      'wr_evil.wr_members กับ public.wr_members คือ table เดียวกันคนละชื่อ',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ไว้ข้างบน: output RETURNING ของ function แสดงแถวที่ดูสมเหตุสมผล wr_evil.wr_members มี insert จริงอยู่ และ count ของ public.wr_members สำหรับ user/tenant นั้นเป๊ะ ๆ คือ 0 -- การเขียนไม่เคยไปถึง table จริงเลยเงียบ ๆ',
+  },
+  {
+    q: 'POST signup จริงไปที่ `/auth/v1/signup` คืน `HTTP 500 {"msg":"Database error saving new user"}` และ log ของ GoTrue สำหรับ request นั้นแสดง `permission denied for table wr_profiles (SQLSTATE 42501)` มาจาก trigger `after insert on auth.users` ที่ไม่มี `security definer` ทำไมบั๊กนี้ตัวเดียวถึงมี blast radius กว้างกว่าตัวอื่นในรีวิวนี้?',
+    options: [
+      'ไม่กว้างกว่าเลย -- มันกระทบแค่ฟีเจอร์ profile เหมือนบั๊กอื่น ๆ ที่นี่',
+      'มันรันบนทุกการ signup ของทุก user ไม่ว่าจะใช้ฟีเจอร์ไหนอยู่ก็ตาม -- บั๊ก permission ใน trigger ที่เขียนไว้ให้ "ฟีเจอร์ profile ใหม่" ทำลายความสามารถของใครก็ตามในการสร้าง account เลย',
+      'มันกระทบแค่ user ที่มีแถว wr_profiles อยู่แล้วเท่านั้น',
+      'error นี้ไม่เกี่ยวกับ trigger เป็นแค่ flake สุ่ม',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ไว้ข้างบน: request signup ที่ไม่เกี่ยวกับ tenant, project หรือ profile โดยตรงเลยก็ยัง fail ด้วย 500 เพราะ trigger fire แบบไม่มีเงื่อนไขบน auth.users -- แก้ด้านล่างด้วยการเพิ่ม security definer set search_path = \'\' แล้ว signup เดิมเป๊ะก็สำเร็จ พร้อมแถวจริงลงใน wr_profiles',
+  },
+  {
+    q: 'การอ่าน filter `created_by = auth.uid()` เดียวกันบน table จริง 50,000 แถว ได้ `Execution Time: 18.634 ms` ตอนไม่ wrap เทียบกับ `3.569 ms` ตอน wrap ใน `(select auth.uid())` โดยมี `InitPlan` โผล่แค่ใน plan ที่ wrap เท่านั้น InitPlan แทนอะไร?',
+    options: [
+      'caching layer ที่ PostgREST เพิ่มเข้ามา ไม่เกี่ยวกับ SQL เอง',
+      'auth.uid() ถูกคำนวณครั้งเดียวพอดี ก่อนที่การ scan แถวจะเริ่ม แล้วผลลัพธ์ถูกนำกลับมาใช้ซ้ำทุกแถว -- เทียบกับถูก re-evaluate เป็นส่วนหนึ่งของ Filter expression ต่อแถวในเวอร์ชันที่ไม่ wrap',
+      'index ที่มีแค่เวอร์ชัน wrap เท่านั้นที่ใช้',
+      'การประหยัด network round-trip จากเวอร์ชัน wrap',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ตรง ๆ ข้างบนด้วย explain analyze จริง: plan ที่ wrap แสดง "InitPlan 1 -> Result (... rows=1 loops=1)" คำนวณครั้งเดียว แล้ว "Filter: (created_by = (InitPlan 1).col1)" นำกลับมาใช้ซ้ำ -- เทียบกับ plan ที่ไม่ wrap ที่ Filter เรียก current_setting() เป็นส่วนหนึ่งของการประเมินทุกหนึ่งใน 50,000 แถว',
+  },
+];
+
+<Quiz client:visible id="reading-supabase/worked-review-1" questions={quizWorkedReview1} />
+
+<ProgressTracker client:visible id="reading-supabase/worked-review-1" />
