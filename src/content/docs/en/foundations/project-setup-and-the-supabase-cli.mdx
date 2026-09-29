@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
@@ -65,6 +66,123 @@ supabase start
 
 This spins up the **entire Supabase stack locally via Docker** — Postgres, Studio, Auth, Storage, Realtime, and the rest, all running as containers on your machine. That means you can develop and test your schema, your RLS policies, and your client code completely offline, with no risk to your hosted project, before ever running `supabase db push` against it.
 
+Run it (or, if it is already running, `supabase status`) and the CLI prints every URL and key you need — this is real, trimmed output from this course's own local stack:
+
+```text
+$ supabase status --workdir tools/probe -o env
+DB_URL="postgresql://postgres:postgres@127.0.0.1:55322/postgres"
+API_URL="http://127.0.0.1:55321"
+REST_URL="http://127.0.0.1:55321/rest/v1"
+GRAPHQL_URL="http://127.0.0.1:55321/graphql/v1"
+MCP_URL="http://127.0.0.1:55321/mcp"
+STUDIO_URL="http://127.0.0.1:55323"
+ANON_KEY="eyJhbGciOiJIUzI1NiIs...I0"
+SERVICE_ROLE_KEY="eyJhbGciOiJIUzI1NiIs...IU"
+```
+
+Every one of these is a real, reachable local endpoint the moment `supabase start` finishes — `DB_URL` is a direct Postgres connection, `API_URL` is Kong's front door from the previous lesson, and `MCP_URL` is the subject of the rest of this section.
+
+## The Supabase MCP server: `supabase start` exposes `/mcp` locally
+
+**MCP (Model Context Protocol)** is the standard AI coding tools (Claude Code, Cursor, and others) use to call tools against an external system instead of only reading and writing files. Supabase ships an official MCP server so an AI agent can inspect your schema, run SQL, check advisors, and generate types directly — without you manually pasting schema dumps into a chat window. Since a recent CLI release, `supabase start` runs a **local MCP server automatically**, reachable at the `MCP_URL` printed above, with no extra setup and no separate `npx @supabase/mcp-server-supabase` process to manage.
+
+Proof it is a real MCP server, not just an idle URL — a raw JSON-RPC `initialize` handshake, `POST`ed directly with `curl`:
+
+```text
+$ curl -s -X POST http://127.0.0.1:55321/mcp \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json, text/event-stream" \
+    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"fnd-probe","version":"0.1.0"}}}'
+{"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"supabase","title":"Supabase","version":"0.11.0"},"instructions":"Here are guidelines for using Supabase tools effectively:\n\n- Before making schema changes, use `list_tables`...\n..."},"jsonrpc":"2.0","id":1}
+```
+
+A real MCP session, a real server name and version, and even server-authored guidance for the calling agent in `instructions`. Following up with a `tools/list` call shows exactly what this local server can do:
+
+```text
+$ curl -s -X POST http://127.0.0.1:55321/mcp \
+    -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
+    -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+```
+
+```text
+search_docs, list_tables, list_extensions, list_migrations, apply_migration,
+execute_sql, query_logs, get_advisors, get_project_url, get_publishable_keys,
+generate_typescript_types
+```
+
+<Callout title="Local is a smaller tool set than hosted">
+Compare that list against [the hosted MCP server's documented tools](https://supabase.com/docs/guides/ai-tools/mcp): hosted also offers account-management tools (`list_projects`, `create_project`, `pause_project`...), branching tools (`create_branch`, `merge_branch`...), Edge Function tools (`deploy_edge_function`...), and Storage tools — none of which exist locally, because those all need a Supabase account and a personal access token (the hosted server runs as `npx @supabase/mcp-server-supabase@latest --access-token <PAT>`). The local server only has what it can do against a single local Postgres instance: read schema, run SQL, manage migrations, and check advisors.
+</Callout>
+
+## How an AI agent uses it — and the real danger
+
+An AI coding tool connects the same way any MCP client does — for a local stack, pointing straight at the URL above needs no access token at all, since there is no hosted project or PAT in the loop:
+
+```json
+{
+  "mcpServers": {
+    "supabase-local": {
+      "url": "http://127.0.0.1:55321/mcp"
+    }
+  }
+}
+```
+
+Once connected, an agent can call `execute_sql` to run arbitrary SQL. This is not a hypothetical — proved directly against this local stack:
+
+```text
+$ curl -s -X POST http://127.0.0.1:55321/mcp \
+    -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
+    -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"execute_sql","arguments":{"query":"select current_user, session_user;"}}}'
+```
+
+```text
+{"current_user":"postgres","session_user":"postgres"}
+```
+
+**`current_user` is `postgres` — the database superuser, not merely `service_role`.** The local MCP server connects to Postgres directly, with full administrative rights: it can read or write any table regardless of RLS, run arbitrary DDL, and inspect any schema, including `auth` and `storage`. The [official MCP docs](https://supabase.com/docs/guides/ai-tools/mcp) put this plainly: *"Connecting an LLM to your Supabase projects carries security risks"*, naming prompt injection as *"the primary attack vector unique to LLMs"* — untrusted data returned from a query (a user's bio field, a support ticket body) could contain text an insufficiently careful agent interprets as a new instruction. The same docs recommend keeping the `read_only=true` parameter on and manual tool-call approval enabled for exactly this reason, and the [self-hosting MCP guide](https://supabase.com/docs/guides/self-hosting/enable-mcp) is explicit that the endpoint should never be reachable from the open internet — access only over a VPN or SSH tunnel. Locally this is lower-stakes (it is your own disposable dev database), but the moment the same pattern is pointed at a real project, "give the AI agent the MCP URL" is equivalent to "give the AI agent an unrestricted `psql` session as the database owner."
+
+## Reading AI-generated code
+
+An AI assistant, asked to "wire up the Supabase MCP server for this project," produced this config:
+
+<SpotTheBug lang="ts" code={`// src/mcp-config-check.ts
+// An AI assistant's suggested MCP client config, pasted into a shared repo README
+const mcpConfig = {
+  mcpServers: {
+    supabase: {
+      command: 'npx',
+      args: [
+        '-y',
+        '@supabase/mcp-server-supabase@latest',
+        '--access-token',
+        'sbp_<your-personal-access-token>',
+      ],
+    },
+  },
+};
+
+export {};
+`}>
+The bug is not in the JSON shape — it is that a real, live **personal access token** was committed straight into a config example in a shared repository, exactly the way an AI assistant will happily paste one back if it was given one earlier in the conversation and asked to "write out the config." A PAT scopes to your whole Supabase account by default (every project, unless `--project-ref` restricts it, per the tool-permission table in Supabase's own docs), so a leaked one is not a "this one project" problem — it is an "attacker can list, modify, or delete every project on this account" problem. The fix has two parts: never let a literal token land in a file that reaches version control (reference an environment variable instead — `"--access-token", process.env.SUPABASE_PAT` in an MCP client that supports env expansion, or the client's own secrets mechanism), and treat any token an AI assistant has already seen in a conversation as compromised — rotate it from the dashboard, the same way you would after any other accidental secret exposure.
+</SpotTheBug>
+
+## Mental Model
+
+The MCP server is not a new way for Supabase to run SQL — it is a translation layer that lets an AI agent call the exact same operations you could run by hand (`psql`, `supabase db push`, the Studio SQL editor), through a structured tool-call protocol instead of you copy-pasting. Every capability it exposes maps to something this course already teaches directly: `execute_sql` is `psql -c`, `apply_migration` is `supabase migration new` plus `db push`, `get_advisors` is Studio's Advisors panel. Treating it as "just another way to run the commands from this course, except an LLM is holding the keyboard" is the right mental model — and the right lens for judging how much trust to extend it.
+
+## Trade-offs
+
+- **The MCP server lets an AI agent inspect and modify your schema without you hand-writing every SQL statement yourself** — **at the cost of handing it the same blast radius a human with full database access would have**, proved above: `execute_sql` runs as the Postgres superuser locally, not a scoped role.
+- **A hosted personal access token can be scoped to one project (`--project-ref`) and made read-only (`--read-only`)** — **at the cost of remembering to actually set those flags**; the default, unscoped, read-write invocation is the more dangerous one and also the one every copy-pasted example defaults to.
+- **Zero setup locally (no PAT, no `npx` wrapper) makes it trivially easy to try** — **at the cost of zero access control locally either**: there is no scoping flag to reach for at all against `MCP_URL`, only "point an agent at your local database or don't."
+
+## Common Misconceptions
+
+- **"The MCP server only lets an AI agent read data, not change anything."** Disproved by the tool list itself: `apply_migration` and `execute_sql` both write. `get_advisors`, `list_tables`, and `search_docs` are the read-only ones — the danger above is specifically about the tools that are not.
+- **"service_role is the most privileged thing an AI agent could get access to."** The proof above shows the local MCP server runs as `postgres`, the actual database superuser — a strictly higher privilege level than `service_role`, which is still just a Postgres role subject to normal grants (service_role simply is not subject to RLS).
+- **"MCP access is safe as long as the AI model itself is trustworthy."** The documented risk is prompt injection from *data the query returns*, not from the model's own intentions — a well-behaved model can still be manipulated by text embedded in a row it was asked to read.
+
 <Mermaid title="A local Docker-based stack linked to a hosted project" code={cliSetupDiagram} />
 
 export const cliSetupDiagram = `flowchart LR
@@ -82,7 +200,7 @@ export const cliSetupDiagram = `flowchart LR
   local -- "supabase db push" --> hosted`;
 
 <Callout title="The one-line takeaway">
-A hosted project gives you Postgres plus an API URL, an **`anon`** key for client code (subject to RLS), and a **`service_role`** key for trusted server code (bypasses RLS — never ship it to a client). The CLI's `supabase init`, `supabase login`, and `supabase link --project-ref` connect a local folder to that project, while `supabase start` runs the whole stack locally in Docker so you can develop entirely offline.
+A hosted project gives you Postgres plus an API URL, an **`anon`** key for client code (subject to RLS), and a **`service_role`** key for trusted server code (bypasses RLS — never ship it to a client). The CLI's `supabase init`, `supabase login`, and `supabase link --project-ref` connect a local folder to that project, while `supabase start` runs the whole stack locally in Docker so you can develop entirely offline — and now also boots a local **MCP server** at `MCP_URL`, proved above to run SQL as the Postgres superuser, which makes it exactly as powerful, and exactly as dangerous to point at the wrong database, as a `service_role` key.
 </Callout>
 
 export const quizCliSetup = [
@@ -95,6 +213,7 @@ export const quizCliSetup = [
       'The service_role key only works in local development',
     ],
     answer: 1,
+    explain: 'Covered in the Foundations architecture lesson and reused throughout the course: RLS applies to anon (and authenticated), never to service_role.',
   },
   {
     q: 'Why must the service_role key never reach client-side code?',
@@ -105,6 +224,7 @@ export const quizCliSetup = [
       'It is slower than the anon key',
     ],
     answer: 2,
+    explain: 'Proved with the MCP server above too: whatever holds a service_role-equivalent credential (or, locally, the MCP endpoint itself) can bypass every RLS policy in the database.',
   },
   {
     q: 'What does `supabase start` do?',
@@ -115,6 +235,7 @@ export const quizCliSetup = [
       'Only starts a Postgres client, nothing else',
     ],
     answer: 1,
+    explain: 'The real supabase status output above lists every URL that comes up: DB, API (Kong), Studio, and the MCP server, among others.',
   },
   {
     q: 'What does `supabase link --project-ref <ref>` do?',
@@ -125,6 +246,18 @@ export const quizCliSetup = [
       'It starts the local Docker stack',
     ],
     answer: 1,
+    explain: 'link ties an existing local supabase/ folder to an existing hosted project so later db push/db diff commands know where to target.',
+  },
+  {
+    q: 'A real curl against this local stack\'s MCP server ran execute_sql with `select current_user;` and got back `postgres`. What does that prove about the danger of exposing MCP_URL?',
+    options: [
+      'Nothing unusual — MCP always runs as a read-only role',
+      'The local MCP server connects as the actual Postgres superuser, so any AI agent with the URL can bypass RLS and run arbitrary DDL, not just act like a scoped service_role client',
+      'It proves the connection failed silently',
+      'It only applies to the hosted MCP server, never the local one',
+    ],
+    answer: 1,
+    explain: 'This is the exact curl result shown above — current_user came back as postgres, the database superuser, which is why the docs\' prompt-injection and internet-exposure warnings are quoted directly in this lesson.',
   },
 ];
 

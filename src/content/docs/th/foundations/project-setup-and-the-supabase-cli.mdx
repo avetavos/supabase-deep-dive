@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
@@ -65,6 +66,123 @@ supabase start
 
 คำสั่งนี้จะสตาร์ท **Supabase stack ทั้งชุดบนเครื่องตัวเองผ่าน Docker** — Postgres, Studio, Auth, Storage, Realtime และอื่น ๆ รันเป็น container บนเครื่องคุณทั้งหมด นั่นแปลว่าคุณ develop และ test schema, RLS policy และ client code ได้แบบ offline เต็มรูปแบบ โดยไม่มีความเสี่ยงต่อ hosted project เลย ก่อนจะรัน `supabase db push` ขึ้นของจริง
 
+รันคำสั่งนี้ (หรือถ้ารันอยู่แล้วก็ `supabase status`) แล้ว CLI จะ print URL และ key ทุกตัวที่คุณต้องใช้ — นี่คือ output จริงที่ตัดให้สั้นลงจาก local stack ของคอร์สนี้เอง:
+
+```text
+$ supabase status --workdir tools/probe -o env
+DB_URL="postgresql://postgres:postgres@127.0.0.1:55322/postgres"
+API_URL="http://127.0.0.1:55321"
+REST_URL="http://127.0.0.1:55321/rest/v1"
+GRAPHQL_URL="http://127.0.0.1:55321/graphql/v1"
+MCP_URL="http://127.0.0.1:55321/mcp"
+STUDIO_URL="http://127.0.0.1:55323"
+ANON_KEY="eyJhbGciOiJIUzI1NiIs...I0"
+SERVICE_ROLE_KEY="eyJhbGciOiJIUzI1NiIs...IU"
+```
+
+ทุกตัวนี้คือ endpoint local จริงที่เรียกใช้ได้ทันทีที่ `supabase start` เสร็จ — `DB_URL` คือ connection ตรงเข้า Postgres, `API_URL` คือประตูหน้าของ Kong จากบทที่แล้ว และ `MCP_URL` คือหัวข้อของส่วนที่เหลือของ section นี้
+
+## Supabase MCP server: `supabase start` เปิด `/mcp` local ให้จริง
+
+**MCP (Model Context Protocol)** คือ standard ที่ AI coding tool (Claude Code, Cursor และตัวอื่น) ใช้เรียก tool กับระบบภายนอก แทนที่จะอ่าน/เขียนไฟล์อย่างเดียว Supabase มี MCP server ที่เป็นทางการให้ AI agent ตรวจ schema, รัน SQL, เช็ค advisor และ generate type ได้โดยตรง — โดยไม่ต้อง copy-paste schema dump ใส่ chat เอง ตั้งแต่ CLI เวอร์ชันหลัง ๆ `supabase start` จะรัน **MCP server local ให้อัตโนมัติ** เข้าถึงได้ที่ `MCP_URL` ที่ print ไว้ข้างบน ไม่ต้อง setup เพิ่ม ไม่ต้องมี process `npx @supabase/mcp-server-supabase` แยกให้จัดการเอง
+
+พิสูจน์ว่ามันคือ MCP server จริง ไม่ใช่ URL เฉย ๆ — JSON-RPC `initialize` handshake แบบดิบ ยิงตรงด้วย `curl`:
+
+```text
+$ curl -s -X POST http://127.0.0.1:55321/mcp \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json, text/event-stream" \
+    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"fnd-probe","version":"0.1.0"}}}'
+{"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"supabase","title":"Supabase","version":"0.11.0"},"instructions":"Here are guidelines for using Supabase tools effectively:\n\n- Before making schema changes, use `list_tables`...\n..."},"jsonrpc":"2.0","id":1}
+```
+
+MCP session จริง, ชื่อและ version ของ server จริง แถมยังมี guidance ที่ server เขียนเองให้ agent ที่เรียกอยู่ใน `instructions` ต่อด้วยเรียก `tools/list` จะเห็นเลยว่า server local ตัวนี้ทำอะไรได้บ้าง:
+
+```text
+$ curl -s -X POST http://127.0.0.1:55321/mcp \
+    -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
+    -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+```
+
+```text
+search_docs, list_tables, list_extensions, list_migrations, apply_migration,
+execute_sql, query_logs, get_advisors, get_project_url, get_publishable_keys,
+generate_typescript_types
+```
+
+<Callout title="Local มี tool set เล็กกว่า hosted">
+เทียบกับ[tool ที่ hosted MCP server มีตามเอกสารจริง](https://supabase.com/docs/guides/ai-tools/mcp): hosted มี tool จัดการ account เพิ่ม (`list_projects`, `create_project`, `pause_project`...), tool branching (`create_branch`, `merge_branch`...), tool Edge Function (`deploy_edge_function`...) และ tool Storage — ไม่มีตัวไหนอยู่ใน local เลย เพราะทั้งหมดนี้ต้องมี Supabase account และ personal access token (hosted server รันเป็น `npx @supabase/mcp-server-supabase@latest --access-token <PAT>`) local server มีแค่สิ่งที่ทำได้กับ Postgres instance เดียวบนเครื่อง: อ่าน schema, รัน SQL, จัดการ migration และเช็ค advisor
+</Callout>
+
+## AI agent ใช้มันยังไง — และอันตรายจริง
+
+AI coding tool ต่อเข้ามาแบบเดียวกับ MCP client ทั่วไป — สำหรับ local stack แค่ชี้ไป URL ข้างบนตรง ๆ ไม่ต้องมี access token เลย เพราะไม่มี hosted project หรือ PAT อยู่ในสมการ:
+
+```json
+{
+  "mcpServers": {
+    "supabase-local": {
+      "url": "http://127.0.0.1:55321/mcp"
+    }
+  }
+}
+```
+
+พอต่อแล้ว agent เรียก `execute_sql` รัน SQL อะไรก็ได้ นี่ไม่ใช่เรื่องสมมติ — พิสูจน์ตรงกับ local stack นี้เลย:
+
+```text
+$ curl -s -X POST http://127.0.0.1:55321/mcp \
+    -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
+    -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"execute_sql","arguments":{"query":"select current_user, session_user;"}}}'
+```
+
+```text
+{"current_user":"postgres","session_user":"postgres"}
+```
+
+**`current_user` คือ `postgres` — database superuser ไม่ใช่แค่ `service_role`** local MCP server ต่อเข้า Postgres โดยตรง ด้วยสิทธิ์ระดับ admin เต็ม: อ่านหรือเขียน table ไหนก็ได้ไม่สนใจ RLS, รัน DDL อะไรก็ได้ และดู schema ไหนก็ได้ รวมถึง `auth` กับ `storage` [เอกสาร MCP อย่างเป็นทางการ](https://supabase.com/docs/guides/ai-tools/mcp) พูดตรง ๆ ว่า *"Connecting an LLM to your Supabase projects carries security risks"* และเรียก prompt injection ว่าเป็น *"the primary attack vector unique to LLMs"* — data ที่ query คืนมา (bio field ของ user, เนื้อหา support ticket) อาจมี text ที่ agent ที่ไม่ระวังพอตีความเป็นคำสั่งใหม่ เอกสารเดียวกันแนะนำให้เปิด parameter `read_only=true` ไว้และเปิด manual tool-call approval เพราะเหตุผลนี้เป๊ะ ๆ และ[คู่มือ self-hosting MCP](https://supabase.com/docs/guides/self-hosting/enable-mcp) ก็พูดชัดว่า endpoint นี้ไม่ควรเข้าถึงได้จาก internet เปิด — เข้าผ่าน VPN หรือ SSH tunnel เท่านั้น local ความเสี่ยงต่ำกว่า (เป็น dev database ทิ้งได้ของตัวเอง) แต่พอ pattern เดียวกันนี้ไปชี้ที่ project จริง "ให้ MCP URL กับ AI agent" ก็เท่ากับ "ให้ AI agent มี `psql` session แบบไม่จำกัดในฐานะเจ้าของ database"
+
+## อ่านโค้ดที่ AI สร้าง
+
+AI assistant ถูกขอให้ "wire up the Supabase MCP server for this project" แล้วสร้าง config นี้ออกมา:
+
+<SpotTheBug lang="ts" code={`// src/mcp-config-check.ts
+// An AI assistant's suggested MCP client config, pasted into a shared repo README
+const mcpConfig = {
+  mcpServers: {
+    supabase: {
+      command: 'npx',
+      args: [
+        '-y',
+        '@supabase/mcp-server-supabase@latest',
+        '--access-token',
+        'sbp_<your-personal-access-token>',
+      ],
+    },
+  },
+};
+
+export {};
+`}>
+บั๊กไม่ได้อยู่ที่ shape ของ JSON — แต่คือ **personal access token** จริงที่ยังใช้งานได้ถูก commit ตรง ๆ ลงใน config ตัวอย่างในที่ repo ที่แชร์กัน แบบเดียวกับที่ AI assistant จะยินดี paste มันกลับมาให้ถ้าเคยเห็น token นั้นมาก่อนใน conversation แล้วถูกขอให้ "write out the config" PAT หนึ่งตัว scope ครอบทั้ง account โดย default (ทุก project เว้นแต่ `--project-ref` จะจำกัดไว้ ตามตาราง tool-permission ของเอกสาร Supabase เอง) ดังนั้น token ที่หลุดไม่ใช่แค่ปัญหาระดับ "project นี้" — แต่เป็น "attacker list, แก้ หรือลบ project ไหนก็ได้ใน account นี้" ทางแก้มีสองส่วน: อย่าให้ token ตัวจริงหลุดลงไฟล์ที่เข้า version control เด็ดขาด (ใช้ environment variable แทน — `"--access-token", process.env.SUPABASE_PAT` ใน MCP client ที่รองรับ env expansion หรือกลไก secret ของ client เอง) และถือว่า token ไหนก็ตามที่ AI assistant เคยเห็นใน conversation แล้วว่า compromised แล้ว — rotate จาก dashboard แบบเดียวกับที่ทำหลัง secret หลุดโดยไม่ตั้งใจกรณีอื่น ๆ
+</SpotTheBug>
+
+## Mental Model
+
+MCP server ไม่ใช่วิธีใหม่ที่ Supabase ใช้รัน SQL — มันคือ translation layer ที่ให้ AI agent เรียก operation เดียวกับที่คุณรันเองด้วยมือได้ (`psql`, `supabase db push`, Studio SQL editor) ผ่าน structured tool-call protocol แทนที่คุณจะ copy-paste เอง ทุก capability ที่มันเปิดให้ map ตรงกับสิ่งที่คอร์สนี้สอนตรง ๆ อยู่แล้ว: `execute_sql` คือ `psql -c`, `apply_migration` คือ `supabase migration new` บวก `db push`, `get_advisors` คือ panel Advisors ของ Studio มองมันเป็น "อีกวิธีรันคำสั่งจากคอร์สนี้ แค่มี LLM เป็นคนกดคีย์บอร์ดแทน" คือ mental model ที่ถูกต้อง — และเป็นมุมมองที่ถูกต้องสำหรับตัดสินว่าจะให้ความไว้ใจมันมากแค่ไหน
+
+## Trade-offs
+
+- **MCP server ให้ AI agent ตรวจและแก้ schema ได้โดยไม่ต้องเขียน SQL ทุกคำสั่งเอง** — **แลกมาด้วยการยกสิทธิ์ระดับเดียวกับที่ human ที่เข้าถึง database เต็มรูปแบบมี** พิสูจน์ข้างบน: `execute_sql` รันในฐานะ Postgres superuser local ไม่ใช่ role ที่จำกัด
+- **personal access token แบบ hosted scope ได้แค่ project เดียว (`--project-ref`) และตั้ง read-only ได้ (`--read-only`)** — **แลกมาด้วยต้องจำตั้ง flag พวกนี้เอง** default ที่ไม่ scope และ read-write คือแบบที่อันตรายกว่า และเป็นแบบที่ตัวอย่าง copy-paste ทุกอันใช้เป็น default
+- **setup local เป็นศูนย์ (ไม่มี PAT, ไม่มี `npx` wrapper) ทำให้ลองง่ายมาก** — **แลกมาด้วย access control local ก็เป็นศูนย์เหมือนกัน**: ไม่มี flag ไหนให้ scope กับ `MCP_URL` เลย มีแค่ "ชี้ agent ไปที่ database local หรือไม่ชี้"
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"MCP server ให้ AI agent อ่านข้อมูลได้อย่างเดียว แก้ไขอะไรไม่ได้"** ถูกหักล้างด้วย tool list เอง: `apply_migration` กับ `execute_sql` เขียนได้ทั้งคู่ `get_advisors`, `list_tables` และ `search_docs` คือตัวที่ read-only จริง — อันตรายข้างบนพูดถึงตัวที่ไม่ใช่ read-only โดยเฉพาะ
+- **"service_role คือสิทธิ์สูงสุดที่ AI agent จะเข้าถึงได้"** พิสูจน์ข้างบนแล้วว่า local MCP server รันในฐานะ `postgres` ซึ่งคือ database superuser จริง — สิทธิ์สูงกว่า `service_role` อีกขั้น เพราะ service_role ยังเป็นแค่ Postgres role ที่ผูกกับ grant ปกติ (service_role แค่ไม่ถูก RLS บังคับ)
+- **"MCP ปลอดภัยตราบใดที่ AI model เองน่าเชื่อถือ"** ความเสี่ยงที่เอกสารระบุคือ prompt injection จาก *data ที่ query คืนมา* ไม่ใช่จากเจตนาของ model เอง — model ที่ทำงานถูกต้องก็ยังถูกชักจูงได้ด้วย text ที่ฝังอยู่ใน row ที่มันถูกขอให้อ่าน
+
 <Mermaid title="Local Docker-based stack ที่ link เข้ากับ hosted project" code={cliSetupDiagram} />
 
 export const cliSetupDiagram = `flowchart LR
@@ -82,7 +200,7 @@ export const cliSetupDiagram = `flowchart LR
   local -- "supabase db push" --> hosted`;
 
 <Callout title="สรุปหนึ่งบรรทัด">
-Hosted project ให้ Postgres มาพร้อม API URL, key **`anon`** สำหรับ client code (ต้องผ่าน RLS) และ key **`service_role`** สำหรับ server code ที่เชื่อถือได้ (bypass RLS — ห้าม ship ไปหา client เด็ดขาด) คำสั่ง CLI อย่าง `supabase init`, `supabase login` และ `supabase link --project-ref` เชื่อม local folder เข้ากับ project นั้น ส่วน `supabase start` รันทั้ง stack บนเครื่องตัวเองผ่าน Docker ทำให้ develop แบบ offline ได้เต็มรูปแบบ
+Hosted project ให้ Postgres มาพร้อม API URL, key **`anon`** สำหรับ client code (ต้องผ่าน RLS) และ key **`service_role`** สำหรับ server code ที่เชื่อถือได้ (bypass RLS — ห้าม ship ไปหา client เด็ดขาด) คำสั่ง CLI อย่าง `supabase init`, `supabase login` และ `supabase link --project-ref` เชื่อม local folder เข้ากับ project นั้น ส่วน `supabase start` รันทั้ง stack บนเครื่องตัวเองผ่าน Docker ทำให้ develop แบบ offline ได้เต็มรูปแบบ — และตอนนี้ยังเปิด **MCP server** local ที่ `MCP_URL` ให้ด้วย พิสูจน์ข้างบนแล้วว่ารัน SQL ในฐานะ Postgres superuser ซึ่งทำให้มันมีพลังพอ ๆ กัน และอันตรายพอ ๆ กันถ้าชี้ผิด database เหมือน service_role key
 </Callout>
 
 export const quizCliSetup = [
@@ -95,6 +213,7 @@ export const quizCliSetup = [
       'service_role key ใช้ได้เฉพาะตอน local development เท่านั้น',
     ],
     answer: 1,
+    explain: 'ครอบคลุมในบท architecture ของ Foundations และใช้ซ้ำตลอดคอร์ส: RLS บังคับ anon (และ authenticated) แต่ไม่บังคับ service_role',
   },
   {
     q: 'ทำไม service_role key ห้ามหลุดไปถึง client-side code',
@@ -105,6 +224,7 @@ export const quizCliSetup = [
       'ช้ากว่า anon key',
     ],
     answer: 2,
+    explain: 'พิสูจน์ด้วย MCP server ข้างบนด้วย: อะไรก็ตามที่ถือ credential ระดับ service_role (หรือ local คือตัว MCP endpoint เอง) bypass RLS policy ทุกอันใน database ได้',
   },
   {
     q: '`supabase start` ทำอะไร',
@@ -115,6 +235,7 @@ export const quizCliSetup = [
       'สตาร์ทแค่ Postgres client เท่านั้น ไม่มีอย่างอื่น',
     ],
     answer: 1,
+    explain: 'supabase status output จริงข้างบนแสดง URL ทุกตัวที่ขึ้นมา: DB, API (Kong), Studio และ MCP server รวมอยู่ด้วย',
   },
   {
     q: '`supabase link --project-ref <ref>` ทำอะไร',
@@ -125,6 +246,18 @@ export const quizCliSetup = [
       'สตาร์ท local Docker stack',
     ],
     answer: 1,
+    explain: 'link ผูก folder supabase/ ที่มีอยู่แล้วบนเครื่องเข้ากับ hosted project ที่มีอยู่แล้ว เพื่อให้คำสั่ง db push/db diff รู้ว่าจะเล็งไปที่ไหน',
+  },
+  {
+    q: 'curl จริงเข้า MCP server ของ local stack นี้ รัน execute_sql ด้วย `select current_user;` แล้วได้ `postgres` กลับมา สิ่งนี้พิสูจน์อะไรเกี่ยวกับอันตรายของการเปิด MCP_URL',
+    options: [
+      'ไม่มีอะไรผิดปกติ — MCP รันเป็น role read-only เสมอ',
+      'local MCP server ต่อในฐานะ Postgres superuser ตัวจริง ดังนั้น AI agent ที่มี URL นี้ bypass RLS และรัน DDL อะไรก็ได้ ไม่ใช่แค่ทำตัวเป็น client ระดับ service_role ที่ถูก scope',
+      'พิสูจน์ว่า connection พังแบบเงียบ ๆ',
+      'ใช้ได้แค่กับ hosted MCP server เท่านั้น ไม่เกี่ยวกับ local',
+    ],
+    answer: 1,
+    explain: 'นี่คือผล curl จริงที่แสดงข้างบนเป๊ะ — current_user คืนค่ามาเป็น postgres ซึ่งคือ database superuser ซึ่งเป็นเหตุผลที่คำเตือนเรื่อง prompt injection และการเปิด internet ของเอกสารถูก quote ไว้ตรง ๆ ในบทนี้',
   },
 ];
 
