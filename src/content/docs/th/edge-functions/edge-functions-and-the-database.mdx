@@ -1,6 +1,6 @@
 ---
 title: 'Edge Functions กับฐานข้อมูล'
-description: 'key ที่คุณใช้สร้าง supabase-js client ใน Edge Function เป็นตัวตัดสินว่า RLS จะทำงานหรือถูก bypass ไปเลย'
+description: 'key ที่คุณใช้สร้าง supabase-js client ในตัว Edge Function ตัดสินว่า RLS จะบังคับใช้หรือถูกข้ามไปเลย บวกการต่อ Postgres ตรง ๆ ผ่าน Supavisor'
 sidebar:
   order: 3
 ---
@@ -8,46 +8,152 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
 
-ใน Edge Function คุณ query ฐานข้อมูลด้วย `supabase-js` ได้เหมือนโค้ดฝั่ง client เป๊ะ ๆ แต่ **key** ที่ใช้สร้าง client นั้นต่างหากที่ตัดสินว่า Row Level Security จะทำงานหรือถูก bypass ไปเลย
+ในตัว Edge Function คุณ query ฐานข้อมูลด้วย `supabase-js` ได้เหมือนโค้ดฝั่ง client เป๊ะ แต่ **key** ที่คุณใช้สร้าง client ตัวนั้นต่างหากที่ตัดสินว่า Row Level Security จะบังคับใช้หรือถูกข้ามไปเลย
 
-## client เดียวกัน แต่ key ต่างกันคนละเรื่อง
+## table จริงพร้อม RLS ไว้พิสูจน์
 
-Edge Function เป็นแค่ TypeScript ฝั่งเซิร์ฟเวอร์ ไม่มีอะไรห้าม function สร้าง `supabase-js` client แล้ว query แบบเดียวกับที่ browser ทำ
+ทุกอย่างในบทนี้รันกับ table จริงที่ namespace ไว้ตัวเดียว — table โน้ตส่วนตัวที่แต่ละ row เป็นของ user คนเดียวเท่านั้น
 
-```typescript
+```sql
+-- supabase/migrations/9001_edge_notes.sql
+create table public.edge_notes (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null,
+  body text not null
+);
+
+alter table public.edge_notes enable row level security;
+
+create policy "edge_notes_own_rows"
+on public.edge_notes
+for select
+to authenticated
+using (auth.uid() = user_id);
+
+create policy "edge_notes_own_insert"
+on public.edge_notes
+for insert
+to authenticated
+with check (auth.uid() = user_id);
+```
+
+user จริงสองคนสมัครผ่าน GoTrue แล้ว seed โน้ตคนละหนึ่งอันแบบตรง ๆ (RLS ที่มีแค่ policy `select`/`insert-own` ปฏิเสธ write ทางอื่นทั้งหมดโดย default การ seed จึงต้อง bypass มันตั้งใจ เหมือน setup script ฝั่ง server ทั่วไป)
+
+```text
+alice_id = 49de779e-056a-4d8a-9941-18f8a1136fc9  ("alice private note")
+bob_id   = 0dd713b3-94ee-4413-8a0c-58e47626b323  ("bob private note")
+```
+
+## client เดียวกัน แต่ key ต่างกันคนละเรื่องเลย
+
+Edge Function ก็แค่ TypeScript ฝั่งเซิร์ฟเวอร์ ไม่มีอะไรห้ามสร้าง `supabase-js` client แล้ว query แบบเดียวกับที่ browser ทำ สร้างด้วย **anon key และไม่ forward user token** จะถูก RLS บังคับเหมือน request ที่ไม่ authenticated และไม่ได้อะไรกลับมาจาก `edge_notes` เลย
+
+```ts
+// supabase/functions/edge-notes-anon/index.ts
 import { createClient } from 'jsr:@supabase/supabase-js@2'
 
-const authHeader = req.headers.get('Authorization')!
-
-const supabase = createClient(
-  Deno.env.get('SUPABASE_URL')!,
-  Deno.env.get('SUPABASE_ANON_KEY')!,
-  { global: { headers: { Authorization: authHeader } } },
-)
+Deno.serve(async (_req) => {
+  const client = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_ANON_KEY')!,
+  )
+  const { data, error } = await client.from('edge_notes').select('*')
+  return new Response(JSON.stringify({ data, error }), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+})
 ```
 
-การ forward header `Authorization` ของผู้เรียกเอง ที่เป็น token เดียวกับที่ `supabase.functions.invoke()` แนบให้อัตโนมัติตามที่บทก่อนหน้าพูดถึง หมายความว่าทุก query ที่ client นี้รันจะถูกจำกัดขอบเขตตาม user คนนั้น Row Level Security ทำงานเหมือนกับที่ client เรียก Postgres ตรง ๆ ทุกประการ function ไม่ได้สิทธิ์เพิ่มขึ้นเลย เพียงแค่เพิ่ม logic ฝั่งเซิร์ฟเวอร์เข้าไปคลุมสิทธิ์ที่ user มีอยู่แล้ว
-
-## service_role key bypass RLS ทั้งหมด
-
-ทางเลือกอีกแบบคือสร้าง client ด้วย **service_role key** แทนที่จะใช้ anon key พร้อม forward token
-
-```typescript
-const supabaseAdmin = createClient(
-  Deno.env.get('SUPABASE_URL')!,
-  Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,
-)
+```text
+$ curl "$FUNCTIONS_URL/edge-notes-anon" -H "Authorization: Bearer $ANON_KEY" -H "apikey: $ANON_KEY"
+{"data":[],"error":null}
 ```
 
-query ที่ทำผ่าน client นี้จะ**bypass RLS ทั้งหมด** ทุก row ในทุก table มองเห็นและเขียนได้หมด ไม่สนใจ policy ใด ๆ นี่เป็น pattern ที่ถูกต้องและใช้กันทั่วไป เพราะ Edge Function เป็นโค้ดฝั่งเซิร์ฟเวอร์ที่เชื่อถือได้ ต่างจาก browser ที่ user ของตัวเองสามารถตรวจดูหรือแก้ไขได้ แต่มาพร้อมความรับผิดชอบที่เปลี่ยนไปจริง ๆ เมื่อ RLS ไม่ได้อยู่ในสมการแล้ว ฐานข้อมูลจะไม่ตรวจสอบอะไรแทน client นี้อีกต่อไป การควบคุมสิทธิ์ที่จำเป็นต้องเขียนให้ถูกต้องเองในโค้ดของ function
+ไม่ใช่ error — เป็น array ว่าง policy `select` อนุญาตแค่ `auth.uid() = user_id` และ client ที่ใช้ anon key ไม่มี `auth.uid()` เลย ทุก row เลยถูกกรองออกแบบเงียบ ๆ ตรงตามที่ RLS ควรทำกับผู้เรียกที่ไม่ได้ authenticated
 
-## ตัวอย่างจริง รายงานสำหรับ admin เท่านั้น
+## service_role key ข้าม RLS ไปเลยทั้งหมด
 
-สมมติว่าคุณต้องการ endpoint ที่คืนรายงานสรุปยอด เช่น revenue รวมของลูกค้าทั้งหมด ซึ่ง RLS policy ของ user ทั่วไปไม่ควรอนุญาตให้เห็นเลย RLS เลือก "อนุญาต query สรุปนี้เฉพาะกรณีนี้" ไม่ได้ RLS ทำได้แค่ให้เห็น row หรือไม่ให้เห็นเท่านั้น Edge Function จึงเป็นที่ที่เหมาะสมสำหรับบังคับข้อยกเว้นนี้
+สร้าง client ตัวเดียวกันด้วย **service_role key** แทน
+
+```ts
+// supabase/functions/edge-notes-service/index.ts
+import { createClient } from 'jsr:@supabase/supabase-js@2'
+
+Deno.serve(async (_req) => {
+  const client = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,
+  )
+  const { data, error } = await client.from('edge_notes').select('*')
+  return new Response(JSON.stringify({ data, error }), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+})
+```
+
+```text
+$ curl "$FUNCTIONS_URL/edge-notes-service" -H "Authorization: Bearer $ANON_KEY" -H "apikey: $ANON_KEY"
+{"data":[
+  {"id":"8313942c-...","user_id":"49de779e-...","body":"alice private note"},
+  {"id":"9dd850a2-...","user_id":"0dd713b3-...","body":"bob private note"}
+],"error":null}
+```
+
+table เดียวกัน `.select('*')` ไม่กรองเหมือนเดิม แต่ตอนนี้ **ทุก row จากทุก user** กลับมาหมด — RLS ถูกข้ามไปทั้งหมด ไม่สนใจ policy เลย นี่เป็น pattern ที่ใช้กันทั่วไปและถูกต้อง เพราะ Edge Function คือโค้ดฝั่งเซิร์ฟเวอร์ที่เชื่อถือได้ ไม่เหมือน browser ที่ user ของตัวเองสามารถ inspect หรือแก้ไขได้ แต่มันมาพร้อมความรับผิดชอบที่เปลี่ยนไปจริง ๆ เมื่อ RLS ออกจากสมการไปแล้ว ฐานข้อมูลไม่ได้ตรวจอะไรแทน client ตัวนี้อีกต่อไป access control ที่จำเป็นตอนนี้ต้องถูกเขียนไว้ในโค้ดของ function เองให้ถูกต้อง
+
+## Forward JWT ของผู้เรียก ทำให้ RLS ยังทำงาน แค่ scope ตาม user นั้น
+
+pattern ที่สาม และพบบ่อยที่สุด สำหรับ function ที่ทำงาน *แทนผู้เรียก* ที่ล็อกอินอยู่: forward header `Authorization` ของเขาเอง — token เดียวกับที่ `supabase.functions.invoke()` แนบให้อัตโนมัติ — เข้าไปใน client ที่ยังสร้างด้วย anon key
+
+```ts
+// supabase/functions/edge-notes-forward/index.ts
+import { createClient } from 'jsr:@supabase/supabase-js@2'
+
+Deno.serve(async (req) => {
+  const authHeader = req.headers.get('Authorization') ?? ''
+  const client = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_ANON_KEY')!,
+    { global: { headers: { Authorization: authHeader } } },
+  )
+  const { data, error } = await client.from('edge_notes').select('*')
+  return new Response(JSON.stringify({ data, error }), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+})
+```
+
+เรียกด้วย access token จริงของ user สองคนที่ต่างกัน `.select('*')` แบบไม่กรองตัวเดิมนี้คืนมาแค่หนึ่ง row ต่อคน — row ของตัวเองเท่านั้น
+
+```text
+$ curl "$FUNCTIONS_URL/edge-notes-forward" -H "Authorization: Bearer $ALICE_TOKEN" -H "apikey: $ANON_KEY"
+{"data":[{"id":"8313942c-...","user_id":"49de779e-...","body":"alice private note"}],"error":null}
+
+$ curl "$FUNCTIONS_URL/edge-notes-forward" -H "Authorization: Bearer $BOB_TOKEN" -H "apikey: $ANON_KEY"
+{"data":[{"id":"9dd850a2-...","user_id":"0dd713b3-...","body":"bob private note"}],"error":null}
+```
+
+function ไม่ได้สิทธิ์เพิ่มขึ้นเลย มันแค่เพิ่ม logic ฝั่งเซิร์ฟเวอร์ไว้หน้าสิ่งที่ user มีอยู่แล้ว — RLS บังคับใช้เหมือน user แต่ละคน query Postgres ตรง ๆ เอง โดย function ไม่เคยเห็น row ของอีกคนเลย
+
+<Mermaid title="สามวิธีสร้าง Supabase client ใน Edge Function พิสูจน์กับ table เดียวกัน" code={edgeDbKeysDiagram} />
+
+export const edgeDbKeysDiagram = `flowchart LR
+  req["Incoming request"] --> edge["Edge Function"]
+  edge -->|"anon key, no token"| anonClient["anon key client"]
+  edge -->|"forwarded user token"| userClient["anon key + forwarded Authorization"]
+  edge -->|"service_role key"| adminClient["service_role client"]
+  anonClient -->|"RLS filters everything out"| db[("edge_notes")]
+  userClient -->|"RLS: caller's own rows only"| db
+  adminClient -->|"RLS bypassed entirely"| db`;
+
+## ตัวอย่างจริง: report สำหรับ admin เท่านั้น
+
+สมมติคุณต้องการ endpoint ที่คืน aggregate report ที่ policy RLS ของ user ทั่วไปไม่ควรให้เห็นเลย RLS ไม่สามารถ "อนุญาตแค่ aggregate query นี้อันเดียว" ได้ มันจะให้เห็น row หรือไม่ให้เห็นเลยเท่านั้น Edge Function คือที่ที่เหมาะจะบังคับข้อยกเว้นแบบนี้ — ตรวจตัวตนด้วย token ที่ forward มาของผู้เรียกก่อน แล้วค่อยใช้ `service_role` หลังจากผ่านการตรวจแล้วเท่านั้น
 
 ```typescript
 Deno.serve(async (req) => {
@@ -84,61 +190,198 @@ Deno.serve(async (req) => {
 })
 ```
 
-ตัวฟังก์ชันเองคือ trust boundary ในตัวอย่างนี้ ไม่ใช่ RLS ฟังก์ชันตรวจสอบว่าใครเรียกด้วย token ของ user คนนั้นเอง แล้วค่อยหยิบ `service_role` มาดึงข้อมูลที่ RLS เพียงอย่างเดียวไม่มีทางเปิดเผยได้อย่างปลอดภัย
+function เองคือ trust boundary ตรงนี้ ไม่ใช่ RLS: มันตรวจว่าใครเรียกด้วย token ของ user เอง แล้วค่อยใช้ `service_role` เพื่อดึงข้อมูลที่ RLS อย่างเดียวไม่มีทางเปิดให้เห็นได้อย่างปลอดภัย
 
-<Mermaid title="สองวิธีสร้าง Supabase client ใน Edge Function" code={edgeDbKeysDiagram} />
+## ต่อ Postgres ตรง ๆ ผ่าน Supavisor แบบ transaction mode
 
-export const edgeDbKeysDiagram = `flowchart LR
-  req["Incoming request"] --> edge["Edge Function"]
-  edge -->|"forwarded user token"| userClient["supabase-js client (anon key + user token)"]
-  edge -->|"service_role key"| adminClient["supabase-js client (service_role key)"]
-  userClient -->|"RLS applies"| db[("Postgres")]
-  adminClient -->|"RLS bypassed"| db`;
+`supabase-js` ไม่ใช่ทางเดียวที่จะเข้าถึงฐานข้อมูลจาก Edge Function — driver `postgres` npm ต่อผ่าน **Supavisor** pooler แบบ **transaction mode** ได้ตรง ๆ มีประโยชน์เวลาต้องการ raw SQL หรือ feature ของ driver ที่ `supabase-js` ไม่ได้ห่อไว้ให้ การต่อ pooler ของ local stack นี้ต้องใช้ tenant id จริงของมัน ยืนยันด้วยการ query table tenant ของ Supavisor เองตรง ๆ แทนที่จะเดา
+
+```text
+$ docker exec -i supabase_db_probe psql "postgresql://postgres:postgres@127.0.0.1:5432/_supabase" \
+    -c "select external_id from _supavisor.tenants;"
+ external_id
+-------------
+ pooler-dev
+```
+
+username ของ connection string คือ `postgres.<tenant external_id>` ไม่ใช่ `postgres.<project_id>` แบบที่ตัวอย่างเอกสารของ hosted project บอกไว้ — รายละเอียดจริงที่มีเฉพาะในเครื่องนี้ ที่ควรยืนยันจริงมากกว่าเดา
+
+```ts
+// supabase/functions/edge-notes-pooler/index.ts
+import postgres from 'npm:postgres@3'
+
+// Module-level client: created once per isolate, reused across warm invocations.
+const sql = postgres(Deno.env.get('PG_POOLER_URL')!, { prepare: false })
+
+Deno.serve(async (_req) => {
+  const rows = await sql`select pg_backend_pid() as backend_pid, count(*) as note_count from public.edge_notes`
+  return new Response(JSON.stringify({ backendPid: rows[0].backend_pid, noteCount: rows[0].note_count }), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+})
+```
+
+```text
+$ echo 'PG_POOLER_URL=postgresql://postgres.pooler-dev:postgres@host.docker.internal:55329/postgres' >> .env.local
+$ curl "$FUNCTIONS_URL/edge-notes-pooler" -H "Authorization: Bearer $ANON_KEY" -H "apikey: $ANON_KEY"
+{"backendPid":3916,"noteCount":"2"}
+```
+
+<Callout title="host.docker.internal ไม่ใช่ชื่อ Docker service — รายละเอียด sandbox จากบทที่แล้ว">
+สัญชาตญาณแรกคือใช้ `supabase_pooler_probe:6543` (ชื่อ Docker Compose service ของ pooler ที่ resolve ได้ปกติจากการ `docker exec` เข้า container edge-runtime) มันพังจาก*ใน*ฟังก์ชันที่กำลังรัน ด้วย error จริง `getaddrinfo ENOTFOUND supabase_pooler_probe` — ข้อจำกัดของ **user runtime** ที่ sandbox แบบเดียวกับที่พูดถึงใน [Edge Functions คืออะไร](/supabase/th/edge-functions/what-are-edge-functions/) ซึ่ง resolve ชื่อ DNS ภายใน Docker ไม่ได้ `host.docker.internal` (หรือ raw IP ของ container) ทำงานได้ปกติจากใน isolate บนโปรเจกต์ที่ deploy จริง เรื่องนี้ไม่เกี่ยวเลย เพราะคุณจะใช้ hostname ของ Supavisor จริงของโปรเจกต์ ที่เข้าถึงได้ผ่าน public DNS จากทุกที่
+</Callout>
+
+## caveat เรื่อง prepared statement ใน transaction mode
+
+transaction mode ของ Supavisor จะให้ client หนึ่ง connection ฝั่ง backend Postgres แค่ช่วงเวลาของ transaction เดียว แล้วคืนกลับเข้า pool — query ถัดไปของ client อื่นอาจไปเจอ backend คนละตัวเลย driver `postgres` npm เตรียม query ทุกตัวเป็น named prepared statement โดย default และ [official troubleshooting guide](https://github.com/supabase/supabase/blob/master/apps/docs/content/troubleshooting/disabling-prepared-statements-qL8lEL.mdx) บอกผลลัพธ์ชัดเจนว่า *"although the direct connections and Supavisor in session mode support prepared statements, Supavisor in transaction mode does not."* prepared statement ที่สร้างไว้กับ backend หนึ่งจะไม่มีอยู่บน backend อื่นที่ query ถัดไปไปเจอเลย วิธีแก้คือ option `prepare: false` ที่ใช้ไปแล้วข้างบน ส่วนเวอร์ชันที่พังแบบ default เก็บไว้ในบทนี้เพื่อการอ้างอิง (คุ้มที่จะใช้เฉพาะตอนต้องการ reproduce หรือพูดถึง failure mode นี้เท่านั้น)
+
+```ts
+// supabase/functions/edge-notes-pooler-prepared/index.ts
+import postgres from 'npm:postgres@3'
+
+// prepare defaults to true — this is the broken version, kept for the lesson's proof.
+const sql = postgres(Deno.env.get('PG_POOLER_URL')!)
+
+Deno.serve(async (_req) => {
+  const rows = await sql`select count(*) as note_count from public.edge_notes where user_id = ${crypto.randomUUID()}`
+  const rows2 = await sql`select count(*) as note_count from public.edge_notes where user_id = ${crypto.randomUUID()}`
+  return new Response(JSON.stringify({ ok: true, rows, rows2 }), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+})
+```
+
+<Callout title="ช่องว่างที่ยอมรับตรง ๆ: ไม่สามารถ reproduce ได้ในการทดสอบ local ที่ concurrency ต่ำแบบนี้">
+พยายามบังคับให้เกิด error `prepared statement "..." does not exist` จริงกับ pooler ในเครื่องนี้ (ทั้งแบบ sequential และแบบยิงพร้อมกัน 8 request) ก็ไม่เกิดขึ้น — client ตัวเดียวบน pool ที่โหลดเบา ๆ ในเครื่องนี้ไปเจอ backend connection ตัวเดิมทุกครั้ง failure mode นี้เลยไม่ถูกกระตุ้นในการทดสอบนี้ กลไกและวิธีแก้ (`prepare: false` ตรงกับ `?pgbouncer=true` ที่ Prisma เอกสารไว้เอง) เป็นเรื่องจริงและมีเอกสารอ้างอิงตามข้างบน บอกไว้ตรง ๆ แบบนี้ดีกว่าแกล้งทำให้เกิดขึ้น ดู [Connection Pooling and Supavisor](/supabase/th/production-and-ecosystem/connection-pooling-and-supavisor/) สำหรับ session vs. transaction mode แบบเต็ม ๆ
+</Callout>
+
+## การใช้ connection ซ้ำข้ามการเรียกฟังก์ชัน
+
+function pooler ข้างบนสร้าง client `postgres` **ครั้งเดียวที่ module scope** ไม่ได้สร้างในตัว request handler — การใช้ warm isolate ซ้ำแบบเดียวกับที่วัด cold start ในบทที่แล้วใช้ได้กับ connection นี้ด้วย เรียกติดกันสามครั้ง ได้ backend เดิม และช่องว่างเวลา cold-vs-warm ตรงกัน
+
+```text
+first call (cold isolate, new pg connection):  time_total=0.093268s  {"backendPid":3916,"noteCount":"2"}
+second call (warm, reused pg connection):      time_total=0.009264s  {"backendPid":3916,"noteCount":"2"}
+third call:                                    time_total=0.009755s  {"backendPid":3916,"noteCount":"2"}
+```
+
+`backendPid` เหมือนกันทั้งสามครั้งคือหลักฐาน: client `sql` ที่อยู่ module scope และ pooled backend connection ที่ Supavisor จัดสรรให้มัน รอดข้ามการเรียกทั้งสามครั้งบน isolate ที่ warm อยู่ — ถ้าเรียก `postgres(...)` ใหม่ในตัว handler แทน (ไม่ใช่ที่ module scope) จะทำลายสิ่งนี้ไปเลย ต้อง reconnect ใหม่ทุก request
 
 <Callout title="สรุปในบรรทัดเดียว">
-ใน Edge Function การสร้าง `supabase-js` client ด้วย**forwarded token ของผู้เรียก** ทำให้ query รันในฐานะ user คนนั้นและ**บังคับใช้ RLS**ตามปกติ ส่วนการสร้างด้วย **service_role key** ทำให้ query รันแบบ**bypass RLS ทั้งหมด** ที่เป็น pattern ที่ถูกต้องสำหรับโค้ดฝั่งเซิร์ฟเวอร์ที่เชื่อถือได้ แต่ผลักภาระการควบคุมสิทธิ์ที่ถูกต้องไปไว้ที่โค้ดของ function เอง เหมือนตัวอย่างรายงานสำหรับ admin ที่ function เองเป็นคนตรวจสอบก่อนจะ query แบบเปิดกว้าง
+ในตัว Edge Function การสร้าง `supabase-js` client ด้วย **anon key อย่างเดียว** จะถูก RLS บังคับเหมือนผู้เรียกที่ไม่ authenticated (พิสูจน์แล้ว: `[]`) **forward auth token ของผู้เรียก** ทำให้ query รันในฐานะ user นั้น**พร้อม RLS บังคับใช้** (พิสูจน์แล้ว: แต่ละ user ได้แค่ row ของตัวเอง) และ **service_role key** รัน query โดย **ข้าม RLS ไปทั้งหมด** (พิสูจน์แล้ว: ทุก row ทุก user) การต่อ `postgres` ตรง ๆ ผ่าน **Supavisor transaction mode** ต้องใช้ `prepare: false` (named prepared statement ที่ driver เตรียมให้ default ไม่รองรับข้าม pooled backend) และ client ที่ module scope เพื่อให้ได้ connection reuse จริงข้าม warm invocation (พิสูจน์แล้ว: `backendPid` เหมือนกัน เร็วขึ้นประมาณ 10 เท่าหลัง call แรก)
 </Callout>
+
+## อ่านโค้ดที่ AI สร้าง
+
+AI ถูกขอให้เขียน "endpoint ที่คืนโน้ตของ user ที่ล็อกอินอยู่" แล้วได้โค้ดนี้มา
+
+<SpotTheBug lang="ts" code={`// supabase/functions/get-my-note/index.ts
+import { createClient } from 'jsr:@supabase/supabase-js@2'
+
+Deno.serve(async (req) => {
+  const { userId } = await req.json()
+
+  const supabase = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,
+  )
+
+  const { data, error } = await supabase
+    .from('edge_notes')
+    .select('*')
+    .eq('user_id', userId)
+
+  return new Response(JSON.stringify({ data, error }), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+})
+`}>
+โค้ดนี้ "ทำงานได้" ทุกครั้งที่ทดสอบด้วยมือ ตามที่ตั้งใจไว้เป๊ะ — จนกว่าจะมีใครส่ง `userId` ที่ต่างออกไปใน request body function นี้ใช้ `service_role` (ข้าม RLS ไปทั้งหมด ตามที่พิสูจน์ไว้ข้างบน) และเชื่อค่า `userId` ที่มาจาก **request body ของผู้เรียกเอง** ตรง ๆ ไม่ใช่อะไรที่ตรวจสอบฝั่งเซิร์ฟเวอร์เลย — เป็น IDOR (Insecure Direct Object Reference) แบบคลาสสิก: ผู้เรียกที่ล็อกอินอยู่คนไหนก็อ่านโน้ตของใครก็ได้ แค่เปลี่ยน field เดียวใน JSON ที่ส่งไป วิธีแก้คือ pattern "forward JWT ของผู้เรียก" จากบทนี้เป๊ะ ๆ: สร้าง client ด้วย header `Authorization` ที่ forward มาของผู้เรียกเองกับ key **anon** ตัด parameter `userId` ออกจาก request body ไปเลย แล้วปล่อยให้ policy RLS `auth.uid() = user_id` — ที่พิสูจน์แล้วข้างบนว่า scope ผลลัพธ์ตาม user ถูกต้อง — ทำหน้าที่กรองที่ฐานข้อมูลถูกออกแบบมาให้ทำ ถ้าจำเป็นต้องใช้ `service_role` client จริง ๆ สำหรับอย่างอื่นใน function เดียวกัน ตัวตนของ user ก็ยังต้องมาจาก `auth.getUser()` กับ token ที่ forward มาของเขาเอง ไม่ใช่จาก field ที่ client ส่งมาเอง
+</SpotTheBug>
+
+## Mental Model
+
+ฐานข้อมูลแยกไม่ออกว่า "Edge Function เป็นคน query" กับ "browser เป็นคน query" — สิ่งที่มันเห็นได้คือ **role** อะไรและ **claim** อะไร (โดยเฉพาะ `auth.uid()`) มากับ request และ RLS policy ถูกประเมินกับสิ่งนั้นตรง ๆ ไม่ว่า layer ไหนของ stack คุณจะเป็นคนยิง query client ที่ใช้ anon key ไม่ forward token เลยไม่มี `auth.uid()` เลย RLS จึงกรองเหมือนไม่มีใครล็อกอิน token ของ user ที่ forward มามี `auth.uid()` จริงของ user นั้น RLS จึงกรองเหมือนเป็น query ตรงของ user คนนั้นเป๊ะ `service_role` ในโมเดลนี้ไม่ใช่ "user ที่มีพลังมากกว่า" — Postgres เองมองว่ามันข้ามการตรวจ row security ไปทั้งหมด นี่คือเหตุผลที่ทั้งสาม key ข้างบนให้ผลลัพธ์ที่ต่างกันโดยสิ้นเชิงกับ `.select('*')` ตัวเดียวกันที่ไม่กรองอะไรเลย
+
+## Trade-offs
+
+- **การ forward JWT ของผู้เรียกทำให้ทุก RLS policy ที่คุณเขียนไว้แล้วทำงานต่อในฟังก์ชันได้ฟรี ๆ** — **แต่ต้องแลกกับการที่ function ถูกจำกัดพอ ๆ กับตัว user เอง** ซึ่งถูกต้องเป๊ะสำหรับ "เพิ่ม logic ฝั่งเซิร์ฟเวอร์ไว้หน้าสิ่งที่ user คนนี้ทำได้อยู่แล้ว" และผิดเป๊ะสำหรับอะไรก็ตามที่ต้อง cross user จริง ๆ (admin report, cross-user aggregate)
+- **`service_role` อ่านเขียนอะไรก็ได้ ปลดล็อก pattern ที่ RLS อย่างเดียวทำไม่ได้** — **แต่ต้องแลกกับการกลายเป็น access-control boundary แบบ manual เต็มตัว**: ไม่มีอะไรนอกจากโค้ดของ function เองที่หยุดการใช้งานผิด ๆ ได้ พิสูจน์ข้างบนด้วย IDOR bug ที่เชื่อ `userId` จาก client แทนที่จะเชื่อ token ที่ตรวจแล้ว
+- **การต่อ `postgres` ตรง ๆ ผ่าน Supavisor เลี่ยง query builder ของ `supabase-js` ไปเลย สำหรับ raw SQL หรือ feature ของ driver ที่ไม่รองรับ** — **แต่ต้องแลกกับความไม่เข้ากันของ prepared statement ใน transaction mode** ที่มองไม่เห็นจนกว่าจะปิด named prepared statement ตรง ๆ
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"ใช้ `supabase-js` ใน Edge Function ปลอดภัยกว่า browser ใช้โดยธรรมชาติ"** client library ไม่เปลี่ยนพฤติกรรมของ RLS เลย สิ่งที่เปลี่ยนพฤติกรรมของ RLS คือ key และ token ที่*โค้ด*เลือกใช้ พิสูจน์ข้างบนด้วยผลลัพธ์ที่ต่างกันสามแบบจาก query เดียวกัน
+- **"`service_role` ใน function โอเค ตราบใดที่ function รันฝั่งเซิร์ฟเวอร์เท่านั้น"** การรันฝั่งเซิร์ฟเวอร์ไม่ได้เพิ่ม authorization ให้เองเลย SpotTheBug ข้างบนคือโค้ด `service_role` ที่รันอยู่ตรงจุดที่ควรรัน (Edge Function ที่ deploy แล้ว) แล้วก็ยังรั่วโน้ตของทุก user อยู่ดี เพราะไม่มีอะไรตรวจว่า*ใคร*เป็นคนถาม
+- **"forward JWT ของ user ช้ากว่าใช้ service_role ตรง ๆ"** client ที่ forward token ยังผ่าน path PostgREST/Postgres เดียวกัน แค่มี RLS check เพิ่มเข้ามา ไม่ใช่ path ที่ต่างกันอย่างมีนัยสำคัญ — ความต่างของต้นทุนจริงในบทนี้คือ isolate cold กับ warm ไม่ใช่ key ที่ใช้
+- **"`postgres` npm client ทำงานเหมือนกันไม่ว่าจะผ่าน Supavisor transaction mode หรือ connection ตรง"** พิสูจน์และอ้างอิงไว้ข้างบน: prepared statement (default ของ driver) เป็นความไม่เข้ากันที่มีเอกสารระบุไว้เฉพาะ transaction mode ไม่ใช่ข้อจำกัดทั่วไปของ Postgres
 
 export const quizEdgeFunctionsDatabase = [
   {
-    q: 'เกิดอะไรขึ้นกับ RLS เมื่อ Edge Function forward auth token ของผู้เรียกไปให้ supabase-js',
+    q: 'Edge Function query edge_notes ด้วย client ที่ใช้ anon key และไม่ forward header Authorization เลย จะได้อะไรกลับมา และทำไม',
     options: [
-      'RLS ถูก bypass เพราะ function เป็นโค้ดที่เชื่อถือได้',
-      'RLS ทำงานเหมือนกับที่ client query ตรง ๆ ทุกประการ',
-      'RLS ถูกปิดทั้งโปรเจกต์',
-      'RLS มีผลกับคำสั่ง insert เท่านั้น',
+      'ทุก row เพราะ Edge Functions เป็นโค้ดฝั่งเซิร์ฟเวอร์ที่เชื่อถือได้',
+      'array ว่าง — policy RLS ต้องการ auth.uid() = user_id และ client ที่ใช้ anon key โดยไม่ forward token ไม่มี auth.uid() เลย',
+      'error เพราะ anon key query table ที่เปิด RLS ไม่ได้',
+      'row แรกใน table เท่านั้น',
     ],
     answer: 1,
+    explain: 'พิสูจน์ข้างบน: curl ไปที่ edge-notes-anon คืน {"data":[],"error":null} — RLS กรองถูกต้องสำหรับผู้เรียกที่ไม่ authenticated ไม่ใช่ error',
   },
   {
-    q: 'เกิดอะไรขึ้นกับ RLS เมื่อ Edge Function ใช้ service_role key',
+    q: 'เกิดอะไรกับ RLS เมื่อ Edge Function ใช้ service_role key',
     options: [
-      'RLS ยังทำงานอยู่ แค่ยกระดับ limit ให้',
-      'RLS ถูก bypass ทั้งหมด ทุก row มองเห็นและเขียนได้',
-      'service_role key ถูก RLS บล็อกเป็นค่าเริ่มต้น',
-      'ไม่มีอะไรต่างจาก anon key',
+      'RLS ยังบังคับใช้ แค่มี limit สูงขึ้น',
+      'RLS ถูกข้ามไปทั้งหมด ทุก row มองเห็นและเขียนได้',
+      'service_role key ถูก RLS บล็อกโดย default',
+      'ไม่มีอะไรเปลี่ยนเทียบกับ anon key',
     ],
     answer: 1,
+    explain: 'พิสูจน์ข้างบน: .select(\'*\') แบบไม่กรองตัวเดิมที่คืน [] สำหรับ anon และหนึ่ง row ต่อคนสำหรับ token ที่ forward มา คืนทุก row จากทุก user สำหรับ service_role',
   },
   {
-    q: 'การใช้ service_role key ใน function เป็นตัวเลือกที่เหมาะสมเมื่อไหร่',
+    q: 'ทำไม edge-notes-forward ถึงคืนแค่ row ของ Alice ตอนเรียกด้วย token ของ Alice และคืนแค่ของ Bob ตอนเรียกด้วย token ของ Bob',
     options: [
-      'ไม่ควรใช้ใน function เลย',
-      'เมื่อ logic ของ function เองบังคับใช้กฎการเข้าถึงที่ RLS ควรจะทำให้ได้อย่างถูกต้อง',
-      'เฉพาะ query แบบอ่านอย่างเดียวเท่านั้น',
-      'เฉพาะตอนที่ไม่มี anon key ให้ใช้',
+      'เพราะโค้ด function กรองด้วย user id ที่ hardcode ไว้',
+      'เพราะ client สร้างด้วย anon key บวก header Authorization ที่ forward มาของผู้เรียกเอง RLS จึงประเมิน auth.uid() เป็น user จริงคนนั้น',
+      'เพราะใช้ service_role แล้วบังเอิญคืนมาแค่ row เดียว',
+      'row ที่กลับมาสุ่มไม่แน่นอน',
     ],
     answer: 1,
+    explain: 'ตัว function body ไม่ได้กรองด้วย user_id เองเลย — RLS บังคับตามผู้เรียกแต่ละคนเพราะ token จริงที่ forward มาตั้งค่า auth.uid() เป็น id ของตัวเอง',
   },
   {
-    q: 'ทำไมการใช้ service_role ถึงผลักภาระไปที่โค้ดของ function',
+    q: 'ทำไมการต่อ pooler ด้วยชื่อ Docker service `supabase_pooler_probe` ถึงพังจากในฟังก์ชัน แต่ใช้ได้ปกติผ่าน `docker exec` เข้า container เดียวกัน',
     options: [
-      'เพราะฐานข้อมูลยังตรวจสอบทุกอย่างให้อัตโนมัติอยู่ดี',
-      'เพราะฐานข้อมูลไม่บังคับสิทธิ์ระดับ row ให้อีกต่อไป function จึงต้องเขียน logic นั้นให้ถูกต้องเอง',
-      'ไม่มีการผลักภาระใด ๆ เลย',
-      'เพราะ query ผ่าน service_role ช้ากว่าเสมอ',
+      'pooler ไม่ได้รันอยู่จริง',
+      'user-runtime isolate ที่ sandbox resolve DNS service name ภายใน Docker ไม่ได้ แม้ container หลักจะทำได้ — พิสูจน์ด้วย error ENOTFOUND จริง',
+      'มีแค่ IPv6 address เท่านั้นที่ใช้ได้จากในฟังก์ชัน',
+      'function พิมพ์ hostname ผิด',
     ],
     answer: 1,
+    explain: 'นี่คือ user-runtime sandbox แบบเดียวกับใน "Edge Functions คืออะไร" — host.docker.internal หรือ raw IP ใช้ได้ ชื่อ Docker Compose service resolve จากในตัว isolate ไม่ได้',
+  },
+  {
+    q: 'ทำไม postgres npm driver ต้องใช้ `prepare: false` เวลาต่อผ่าน Supavisor transaction mode',
+    options: [
+      'ไม่จำเป็น นี่เป็นการตั้งค่าเฉพาะของ Prisma เท่านั้น',
+      'transaction mode สามารถส่ง query ที่ติดกันไปยัง backend connection คนละตัวได้ และ named prepared statement ที่สร้างไว้กับ backend หนึ่งจะไม่มีอยู่บนอีกตัว — session mode และ connection ตรงไม่มีปัญหานี้',
+      'prepare: false แค่ทำให้ query เร็วขึ้น ไม่มีผลอย่างอื่น',
+      'จำเป็นเฉพาะกับคำสั่ง INSERT เท่านั้น ไม่ใช่ SELECT',
+    ],
+    answer: 1,
+    explain: 'อ้างอิงจาก official troubleshooting guide: transaction mode ไม่รองรับ prepared statement ต่างจาก connection ตรงและ session mode',
+  },
+  {
+    q: 'function ที่ AI สร้างใช้ service_role client แล้วกรอง `edge_notes` ด้วย `userId` ที่อ่านตรงจาก request body ความเสี่ยงจริงคืออะไร และวิธีแก้คือ?',
+    options: [
+      'ไม่มีความเสี่ยงจริง service_role ต้องมี Supabase JWT ที่ valid เสมอ',
+      'เป็น IDOR: ผู้เรียกคนไหนก็อ่านโน้ตของใครก็ได้แค่เปลี่ยน userId ใน request body วิธีแก้คือ forward JWT ของผู้เรียกเองด้วย client ที่ใช้ anon key แล้วปล่อยให้ RLS กรองด้วย auth.uid() จริงของเขา',
+      'bug คือลืม await ไม่เกี่ยวกับความปลอดภัยเลย',
+      'วิธีแก้คือเปลี่ยน userId ให้เป็นชนิด UUID',
+    ],
+    answer: 1,
+    explain: 'service_role ข้าม RLS ไปทั้งหมด (พิสูจน์ไว้ก่อนหน้านี้) จึงไม่มีอะไรหยุด userId ที่ client ส่งมาจากการอ่าน row ไหนก็ได้ — pattern forward-JWT จากบทนี้คือวิธีแก้ ใช้ RLS ของฐานข้อมูลเองแทนการเชื่อ input จาก client',
   },
 ];
 

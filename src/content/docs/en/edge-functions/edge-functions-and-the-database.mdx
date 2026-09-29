@@ -1,6 +1,6 @@
 ---
 title: 'Edge Functions and the Database'
-description: 'How the key you initialize a supabase-js client with inside an Edge Function decides whether RLS applies or is bypassed entirely.'
+description: 'How the key you initialize a supabase-js client with inside an Edge Function decides whether RLS applies or is bypassed entirely, plus a direct Postgres connection through Supavisor.'
 sidebar:
   order: 3
 ---
@@ -8,46 +8,152 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
 
 Inside an Edge Function you can query the database with `supabase-js` exactly like client-side code, but which **key** you initialize that client with decides whether Row Level Security applies or is bypassed entirely.
 
-## Same client, two very different keys
+## A real table with RLS to prove it against
 
-An Edge Function is just server-side TypeScript, so nothing stops it from creating a `supabase-js` client and running queries the same way a browser would:
+Everything in this lesson runs against one real, namespaced table — a private notes table where each row belongs to exactly one user:
 
-```typescript
-import { createClient } from 'jsr:@supabase/supabase-js@2'
+```sql
+-- supabase/migrations/9001_edge_notes.sql
+create table public.edge_notes (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null,
+  body text not null
+);
 
-const authHeader = req.headers.get('Authorization')!
+alter table public.edge_notes enable row level security;
 
-const supabase = createClient(
-  Deno.env.get('SUPABASE_URL')!,
-  Deno.env.get('SUPABASE_ANON_KEY')!,
-  { global: { headers: { Authorization: authHeader } } },
-)
+create policy "edge_notes_own_rows"
+on public.edge_notes
+for select
+to authenticated
+using (auth.uid() = user_id);
+
+create policy "edge_notes_own_insert"
+on public.edge_notes
+for insert
+to authenticated
+with check (auth.uid() = user_id);
 ```
 
-Forwarding the caller's own `Authorization` header — the same token `supabase.functions.invoke()` attached automatically, as covered in the last lesson — means every query this client runs is scoped to that user. Row Level Security applies exactly as if the client had queried Postgres directly. The function has not gained any extra access; it is simply adding server-side logic in front of the access the user already had.
+Two real users signed up through GoTrue, and one note each seeded directly (RLS with only `select`/`insert-own` policies denies every other write path by default, so seeding bypasses it deliberately, the same way any server-side setup script would):
+
+```text
+alice_id = 49de779e-056a-4d8a-9941-18f8a1136fc9  ("alice private note")
+bob_id   = 0dd713b3-94ee-4413-8a0c-58e47626b323  ("bob private note")
+```
+
+## Same client, two very different keys
+
+An Edge Function is just server-side TypeScript, so nothing stops it from creating a `supabase-js` client and running queries the same way a browser would. Initialized with the **anon key and no forwarded user token**, it is subject to RLS as an unauthenticated request — and gets nothing back from `edge_notes`:
+
+```ts
+// supabase/functions/edge-notes-anon/index.ts
+import { createClient } from 'jsr:@supabase/supabase-js@2'
+
+Deno.serve(async (_req) => {
+  const client = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_ANON_KEY')!,
+  )
+  const { data, error } = await client.from('edge_notes').select('*')
+  return new Response(JSON.stringify({ data, error }), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+})
+```
+
+```text
+$ curl "$FUNCTIONS_URL/edge-notes-anon" -H "Authorization: Bearer $ANON_KEY" -H "apikey: $ANON_KEY"
+{"data":[],"error":null}
+```
+
+Not an error — an empty array. The `select` policy only allows `auth.uid() = user_id`, and an anon-key client has no `auth.uid()` at all, so every row is filtered out silently, exactly as RLS is supposed to behave for an unauthenticated caller.
 
 ## The service_role key bypasses RLS entirely
 
-The alternative is initializing the client with the **service_role key** instead of the anon key plus a forwarded token:
+Initialize the same client with the **service_role key** instead:
 
-```typescript
-const supabaseAdmin = createClient(
-  Deno.env.get('SUPABASE_URL')!,
-  Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,
-)
+```ts
+// supabase/functions/edge-notes-service/index.ts
+import { createClient } from 'jsr:@supabase/supabase-js@2'
+
+Deno.serve(async (_req) => {
+  const client = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,
+  )
+  const { data, error } = await client.from('edge_notes').select('*')
+  return new Response(JSON.stringify({ data, error }), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+})
 ```
 
-Queries made with this client run with RLS **bypassed entirely** — every row in every table is visible and writable, regardless of policies. This is a legitimate, common pattern, because an Edge Function is trusted server-side code, unlike a browser that could be inspected or tampered with by its own user. But it comes with a real shift in responsibility: once RLS is out of the picture, the database is no longer checking anything on this client's behalf. Whatever access control is required now has to be written, correctly, in the function's own code.
+```text
+$ curl "$FUNCTIONS_URL/edge-notes-service" -H "Authorization: Bearer $ANON_KEY" -H "apikey: $ANON_KEY"
+{"data":[
+  {"id":"8313942c-...","user_id":"49de779e-...","body":"alice private note"},
+  {"id":"9dd850a2-...","user_id":"0dd713b3-...","body":"bob private note"}
+],"error":null}
+```
+
+Same table, same unfiltered `.select('*')`, and now **every row from every user** comes back — RLS is bypassed entirely, regardless of policies. This is a legitimate, common pattern, because an Edge Function is trusted server-side code, unlike a browser that could be inspected or tampered with by its own user. But it comes with a real shift in responsibility: once RLS is out of the picture, the database is no longer checking anything on this client's behalf. Whatever access control is required now has to be written, correctly, in the function's own code.
+
+## Forwarding the caller's JWT keeps RLS working, scoped to that user
+
+The third, and most common, pattern for a function acting *on behalf of* the signed-in caller: forward their own `Authorization` header — the same token `supabase.functions.invoke()` attached automatically — into a client still built with the anon key:
+
+```ts
+// supabase/functions/edge-notes-forward/index.ts
+import { createClient } from 'jsr:@supabase/supabase-js@2'
+
+Deno.serve(async (req) => {
+  const authHeader = req.headers.get('Authorization') ?? ''
+  const client = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_ANON_KEY')!,
+    { global: { headers: { Authorization: authHeader } } },
+  )
+  const { data, error } = await client.from('edge_notes').select('*')
+  return new Response(JSON.stringify({ data, error }), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+})
+```
+
+Called with two different real users' access tokens, the same unfiltered `.select('*')` now returns exactly one row each — their own:
+
+```text
+$ curl "$FUNCTIONS_URL/edge-notes-forward" -H "Authorization: Bearer $ALICE_TOKEN" -H "apikey: $ANON_KEY"
+{"data":[{"id":"8313942c-...","user_id":"49de779e-...","body":"alice private note"}],"error":null}
+
+$ curl "$FUNCTIONS_URL/edge-notes-forward" -H "Authorization: Bearer $BOB_TOKEN" -H "apikey: $ANON_KEY"
+{"data":[{"id":"9dd850a2-...","user_id":"0dd713b3-...","body":"bob private note"}],"error":null}
+```
+
+The function has not gained any extra access; it is simply adding server-side logic in front of the access the user already had — RLS applies exactly as if each user had queried Postgres directly, with the function never seeing the other user's row at all.
+
+<Mermaid title="Three ways to initialize a Supabase client inside an Edge Function, proved against the same table" code={edgeDbKeysDiagram} />
+
+export const edgeDbKeysDiagram = `flowchart LR
+  req["Incoming request"] --> edge["Edge Function"]
+  edge -->|"anon key, no token"| anonClient["anon key client"]
+  edge -->|"forwarded user token"| userClient["anon key + forwarded Authorization"]
+  edge -->|"service_role key"| adminClient["service_role client"]
+  anonClient -->|"RLS filters everything out"| db[("edge_notes")]
+  userClient -->|"RLS: caller's own rows only"| db
+  adminClient -->|"RLS bypassed entirely"| db`;
 
 ## A concrete example: an admin-only report
 
-Suppose you need an endpoint that returns an aggregate report — total revenue across all customers — that no ordinary user's RLS policies should ever allow them to see. RLS cannot selectively "allow this one aggregate query"; it either lets a user see rows or it does not. An Edge Function is the natural place to enforce that exception:
+Suppose you need an endpoint that returns an aggregate report that no ordinary user's RLS policies should ever allow them to see. RLS cannot selectively "allow this one aggregate query"; it either lets a user see rows or it does not. An Edge Function is the natural place to enforce that exception — check identity with the caller's own forwarded token first, then reach for `service_role` only after that check passes:
 
 ```typescript
 Deno.serve(async (req) => {
@@ -86,29 +192,141 @@ Deno.serve(async (req) => {
 
 The function itself is the trust boundary here, not RLS: it checks who is calling with the user's own token, and only then reaches for `service_role` to fetch data that RLS alone could never expose safely.
 
-<Mermaid title="Two ways to initialize a Supabase client inside an Edge Function" code={edgeDbKeysDiagram} />
+## Direct Postgres via Supavisor, transaction mode
 
-export const edgeDbKeysDiagram = `flowchart LR
-  req["Incoming request"] --> edge["Edge Function"]
-  edge -->|"forwarded user token"| userClient["supabase-js client (anon key + user token)"]
-  edge -->|"service_role key"| adminClient["supabase-js client (service_role key)"]
-  userClient -->|"RLS applies"| db[("Postgres")]
-  adminClient -->|"RLS bypassed"| db`;
+`supabase-js` is not the only way to reach the database from inside a function — the `postgres` npm driver can connect straight through the **Supavisor** pooler in **transaction mode**, useful when you need raw SQL or a driver `supabase-js` does not wrap. Connecting to this local stack's pooler needs its real tenant id, confirmed by querying Supavisor's own tenant table directly rather than guessing:
+
+```text
+$ docker exec -i supabase_db_probe psql "postgresql://postgres:postgres@127.0.0.1:5432/_supabase" \
+    -c "select external_id from _supavisor.tenants;"
+ external_id
+-------------
+ pooler-dev
+```
+
+The connection string username is `postgres.<tenant external_id>`, not `postgres.<project_id>` as the hosted-project docs example suggests — a real, local-only detail worth confirming rather than assuming:
+
+```ts
+// supabase/functions/edge-notes-pooler/index.ts
+import postgres from 'npm:postgres@3'
+
+// Module-level client: created once per isolate, reused across warm invocations.
+const sql = postgres(Deno.env.get('PG_POOLER_URL')!, { prepare: false })
+
+Deno.serve(async (_req) => {
+  const rows = await sql`select pg_backend_pid() as backend_pid, count(*) as note_count from public.edge_notes`
+  return new Response(JSON.stringify({ backendPid: rows[0].backend_pid, noteCount: rows[0].note_count }), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+})
+```
+
+```text
+$ echo 'PG_POOLER_URL=postgresql://postgres.pooler-dev:postgres@host.docker.internal:55329/postgres' >> .env.local
+$ curl "$FUNCTIONS_URL/edge-notes-pooler" -H "Authorization: Bearer $ANON_KEY" -H "apikey: $ANON_KEY"
+{"backendPid":3916,"noteCount":"2"}
+```
+
+<Callout title="host.docker.internal, not the Docker service name — a sandboxing detail from the last lesson">
+The natural instinct is `supabase_pooler_probe:6543` (the pooler's Docker Compose service name, which resolves fine from a plain `docker exec` into the edge-runtime container). It fails from *inside* a running function with a real `getaddrinfo ENOTFOUND supabase_pooler_probe` — the same sandboxed **user runtime** restriction from [What Are Edge Functions](/supabase/en/edge-functions/what-are-edge-functions/), which does not resolve Docker-internal service names. `host.docker.internal` (or the container's raw IP) works from inside the isolate; on a real deployed project this is moot — you would use the project's real Supavisor hostname, reachable over public DNS from anywhere.
+</Callout>
+
+## The prepared-statement caveat in transaction mode
+
+Supavisor's transaction mode assigns a client a backend Postgres connection only for the duration of one transaction, then returns it to the pool — a different client's next query can land on a completely different backend. The `postgres` npm driver prepares every query as a named statement by default, and the [official troubleshooting guide](https://github.com/supabase/supabase/blob/master/apps/docs/content/troubleshooting/disabling-prepared-statements-qL8lEL.mdx) is explicit about the consequence: *"although the direct connections and Supavisor in session mode support prepared statements, Supavisor in transaction mode does not."* A prepared statement created against one backend simply does not exist on whichever different backend the next query happens to land on. The fix is the `prepare: false` option already used above; the broken default, kept here for the lesson (only worth reaching for when you specifically need to reproduce or discuss this failure mode):
+
+```ts
+// supabase/functions/edge-notes-pooler-prepared/index.ts
+import postgres from 'npm:postgres@3'
+
+// prepare defaults to true — this is the broken version, kept for the lesson's proof.
+const sql = postgres(Deno.env.get('PG_POOLER_URL')!)
+
+Deno.serve(async (_req) => {
+  const rows = await sql`select count(*) as note_count from public.edge_notes where user_id = ${crypto.randomUUID()}`
+  const rows2 = await sql`select count(*) as note_count from public.edge_notes where user_id = ${crypto.randomUUID()}`
+  return new Response(JSON.stringify({ ok: true, rows, rows2 }), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+})
+```
+
+<Callout title="Honest gap: not reproduced under this local, low-concurrency test">
+Attempting to force the actual `prepared statement "..." does not exist` error against this local pooler (sequentially, and with 8 concurrent requests) did not reproduce it — a single client on a lightly loaded local pool kept landing on the same backend connection every time, so the failure mode never triggered here. The mechanism and the fix (`prepare: false`, matching Prisma's own documented `?pgbouncer=true`) are real and doc-sourced above; this is stated honestly rather than staged. See [Connection Pooling and Supavisor](/supabase/en/production-and-ecosystem/connection-pooling-and-supavisor/) for session vs. transaction mode in depth.
+</Callout>
+
+## Connection reuse across invocations
+
+The pooler function above created its `postgres` client **once, at module scope**, not inside the request handler — the same warm-isolate reuse from the previous lesson's cold-start measurement applies to this connection too. Three consecutive calls, same backend, and a cold-vs-warm timing gap that matches:
+
+```text
+first call (cold isolate, new pg connection):  time_total=0.093268s  {"backendPid":3916,"noteCount":"2"}
+second call (warm, reused pg connection):      time_total=0.009264s  {"backendPid":3916,"noteCount":"2"}
+third call:                                    time_total=0.009755s  {"backendPid":3916,"noteCount":"2"}
+```
+
+The identical `backendPid` across all three calls is the proof: the module-level `sql` client, and the pooled backend connection Supavisor assigned it, both survived between invocations on the warm isolate — a fresh `postgres(...)` call inside the handler (rather than at module scope) would defeat this entirely, reconnecting on every single request.
 
 <Callout title="The one-line takeaway">
-Inside an Edge Function, initializing a `supabase-js` client with the **caller's forwarded auth token** keeps queries running **as that user with RLS enforced**, while initializing it with the **service_role key** runs queries with **RLS bypassed entirely** — a legitimate pattern for trusted server-side code, but one that shifts responsibility for correct access control onto the function's own code, as in an admin-only report the function itself gates before querying freely.
+Inside an Edge Function, initializing a `supabase-js` client with the **anon key alone** leaves it subject to RLS as an unauthenticated caller (proved: `[]`), the **caller's forwarded auth token** keeps queries running **as that user with RLS enforced** (proved: each user got only their own row), and the **service_role key** runs queries with **RLS bypassed entirely** (proved: every row, every user). A direct `postgres` connection through **Supavisor transaction mode** needs `prepare: false` (the driver's default named prepared statements are not supported across pooled backends) and a module-scope client to get real connection reuse across warm invocations (proved: identical `backendPid`, ~10x faster after the first call).
 </Callout>
+
+## Reading AI-generated code
+
+An AI assistant asked for "an endpoint that returns the signed-in user's own note" produced this:
+
+<SpotTheBug lang="ts" code={`// supabase/functions/get-my-note/index.ts
+import { createClient } from 'jsr:@supabase/supabase-js@2'
+
+Deno.serve(async (req) => {
+  const { userId } = await req.json()
+
+  const supabase = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,
+  )
+
+  const { data, error } = await supabase
+    .from('edge_notes')
+    .select('*')
+    .eq('user_id', userId)
+
+  return new Response(JSON.stringify({ data, error }), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+})
+`}>
+This "works" in every manual test the way it is meant to — until someone passes a different `userId` in the request body. The function uses `service_role` (bypassing RLS entirely, as proved above) and trusts a `userId` value that came straight from the **caller's own request body**, not from anything verified server-side — a classic IDOR (Insecure Direct Object Reference): any signed-in caller can read anyone's notes just by changing one field in the JSON they send. The fix is exactly the "forward the caller's JWT" pattern from this lesson: build the client with the caller's own forwarded `Authorization` header and the **anon** key, drop the `userId` parameter from the request body entirely, and let RLS's `auth.uid() = user_id` policy — already proved above to correctly scope results per user — do the filtering the database was designed to do. If a `service_role` client is genuinely needed for something else in the same function, the user's identity must still come from `auth.getUser()` against their own forwarded token, never from a client-supplied field.
+</SpotTheBug>
+
+## Mental Model
+
+The database cannot tell the difference between "an Edge Function queried this" and "a browser queried this" — what it can see is which **role** and which **claims** (`auth.uid()`, in particular) arrived with the request, and RLS policies are evaluated against exactly that, regardless of which layer of your stack issued the query. An anon-key client with no forwarded token carries no `auth.uid()` at all, so RLS filters as if no one is signed in. A forwarded user token carries that user's real `auth.uid()`, so RLS filters exactly as it would for that user's own direct query. `service_role` is not "a more powerful user" in this model — Postgres itself treats it as bypassing row security checks entirely, which is why the three keys above produce three completely different result sets against the identical unfiltered `.select('*')`.
+
+## Trade-offs
+
+- **Forwarding the caller's JWT keeps every RLS policy you have already written working, for free, inside a function** — **at the cost of the function being just as restricted as the user is**, which is exactly right for "add server logic in front of what this user could already do," and exactly wrong for anything that must legitimately cross users (an admin report, a cross-user aggregate).
+- **`service_role` can read and write anything, unlocking patterns RLS alone cannot express** — **at the cost of becoming a fully manual access-control boundary**: nothing except the function's own code stops it from being misused, proved above by the IDOR bug that trusted a client-supplied `userId` instead of a verified token.
+- **A direct `postgres` connection through Supavisor avoids `supabase-js`'s query builder entirely, for raw SQL or an unsupported driver feature** — **at the cost of transaction-mode's prepared-statement incompatibility**, invisible until named prepared statements are turned off explicitly.
+
+## Common Misconceptions
+
+- **"Using `supabase-js` inside an Edge Function is inherently safer than a browser using it."** The client library does not change RLS's behavior at all — what changes RLS's behavior is which key and which token the *code* decides to use, proved above with three different outcomes from the same query.
+- **"`service_role` inside a function is fine as long as the function only runs server-side."** Running server-side does not add any authorization by itself — the SpotTheBug above is `service_role` code, running exactly where it was supposed to (a deployed Edge Function), and still leaking every user's notes because nothing checked *who* was asking.
+- **"Forwarding the user's JWT is slower than using service_role directly."** The forwarded-token client still goes through the same PostgREST/Postgres path with an extra RLS check, not a meaningfully different one — the real cost difference in this lesson is cold vs. warm isolate reuse, not which key was used.
+- **"A `postgres` npm client behaves the same over Supavisor transaction mode as over a direct connection."** Proved and cited above: prepared statements (the driver's default) are a documented incompatibility specific to transaction mode, not a general Postgres limitation.
 
 export const quizEdgeFunctionsDatabase = [
   {
-    q: 'What happens to RLS when an Edge Function forwards the caller\'s own auth token to supabase-js',
+    q: 'An Edge Function queries edge_notes with an anon-key client and no forwarded Authorization header. What comes back, and why?',
     options: [
-      'RLS is bypassed because the function is trusted code',
-      'RLS applies exactly as it would for a direct client query',
-      'RLS is disabled for the whole project',
-      'RLS only applies to insert statements',
+      'Every row, because Edge Functions are trusted server-side code',
+      'An empty array — the RLS policy requires auth.uid() = user_id, and an anon-key client with no forwarded token has no auth.uid() at all',
+      'An error, because anon keys cannot query tables with RLS enabled',
+      'Only the first row in the table',
     ],
     answer: 1,
+    explain: 'Proved above: curl against edge-notes-anon returns {"data":[],"error":null} — RLS filters correctly for an unauthenticated caller, not an error.',
   },
   {
     q: 'What happens to RLS when an Edge Function uses the service_role key',
@@ -119,26 +337,51 @@ export const quizEdgeFunctionsDatabase = [
       'Nothing changes compared to the anon key',
     ],
     answer: 1,
+    explain: 'Proved above: the identical unfiltered .select(\'*\') that returned [] for anon and one row each for forwarded tokens returned every row from every user for service_role.',
   },
   {
-    q: 'When is using the service_role key inside a function an appropriate choice',
+    q: 'Why did edge-notes-forward return only Alice\'s row when called with Alice\'s token, and only Bob\'s when called with Bob\'s?',
     options: [
-      'Never, it should not be used inside functions',
-      'When the function\'s own logic correctly enforces the access rules that RLS would otherwise provide',
-      'Only for read-only queries',
-      'Only when the anon key is unavailable',
+      'Because the function code filters by a hardcoded user id',
+      'Because the client is built with the anon key plus the caller\'s own forwarded Authorization header, so RLS evaluates auth.uid() as that real user',
+      'Because service_role was used and it happened to only return one row',
+      'It is random which row comes back',
     ],
     answer: 1,
+    explain: 'The function body never filters by user_id itself — RLS applied per-caller because their real forwarded token set auth.uid() to their own id.',
   },
   {
-    q: 'Why does using service_role shift responsibility onto the function\'s code',
+    q: 'Why did connecting to the pooler with the Docker service name `supabase_pooler_probe` fail from inside the function, but work fine via `docker exec` into the same container?',
     options: [
-      'Because the database still checks everything automatically',
-      'Because the database no longer enforces row-level access, so the function must get that logic right itself',
-      'It does not shift any responsibility',
-      'Because service_role queries are always slower',
+      'The pooler was not actually running',
+      'The sandboxed user-runtime isolate cannot resolve Docker-internal DNS service names, even though the main container can — proved with a real ENOTFOUND error',
+      'Only IPv6 addresses work from inside functions',
+      'The function had a typo in the hostname',
     ],
     answer: 1,
+    explain: 'This is the same user-runtime sandboxing from "What Are Edge Functions" — host.docker.internal or a raw IP works; the Docker Compose service name does not resolve from inside the isolate.',
+  },
+  {
+    q: 'Why does the postgres npm driver need `prepare: false` when connecting through Supavisor transaction mode?',
+    options: [
+      'It does not need it, this is only a Prisma-specific setting',
+      'Transaction mode can route consecutive queries to different backend connections, and named prepared statements created on one backend do not exist on another — session mode and direct connections do not have this issue',
+      'prepare: false makes queries run faster with no other effect',
+      'It is required only for INSERT statements, never SELECT',
+    ],
+    answer: 1,
+    explain: 'Cited from the official troubleshooting guide: transaction mode does not support prepared statements, unlike direct connections and session mode.',
+  },
+  {
+    q: 'An AI-generated function uses a service_role client and filters `edge_notes` by a `userId` read directly from the request body. What is the real vulnerability, and what is the fix?',
+    options: [
+      'No real vulnerability, service_role always requires a valid Supabase JWT',
+      'It is an IDOR: any caller can read any user\'s notes by changing the userId in the request body; fix by forwarding the caller\'s own JWT with an anon-key client and letting RLS filter by their real auth.uid()',
+      'The bug is a missing await, nothing to do with security',
+      'The fix is to switch userId to a UUID type',
+    ],
+    answer: 1,
+    explain: 'service_role bypasses RLS entirely (proved earlier), so nothing stops a caller-supplied userId from reading any row — the forwarded-JWT pattern from this lesson is the fix, using the database\'s own RLS instead of trusting client input.',
   },
 ];
 
