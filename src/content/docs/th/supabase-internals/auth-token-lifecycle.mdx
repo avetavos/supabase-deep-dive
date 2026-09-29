@@ -1,0 +1,227 @@
+---
+title: 'Auth Token Lifecycle'
+description: 'GoTrue เก็บ ES256 signing key จริง ๆ ไว้ที่ไหน เทียบกับ HS256 secret แบบเก่า PostgREST verify token โดยไม่ต้องเรียกกลับไปที่ GoTrue เลยยังไง (kid lookup, clock skew 30 วินาที, และการเช็ก aud ที่ปิดอยู่โดยดีฟอลต์), chain parent/revoked จริงของ auth.refresh_tokens, แถวจริงของ auth.sessions และ auth.audit_log_entries, และจุดที่ Auth Hook แต่ละตัวทำงานจริง'
+sidebar:
+  order: 5
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ใจความสำคัญในหนึ่งประโยค
+
+GoTrue เป็น service เดียวที่ถือ private signing key จริง ๆ, PostgREST verify ทุก token ด้วยตัวเองทั้งหมดโดยใช้แค่ public key ครึ่งเดียว (หรือ HS256 secret ที่ใช้ร่วมกันสำหรับ key แบบเก่า) โดยไม่มีการเรียกกลับไปที่ GoTrue ต่อ request เลย และการ rotate refresh token ที่ [Sessions and JWTs](/supabase/th/auth-and-row-level-security/sessions-and-jwts/) พิสูจน์ไปแล้วจากฝั่ง HTTP นั้น ข้างใต้คือตาราง Postgres จริงตารางเดียวที่ track chain parent/child ของ token แบบตรงตัวเลย
+
+<Callout title="เวอร์ชันที่ใช้สำหรับทุกการพิสูจน์ด้านล่าง">
+`docker ps` บน stack ของคอร์สนี้เอง: **GoTrue (Auth) v2.196.0** `kid` เดียวกัน (`b81269f1-21d8-4f2e-b719-c2240a840d90`) ถูกอ้างอิงตลอดบทนี้และใน Sessions and JWTs — key เดียวกัน โปรเจกต์เดียวกัน มุมมองอิสระของสอง service ที่มีต่อมัน
+</Callout>
+
+## พิสูจน์: private key ES256 อยู่ที่ไหนจริง ๆ — และไม่ใช่ตารางฐานข้อมูล
+
+GoTrue เวอร์ชันนี้ **ไม่มี** ตาราง `auth.jwt_keys` เลย (`\dt auth.*` แสดง 23 ตาราง — `sessions`, `refresh_tokens`, `audit_log_entries`, `mfa_factors`, และอื่น ๆ แต่ไม่มีตัวไหนชื่อเกี่ยวกับ JWT key) Signing key ไม่ได้ถูกจัดการผ่านฐานข้อมูลเลย มันเป็น environment variable บน container Auth เอง:
+
+```text
+$ docker inspect supabase_auth_probe --format '{{range .Config.Env}}{{println .}}{{end}}' | grep -iE "JWT|KEY"
+GOTRUE_JWT_VALID_METHODS=HS256,RS256,ES256
+GOTRUE_JWT_AUD=authenticated
+GOTRUE_JWT_ISSUER=http://127.0.0.1:55321/auth/v1
+GOTRUE_JWT_EXP=3600
+GOTRUE_JWT_KEYS=[{"kty":"EC","kid":"b81269f1-21d8-4f2e-b719-c2240a840d90","use":"sig","key_ops":["sign","verify"],"alg":"ES256","ext":true,"d":"<redacted-private-scalar>","crv":"P-256","x":"M5Sjqn5zwC9Kl1zVfUUGvv9boQjCGd45G8sdopBExB4","y":"P6IXMvA2WYXSHSOMTBH2jsw_9rrzGy89FjPf6oOsIxQ"}]
+GOTRUE_JWT_SECRET=super-secret-jwt-token-with-at-least-32-characters-long
+```
+
+`GOTRUE_JWT_KEYS` คือ private key material จริง — JWK ที่มี `key_ops: ["sign","verify"]` และฟิลด์ `d` แบบ private (แก้ไขเป็นตัวยับยั้งไว้ด้านบน — คอร์สนี้ไม่ paste private key scalar จริงแม้จะเป็น local dev stack ที่ agent อื่นใช้ร่วมกันก็ตาม) `kid`, `x`, `y` ของมันคือค่า public เป๊ะ ๆ ที่ endpoint `/.well-known/jwks.json` เสิร์ฟ (พิสูจน์ใน Sessions and JWTs) — นี่คือ key pair เดียวกัน มองจากฝั่งผู้เซ็นแทนที่จะเป็นฝั่งผู้ตรวจสอบ `GOTRUE_JWT_SECRET` คือ HS256 shared secret แบบเก่าแยกต่างหาก — ตรงกับ `JWT_SECRET` ธรรมดาที่ `supabase status` แสดง — ใช้แค่กับคีย์โปรเจกต์แบบ static `anon`/`service_role` แบบเก่า ไม่เคยใช้กับ session token จริงของ user เลย (พิสูจน์ใน Sessions and JWTs ผ่าน `alg`/`kid` ที่ต่างกัน)
+
+## พิสูจน์: PostgREST verify token โดยไม่เรียกกลับไปที่ GoTrue เลย
+
+Config JWT ของ Data API เองเป็นสำเนาอิสระสมบูรณ์ ไม่ใช่ลิงก์สดไปหา Auth:
+
+```text
+$ docker inspect supabase_rest_probe --format '{{range .Config.Env}}{{println .}}{{end}}' | grep -i JWT
+PGRST_JWT_SECRET={"keys":[{"kty":"EC","kid":"b81269f1-21d8-4f2e-b719-c2240a840d90","use":"sig","key_ops":["verify"],"alg":"ES256","ext":true,"crv":"P-256","x":"M5Sjqn5zwC9Kl1zVfUUGvv9boQjCGd45G8sdopBExB4","y":"P6IXMvA2WYXSHSOMTBH2jsw_9rrzGy89FjPf6oOsIxQ"},{"kty":"oct","k":"c3VwZXItc2VjcmV0LWp3dC10b2tlbi13aXRoLWF0LWxlYXN0LTMyLWNoYXJhY3RlcnMtbG9uZw"}]}
+```
+
+ตาม [เอกสาร `jwt-secret` ของ PostgREST เอง](https://github.com/postgrest/postgrest/blob/main/docs/references/configuration.rst) config parameter นี้รับได้ทั้ง passphrase string แบบ HS256 ธรรมดา **หรือ** JSON Web Key / JWK Set ตรง ๆ — ไม่มีโหมด "fetch จาก JWKS URL" แยกต่างหากเลยที่นี่ ค่าที่ PostgREST ได้รับ **คือ** JSON รูปร่าง JWKS สอง key ฝังตรง ๆ ใน environment ของมันเอง Key แรกคือ `EC`/`ES256` **public-only** (ไม่มีฟิลด์ `d` — มีแค่ `key_ops: ["verify"]` ตามที่ verifier ต้องการพอดี) พร้อม `kid`/`x`/`y` เดียวกันเป๊ะกับที่ GoTrue เซ็นด้วย; key ที่สองคือ `oct` (symmetric) แบบเก่า — การเข้ารหัส base64 ของ string `super-secret-jwt-token-with-at-least-32-characters-long` เดียวกันเป๊ะ สำหรับ verify คีย์ static `anon`/`service_role` PostgREST ถอดรหัสและ verify JWT ของทุก request กับสำเนา local คงที่นี้ — พิสูจน์ได้จากโครงสร้างเอง: ไม่มีอะไรใน `PGRST_JWT_SECRET` เป็น URL และไม่มีตัวแปร `PGRST_JWT_*` ตัวไหนชี้ไปที่ endpoint ของ GoTrue เลยใน env ของ container นี้
+
+<Mermaid title="Key pair เดียว, สำเนาอิสระสองชุด — ไม่มี runtime coupling" code={tokenVerifyDiagram} />
+
+export const tokenVerifyDiagram = `flowchart TD
+  gotrue["GoTrue: GOTRUE_JWT_KEYS (private d + public x/y, ES256)\\nsigns access tokens"] -->|"same key pair, published"| jwks["/.well-known/jwks.json (public half only)"]
+  gotrue -.->|"NOT a runtime dependency"| pgrst["PostgREST"]
+  jwks -.->|"a human/tool could fetch this, PostgREST here does not"| pgrst
+  config["PGRST_JWT_SECRET env var: the SAME public ES256 key + legacy HS256 oct key, inlined at container start"] --> pgrst
+  pgrst -->|"kid present? exact key match. kid absent? try each key."| verify["Verify signature + exp/nbf/iat (30s skew) + aud (only if jwt-aud configured)"]`;
+
+## พิสูจน์: การ lookup `kid`, clock skew จริง 30 วินาที, และการเช็ก `aud`/`iss` ที่แคบกว่าที่คิด
+
+ตาม [เอกสาร JWT Claims Validation ของ PostgREST](https://github.com/postgrest/postgrest/blob/main/docs/references/auth.rst) และ source ของมันเอง (`PostgREST.Auth.Jwt`, `checkForErrors`):
+
+- **การ lookup `kid`**: *"If the JWT contains a `kid` parameter, then PostgREST will look for the JSON Web Key in `jwt-secret`... If the JWT doesn't have a `kid`, PostgREST will try each key... one by one until it finds one that works."* นี่คือเหตุผลเป๊ะ ๆ ที่ session token จริง (แบก `kid: b81269f1-...`) resolve ตรงไปยัง key ES256 ด้านบนเลย ขณะที่คีย์ static `anon`/`service_role` (พิสูจน์ใน Sessions and JWTs ว่าไม่มี `kid` เลย) fallback ไปลองทุก key ใน set จนกว่าตัว `oct` จะสำเร็จ
+- **Clock skew**: *"We allow a 30-second clock skew when validating [`exp`/`iat`/`nbf`]... an extra 30 seconds before the JWT is rejected if there is a slight discrepancy in the timestamps."* Source ของ function validation จริงระบุค่าคงที่ตรง ๆ: `allowedSkewSeconds = 30 :: Int64`
+- **การเช็ก `aud` — ปิดโดยดีฟอลต์**: *"If `jwt-aud` is not set (the default), PostgREST identifies with all audiences and allows the JWT for any `aud` claim."* `docker inspect` ของ `supabase_rest_probe` ในบทนี้ด้านบนโชว์ว่า**ไม่มี** ตัวแปร `PGRST_JWT_AUD` เลย — ดังนั้นบน stack นี้ PostgREST ไม่เช็ก `aud` บน token ไหนเลย แม้ว่า GoTrue เองจะบังคับ `GOTRUE_JWT_AUD=authenticated` ตอน **ออก** token ก็ตาม กฎ `"aud" ต้องเป็น `authenticated`` ที่ [Sessions and JWTs](/supabase/th/auth-and-row-level-security/sessions-and-jwts/) ระบุไว้เป็นเรื่องจริง แต่มันเป็นการรับประกันตอนออก token ของ GoTrue เอง ไม่ใช่สิ่งที่ PostgREST verify ซ้ำอิสระบน config local นี้
+- **`iss` — ไม่ถูกเช็กเลย**: function `checkForErrors` จริง (อ้างตรง ๆ จาก source ของ PostgREST เอง) verify claim ทั้งหมดสี่ตัวเป๊ะ ๆ: `exp`, `nbf`, `iat`, `aud` — `iss` (issuer) ไม่อยู่ในนั้นเลย PostgREST ไม่มี built-in check เรื่อง issuer-matching เลย `GOTRUE_JWT_ISSUER` กำหนดสิ่งที่ GoTrue เอง *เขียน* ลงใน claim `iss` แต่ไม่มีอะไรฝั่ง PostgREST อ่านมันกลับมาเทียบเลย
+
+<Callout title="แก้ความเข้าใจตามธรรมชาติ">
+เป็นเรื่องง่ายที่จะสมมติว่าทุก claim มาตรฐานของ JWT (`aud`, `iss`) ถูก verify แบบสมมาตรโดยทุก service ที่แตะ token พิสูจน์ด้านบนจาก source จริงปัจจุบันของ PostgREST เอง: มันเช็ก `exp`/`nbf`/`iat` (พร้อม clock skew จริง 30 วินาที) แบบไม่มีเงื่อนไข แต่ `aud` เช็กก็ต่อเมื่อตั้งค่าไว้ชัดเจนเท่านั้น (`jwt-aud` ไม่ได้ตั้งบน stack นี้) และไม่เคยเช็ก `iss` เลย อย่าสมมติว่า issuer-pinning กำลังเกิดขึ้นฝั่ง Data API นอกจากคุณจะตรวจสอบ `jwt-aud` และเช็กโค้ด validation จริงแบบที่บทนี้เพิ่งทำไป — มันขึ้นอยู่กับการตั้งค่าของ operator ทั้งหมด ซึ่ง stack ของคอร์สนี้เองไม่ได้ตั้งไว้
+</Callout>
+
+## พิสูจน์: chain parent/revoked จริงของ `auth.refresh_tokens`
+
+[Sessions and JWTs](/supabase/th/auth-and-row-level-security/sessions-and-jwts/) พิสูจน์การ rotate refresh ไปแล้วจากฝั่ง HTTP (error `refresh_token_already_used` จริงตอน reuse) นี่คือ rotation เดียวกัน มองจากข้างใต้ — สมัครใหม่แล้ว refresh จริงสองครั้ง แล้วอ่านตารางตรง ๆ:
+
+```text
+$ docker exec -i supabase_db_probe psql -U postgres -c "select id, left(token,8) as token8, left(parent,8) as parent8, revoked, session_id from auth.refresh_tokens where user_id = '<this test user's id>' order by id;"
+ id  |  token8  | parent8  | revoked |              session_id
+-----+----------+----------+---------+--------------------------------------
+ 103 | t5vnytrn |          | t       | 6242b953-8aeb-471e-935f-f66fdc82b978
+ 104 | rlgd3eu7 | t5vnytrn | t       | 6242b953-8aeb-471e-935f-f66fdc82b978
+ 105 | mgmpw7rx | rlgd3eu7 | f       | 6242b953-8aeb-471e-935f-f66fdc82b978
+```
+
+สามแถว หนึ่ง session จริง (`session_id` เหมือนกันทั้งสามแถว) และคอลัมน์ `parent` วาด linked list ตรงตัว: `parent` ของแถว 104 คือ token ของแถว 103 เอง, `parent` ของแถว 105 คือของแถว 104 — chain ที่เดินตามได้จริง จาก token ล่าสุดที่ยังใช้ได้ย้อนกลับไปถึงตัวแรกสุดที่ออกตอนสมัคร `revoked` พลิกเป็น `true` ทันทีที่ token ถูกใช้เพื่อสร้างตัวสืบทอด — แถว 103 กับ 104 ทั้งคู่ `revoked = true` มีแค่ 105 (ตัวปัจจุบัน) ที่เป็น `false` นี่คือกลไกตรงตัวเบื้องหลัง error `refresh_token_already_used` — การใช้ token 103 หรือ 104 ซ้ำล้มเหลว ไม่ใช่เพราะแถวถูกลบ แต่เพราะ `revoked` ถูกเช็กแล้วพบว่าเป็น `true`
+
+```text
+$ docker exec -i supabase_db_probe psql -U postgres -c "select id, user_id, aal, created_at from auth.sessions where user_id = '<...>';"
+                  id                  |               user_id               | aal  |          created_at
+--------------------------------------+--------------------------------------+------+-------------------------------
+ 6242b953-8aeb-471e-935f-f66fdc82b978 | b205af2e-73f5-451c-a28c-fe83a3e90042 | aal1 | 2026-09-29 08:11:10.666279+00
+```
+
+หนึ่งแถว `auth.sessions` ต่อหนึ่งการ sign-in ไม่ใช่ต่อ token — ทุก refresh ใน chain ด้านบนแชร์ `id` นี้เป๊ะ ๆ ยืนยันว่า "session" กับ "refresh token" คือคนละอย่างกัน เกี่ยวข้องกันแต่แยกกัน: การ rotate token หลายครั้งตลอดชีวิตของ session ไม่เคยสร้างแถว session ที่สองเลย
+
+## พิสูจน์: `auth.audit_log_entries` — ลำดับ event จริงของหนึ่งการสมัคร + สอง refresh
+
+```text
+$ docker exec -i supabase_db_probe psql -U postgres -c "select payload->>'action' as action, created_at from auth.audit_log_entries where payload->>'actor_id' = '<...>' order by created_at;"
+     action      |          created_at
+-----------------+-------------------------------
+ user_signedup   | 2026-09-29 08:11:10.661463+00
+ login           | 2026-09-29 08:11:10.665767+00
+ token_refreshed | 2026-09-29 08:11:10.745146+00
+ token_revoked   | 2026-09-29 08:11:10.745647+00
+ token_refreshed | 2026-09-29 08:11:10.80385+00
+ token_revoked   | 2026-09-29 08:11:10.804243+00
+```
+
+หกแถวจริง มี timestamp สำหรับสิ่งที่ดูเหมือนสาม HTTP call (สมัคร, refresh, refresh): `user_signedup` กับ `login` ทั้งคู่ยิงตอนสมัครครั้งแรก (บัญชีใหม่ถูก**สร้าง**และ**sign-in**พร้อมกัน) และแต่ละการเรียก refresh สองครั้งสร้าง**สอง**แถว — `token_refreshed` (token ใหม่ถูกออก) ตามด้วย `token_revoked` (ตัวเก่าถูก invalidate) ทันที — ตรงกับการพลิก `revoked` ที่เห็นใน `auth.refresh_tokens` ด้านบนแทบจะถึงระดับมิลลิวินาที
+
+## พิสูจน์: จุดที่ Auth Hook ทำงานจริง จากเอกสารของ Supabase เอง
+
+Hook `Customize Access Token Claims` พิสูจน์ครบวงจรไปแล้ว (รูปร่าง config, function contract, ค่าที่คืนจริง) ใน [RLS Patterns and Pitfalls](/supabase/th/auth-and-row-level-security/rls-patterns-and-pitfalls/) — ไม่พิสูจน์ซ้ำที่นี่ Shared stack ของคอร์สนี้แก้ `config.toml` ต่อบทไม่ได้ (การเปลี่ยน hook wiring เป็นระดับโปรเจกต์ ไม่ใช่ต่อบท) ดังนั้น hook ที่เหลือด้านล่างนี้มาจากเอกสารปัจจุบันของ Supabase เอง ไม่ได้ต่อสายและยิงจริง; แต่ละตัวทำงานที่จุดที่ต่างกันจริง ๆ ในขั้นตอน auth ไม่ใช่ลำดับเชิงเส้นเดียว:
+
+| Hook | ทำงานเมื่อไหร่ | แหล่งที่มา |
+|---|---|---|
+| `BEFORE_USER_CREATED` | ก่อนที่แถว user ใหม่จะถูก insert ระหว่างสมัคร — ปฏิเสธการสมัครได้เลย ทำให้ user ที่ถูกปฏิเสธไม่ถูกสร้างขึ้นมาเลย | [docs](https://supabase.com/docs/guides/auth/auth-hooks/before-user-created-hook): *"This hook runs before a new user is created... If the hook returns an error object, the signup is denied and the user is not created."* |
+| `CUSTOM_ACCESS_TOKEN` | ทุกครั้งที่ GoTrue กำลังจะออก JWT — sign-in, sign-up, และทุกการ rotate refresh เหมือนกันหมด | [docs](https://supabase.com/docs/guides/auth/auth-hooks/custom-access-token-hook) พิสูจน์จริงแล้วใน RLS Patterns and Pitfalls |
+| `PASSWORD_VERIFICATION_ATTEMPT` | ทันทีหลังจาก GoTrue เช็ก password ที่ส่งมากับ hash ที่เก็บไว้ ทุกครั้งที่พยายาม sign-in ด้วย password ไม่ว่าสำเร็จหรือล้มเหลว | [docs](https://supabase.com/docs/guides/auth/auth-hooks/password-verification-hook) — ตัวอย่างใช้งานจริง track ความพยายามที่ล้มเหลวแล้วส่งอีเมลถึง user เมื่อเกิน threshold |
+| `MFA_VERIFICATION_ATTEMPT` | ทันทีหลังจากรหัส MFA ที่ส่งมาถูกเช็ก ระหว่างขั้นตอน MFA challenge-verify (คนละขั้นตอนกับการเช็ก password เริ่มต้น) | [docs](https://supabase.com/docs/guides/auth/auth-hooks/mfa-verification-hook) — ตัวอย่างใช้งานจริง rate-limit ความล้มเหลวซ้ำ ๆ ด้วย `429` |
+| `SEND_EMAIL` | ทุกครั้งที่ GoTrue จะส่งอีเมลเกี่ยวกับ auth ใด ๆ (ยืนยัน, magic link, recovery ฯลฯ) — แทนที่ mailer ในตัวทั้งหมด ไม่ใช่รันคู่กัน | [docs](https://supabase.com/docs/guides/self-hosting/self-hosted-auth-hooks) ตาราง hook |
+
+อ่านจากบนลงล่างเทียบกับ flow สมัคร-พร้อม-password-และ-MFA จริง ลำดับจริงที่ request หนึ่งอาจชน hook พวกนี้หลายตัวคือ: `BEFORE_USER_CREATED` (สมัคร) → `SEND_EMAIL` (อีเมลยืนยัน ถ้าเปิดใช้) → `CUSTOM_ACCESS_TOKEN` (token แรกที่ออก) → ตอน sign-in ครั้งถัดไป `PASSWORD_VERIFICATION_ATTEMPT` → `MFA_VERIFICATION_ATTEMPT` (ถ้าลงทะเบียน MFA ไว้) → `CUSTOM_ACCESS_TOKEN` อีกครั้งสำหรับ token หลัง MFA นี่คือคำอธิบาย *เมื่อไหร่แต่ละตัวทำงานเทียบกับ flow* ไม่ใช่ pipeline ตายตัวเดียวที่ทุก request ผ่าน — การ sign-in ด้วย password ธรรมดาที่ไม่มี MFA ไม่เคยแตะ `MFA_VERIFICATION_ATTEMPT` เลย
+
+## อ่านโค้ดที่ AI เขียน
+
+<SpotTheBug lang="ts" code={`// AI-generated "verify this Supabase JWT looks legitimate before trusting it"
+import { jwtVerify, decodeProtectedHeader } from 'jose';
+
+async function checkToken(token: string) {
+  const { alg } = decodeProtectedHeader(token);
+  // "any recognized Supabase signing algorithm is fine"
+  if (alg !== 'ES256' && alg !== 'HS256') {
+    throw new Error('unsupported algorithm');
+  }
+  const payload = JSON.parse(atob(token.split('.')[1]));
+  if (payload.iss !== 'http://127.0.0.1:55321/auth/v1') {
+    throw new Error('wrong issuer');
+  }
+  return payload;
+}`}>
+มีบั๊กจริงสองตัว ทั้งคู่พิสูจน์ด้านบน อย่างแรก function นี้แค่ base64-decode payload (`JSON.parse(atob(...))`) แล้วไม่เคยเรียก verify function จริงกับ key ไหนเลย — มันอ่าน claim โดยไม่เคยเช็ก signature เลย หมายความว่า token ที่ payload ถูกแก้มือและไม่มี signature ที่ถูกต้อง "ผ่าน" การเช็กนี้ได้ง่าย ๆ นี่เหมือนกับพฤติกรรมของ `getSession()` เองที่ไม่เช็ก signature ที่ [Sessions and JWTs](/supabase/th/auth-and-row-level-security/sessions-and-jwts/) พิสูจน์ไปแล้วว่ายอมรับ token ที่ถูกแก้ไข อย่างที่สอง แม้จะเพิ่มการ verify signature เข้าไปแล้ว การเทียบ `iss` ก็ยังเช็กสิ่งที่ **โค้ด validation จริงของ PostgREST เองไม่เช็กเลย** (พิสูจน์ด้านบน: `checkForErrors` verify แค่ `exp`/`nbf`/`iat`/`aud` เป๊ะ ๆ ไม่เคย `iss`) — การเขียน logic issuer-pinning เองตรงนี้ทำซ้ำการเช็กที่ platform ไม่ได้ทำที่ไหนเลยฝั่ง downstream ทำให้รู้สึกผิด ๆ ว่า "issuer" เป็นขอบเขตความปลอดภัยที่ Supabase บังคับใช้ end-to-end ทั้งที่ฝั่ง Data API มันไม่ใช่เชิงโครงสร้างเลย วิธีแก้สำหรับการ verify signature จริง ๆ คือ `jwtVerify` จาก `jose` เทียบกับ public JWKS จริง (`/.well-known/jwks.json` พิสูจน์ใน Sessions and JWTs) — และถ้าต้องการ issuer-pinning จริง ๆ ต้องบังคับใช้ในโค้ดแอปแบบนี้เอง ชัดเจน เพราะทั้ง PostgREST และการเช็กนี้ (ตามที่เขียนไว้ ก่อนแก้) ไม่ได้ทำถูกต้องเลย
+</SpotTheBug>
+
+## Mental Model
+
+ลองนึกภาพ GoTrue กับ PostgREST เป็นทนายรับรองเอกสารสองคนแยกกัน ที่ได้รับ **สำเนา** ของตราประทับเดียวกัน (key pair) ครั้งเดียวตอนเริ่มต้น แล้วไม่เคยคุยกันอีกเลยต่อ request GoTrue เป็นคนเดียวที่เคยมีบล็อกแกะสลักของตราประทับ (private key, `d`) — มันประทับตราใหม่ (ออก token) และแจกรอยประทับ public ของหน้าตรา (JWKS endpoint) ให้ใครก็ตามเอาไปเช็กตราได้ PostgREST ได้รับรอยประทับ public เดียวกันนั้นแยกต่างหาก (ฝังไว้ใน config ของตัวเองตอน container เริ่ม) แล้วเช็กทุกตราด้วยตัวเอง local ล้วน ๆ — ไม่มีการโทรกลับไปหา GoTrue เลย ต่อ request กฎที่ทนายแต่ละคนเช็กไม่เหมือนกันเป๊ะ: GoTrue รับประกันสิ่งที่มันเขียนลง token ตอนเซ็น (`aud`, `iss`); PostgREST พิสูจน์ด้านบนแล้วว่าเช็กซ้ำแค่ชุดที่แคบกว่า (`exp`/`nbf`/`iat` เสมอ, `aud` แค่ตอนตั้งค่าไว้, `iss` ไม่เคยเลย) — เชื่อการรับประกันของ GoTrue เองสำหรับทุกอย่างที่มันไม่ verify ซ้ำเอง
+
+## Trade-offs
+
+| ทางเลือกการออกแบบ | ข้อดี | ต้นทุน |
+|---|---|---|
+| PostgREST verify token local ไม่เรียกกลับไป GoTrue เลย | ไม่มี network round trip หรือ dependency กับความพร้อมใช้งานของ GoTrue ในทุก Data API request — พิสูจน์ด้านบนด้วยการที่ไม่มี endpoint ของ GoTrue อยู่ใน JWT config ของ PostgREST เองเลย | Key ของสอง service อาจ drift ไม่ตรงกันได้ถ้าตัวหนึ่งถูก rotate โดยไม่อัปเดต config ของอีกตัว — ไม่มีอะไรบังคับให้มันตรงกันนอกจากวินัยของ operation |
+| การเช็ก `aud` ปิดอยู่จนกว่าจะตั้ง `jwt-aud` ชัดเจน | ดีฟอลต์ง่ายกว่า — ไม่เสี่ยง token ที่ออกมาถูกต้องแล้วถูกปฏิเสธเพราะการเช็ก audience ที่เข้มเกินไปหรือ config ผิด | พิสูจน์ด้านบน: บน stack ที่ไม่ได้ตั้งค่า token ไหนก็ตามที่มี signature ถูกต้องและ timestamp สดใหม่จะถูกยอมรับไม่ว่าค่า `aud` จะเป็นอะไร — audience ไม่ใช่ขอบเขตความปลอดภัยที่นี่ นอกจาก operator จะเปิดมันเอง |
+| Refresh token เป็น chain parent/revoked จริง query ได้ แทนที่จะเป็น secret หมุนแบบ stateless | การตรวจจับ reuse เป็นการ lookup แถวจริง ตรวจสอบได้ (`revoked = true`) ไม่ใช่ heuristic — พิสูจน์ด้านบนด้วย chain 3 แถวจริง | มีการเขียนตารางเพิ่มทุกครั้งที่ refresh (และทุก session แบก chain ที่ยาวไม่มีขีดจำกัดตลอดอายุของมัน นอกจากจะถูก prune) |
+| Auth Hook ห้าตัวที่แยกกันทำงานที่จุดต่างกันของ flow แทนที่จะเป็น hook "on auth event" ทั่วไปตัวเดียว | Payload ของแต่ละ hook มีรูปร่างเฉพาะสำหรับจังหวะของมันเป๊ะ ๆ (payload ของความพยายาม password ต่างจากของ MFA) — extension point ที่แม่นยำ มี type | มีจุด integration ห้าจุดต่างกันที่ต้องคิดถึง แทนที่จะเป็นจุดเดียว — และไม่มีตัวไหนเทสต์กับ shared local stack ของคอร์สนี้ได้เลยโดยไม่เปลี่ยน `config.toml` ระดับโปรเจกต์ พิสูจน์ด้านบนแล้วว่านอกเหนือขอบเขตต่อบท |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"GoTrue กับ PostgREST แชร์ connection สดตัวเดียวกันในการ verify token"** พิสูจน์ว่าผิดด้านบน: `PGRST_JWT_SECRET` เป็นสำเนา static ของ public key material ที่ฝังไว้ตอน container เริ่ม — ไม่มี URL ของ GoTrue ปรากฏที่ไหนเลยใน JWT config ของ PostgREST เอง
+- **"PostgREST เช็ก claim `aud` และ `iss` แบบเดียวกับที่ GoTrue เช็ก"** พิสูจน์ว่าผิดด้านบนจาก source validation จริงของ PostgREST เอง: `aud` เช็กก็ต่อเมื่อตั้ง `jwt-aud` ไว้ชัดเจน (บน stack นี้ไม่ได้ตั้ง) และ `iss` ไม่เคยถูกเช็กเลย — ชุดการรับประกันที่แคบกว่าที่ GoTrue ให้ตอนออก token มาก
+- **"การ 'rotate' refresh token แปลว่าตัวเก่าถูกลบ"** พิสูจน์ว่าผิดด้านบน: แถวเก่ายังอยู่ใน `auth.refresh_tokens`, `revoked` พลิกเป็น `true`, และ `parent` ของแถวใหม่ชี้กลับไปหามัน — chain จริง ตรวจสอบได้ ไม่ใช่ลบแล้วสร้างใหม่
+- **"Auth Hook ทุกตัวทำงานทุก request ในลำดับตายตัวเดียว"** พิสูจน์ว่าผิดด้านบนด้วยตารางจุดประสงค์ของ hook: แต่ละตัวทำงานที่จุดที่ต่างกันจริง ๆ เฉพาะเจาะจงในขั้นตอน auth (สมัคร, ออก token, เช็ก password, เช็ก MFA, ส่งอีเมล) — การ sign-in ด้วย password ธรรมดาที่ไม่ได้ลงทะเบียน MFA ไม่เคยเรียก `MFA_VERIFICATION_ATTEMPT` เลย
+
+## แบบทดสอบ
+
+export const quizAuthTokenLifecycle = [
+  {
+    q: 'docker inspect บน supabase_auth_probe โชว์ GOTRUE_JWT_KEYS มีฟิลด์ private "d" ขณะที่ endpoint /.well-known/jwks.json (พิสูจน์ใน Sessions and JWTs) เสิร์ฟ kid/x/y เดียวกันโดยไม่มี "d" สิ่งนี้ยืนยันอะไร (What does this confirm?)',
+    options: [
+      'The two are unrelated keys that happen to share a kid by coincidence',
+      'GoTrue holds the full private key (able to sign) while the public JWKS endpoint exposes only the verify-capable public half of the exact same key pair',
+      'The "d" field is deprecated and has no cryptographic meaning',
+      'PostgREST also has access to the "d" field via its own JWT config',
+    ],
+    answer: 1,
+    explain: 'Entry จริงของ GOTRUE_JWT_KEYS มี key_ops: ["sign","verify"] และ scalar private "d"; kid/x/y ของ JWKS endpoint ที่ตรงกัน (ค่าเดียวกัน) โดยไม่มี "d" คือครึ่ง public-only — พิสูจน์ตรง ๆ ด้วยการเทียบ output จริงทั้งสอง ไม่ได้สมมติจากการมี kid ร่วมกันเพียงอย่างเดียว',
+  },
+  {
+    q: 'docker inspect บน supabase_rest_probe โชว์ PGRST_JWT_SECRET เป็น JWKS JSON สอง key ตรง ๆ (EC public key บวก oct key) ไม่ใช่ URL สิ่งนี้พิสูจน์อะไรเกี่ยวกับวิธีที่ PostgREST verify token ตอน request (What does this prove?)',
+    options: [
+      'PostgREST fetches the current JWKS from GoTrue on every request to stay in sync',
+      'PostgREST verifies every token against a static, locally-held copy of the key material set at container start — no runtime call to GoTrue is involved',
+      'PostgREST only supports HS256 and ignores the EC key entirely',
+      'The JWKS value is decorative; PostgREST actually reads keys from a database table',
+    ],
+    answer: 1,
+    explain: 'ค่าที่เป็น JSON ที่มี key material ดิบอยู่ข้างใน ไม่ใช่ URL string จะ "fetch" ตอน request ไม่ได้เลย — มันถูกฝังอยู่ใน environment ของ PostgREST เองตอน container เริ่ม พิสูจน์ตรง ๆ จาก output ของ docker inspect ที่มี key ดิบอยู่แทนที่จะเป็น address ของ endpoint',
+  },
+  {
+    q: 'Source validation จริงของ PostgREST เอง (checkForErrors) ถูกอ้างว่าเช็ก claim สี่ตัวเป๊ะ ๆ: exp, nbf, iat, aud สิ่งนี้พิสูจน์อะไรเกี่ยวกับการ verify iss (issuer) ฝั่ง Data API ของ stack นี้ (What does this prove about iss validation?)',
+    options: [
+      'iss is checked implicitly as part of the aud check',
+      'iss is not checked by PostgREST at all — GOTRUE_JWT_ISSUER controls what GoTrue writes into the claim, but nothing on the PostgREST side compares it',
+      'iss is checked, but only for asymmetric (ES256) tokens',
+      'iss checking requires a separate PGRST_JWT_ISS variable that this stack sets',
+    ],
+    answer: 1,
+    explain: 'Function checkForErrors ที่อ้างไว้ระบุ exp/nbf/iat/aud เป็นสี่ claim ที่ verify อย่างชัดเจน — iss ไม่อยู่ในรายการนั้นเลย ยืนยันตรง ๆ จาก source จริงของ PostgREST เอง ไม่ได้อนุมานจากพฤติกรรม',
+  },
+  {
+    q: 'แถวจริงของ auth.refresh_tokens โชว์ id 103 (revoked=true, ไม่มี parent), id 104 (revoked=true, parent=token ของ 103), id 105 (revoked=false, parent=token ของ 104) ทั้งหมดแชร์ session_id เดียวกัน โครงสร้างนี้พิสูจน์อะไรเกี่ยวกับ "refresh token rotation" (What does this prove?)',
+    options: [
+      'Each refresh deletes the old token row and creates an unrelated new one',
+      'Rotation keeps every token as a real, auditable row forming a parent-linked chain within one unchanging session — reuse detection is a revoked-flag lookup, not a heuristic',
+      'A new session row is created on every single refresh',
+      'The parent column is unused metadata with no functional role',
+    ],
+    answer: 1,
+    explain: 'สามแถวจริงแชร์ session_id เดียวกัน (พิสูจน์ว่าเป็น session เดียว token หมุนหลายครั้ง) และคอลัมน์ parent ของแถวใหม่แต่ละแถวชี้ไปที่ค่าของ token ก่อนหน้าเป๊ะ ๆ พร้อม revoked พลิกเป็น true บนแถวที่ถูกแทนที่ — chain ตรงตัว query ได้ ไม่ใช่ลบแล้วสร้างใหม่ หรือ heuristic ที่มองไม่เห็น',
+  },
+  {
+    q: 'ตามตารางจุดประสงค์ hook จริงที่มาจากเอกสารของ Supabase เอง flow auth แบบไหนที่จะเรียก MFA_VERIFICATION_ATTEMPT (Which flow would invoke it?)',
+    options: [
+      'Every single sign-in, regardless of whether MFA is enrolled',
+      'Only a sign-in flow where the user has MFA enrolled and is actively completing an MFA challenge-verify step — a plain password-only sign-in never reaches it',
+      'Only the initial signup, never a subsequent sign-in',
+      'Only when the CUSTOM_ACCESS_TOKEN hook explicitly calls it',
+    ],
+    answer: 1,
+    explain: 'ตารางจุดประสงค์ hook (มาจากเอกสารของ Supabase เอง) ระบุว่า MFA_VERIFICATION_ATTEMPT ทำงาน "immediately after a submitted MFA code is checked" — เป็นขั้นตอนแยกจากการเช็ก password ที่เกิดขึ้นก็ต่อเมื่อ MFA เป็นส่วนหนึ่งของ flow sign-in นั้นจริง ๆ เท่านั้น',
+  },
+];
+
+<Quiz client:visible id="supabase-internals/auth-token-lifecycle" questions={quizAuthTokenLifecycle} />
+
+<ProgressTracker client:visible id="supabase-internals/auth-token-lifecycle" />
