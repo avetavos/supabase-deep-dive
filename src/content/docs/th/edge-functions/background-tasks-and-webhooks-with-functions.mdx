@@ -1,6 +1,6 @@
 ---
-title: 'Background Tasks และ Webhooks กับ Functions'
-description: 'การเรียก Edge Function อัตโนมัติจากการเปลี่ยนแปลงในฐานข้อมูลด้วย Database Webhooks และการรันงานต่อหลังตอบ response ด้วย EdgeRuntime.waitUntil'
+title: 'Background Task และ Webhook กับ Functions'
+description: 'สั่ง Edge Function จากการเปลี่ยนแปลงในฐานข้อมูลด้วย Database Webhooks, รันงานหลัง response ด้วย EdgeRuntime.waitUntil, pg_net async semantics, pg_cron, idempotency และพฤติกรรมตอน shutdown'
 sidebar:
   order: 4
 ---
@@ -8,130 +8,300 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
 
-**Database Webhook** ทำให้ row ที่เปลี่ยนแปลงใน Postgres เรียก Edge Function ได้อัตโนมัติ ส่วน `EdgeRuntime.waitUntil` ทำให้ function นั้นตอบกลับทันทีในขณะที่งานที่ช้ากว่ายังทำต่อในเบื้องหลัง
+**Database Webhook** ทำให้การเปลี่ยนแปลง row ใน Postgres เรียก Edge Function ได้อัตโนมัติ และ `EdgeRuntime.waitUntil` ทำให้ function นั้นตอบกลับได้ทันทีในขณะที่งานที่ช้ากว่ายังทำต่อในพื้นหลัง
 
-## Database Webhooks ให้ฐานข้อมูลเป็นฝ่ายเรียกออกไปเอง
+## `EdgeRuntime.waitUntil` พิสูจน์ด้วย timestamp จริง
 
-Edge Function ทุกตัวที่ผ่านมาถูกเรียกโดย client อย่างชัดเจนด้วย `supabase.functions.invoke()` แต่งานจริงจำนวนมากควรเกิดขึ้นเพราะ**การเปลี่ยนแปลงในฐานข้อมูล** ไม่ใช่เพราะ client จำได้ว่าต้องเรียก เช่น ส่ง welcome email ตอนมี row ใหม่ใน `profiles` หรือแจ้งระบบปลายทางตอนมีการสั่งซื้อ Database Webhooks ตอบโจทย์นี้ตรง ๆ ตั้งค่าบน table สำหรับ event `insert`, `update` หรือ `delete` แล้ว Supabase จะยิง HTTP request ให้ทุกครั้งที่ event นั้นเกิดขึ้น
+`EdgeRuntime.waitUntil(promise)` ทำเครื่องหมาย promise ว่าเป็น background task ที่ยังรันต่อหลังจาก function ส่ง response ไปแล้ว — instance ของ function จะยังอยู่จนกว่า promise นั้นจะ settle โดยไม่ทำให้ HTTP response ต้องรอ การพิสูจน์ต้องเห็น **การไม่ใส่ `await`** ชัดเจน และต้องโชว์ว่า response กลับไปจริงก่อนงานพื้นหลังจะเสร็จ ไม่ใช่แค่อ้างลอย ๆ
 
-เบื้องหลัง Database Webhook คือ wrapper สะดวกใช้ที่ครอบ Postgres trigger อยู่ สร้างบน extension **`pg_net`** `pg_net` ยิง HTTP request จากใน Postgres แบบ**asynchronous** ดังนั้น network call ที่ช้าหรือ fail จะไม่บล็อกการเขียนข้อมูลที่ทำให้เกิด trigger นั้นเลย คำสั่ง `insert` commit ได้ไม่ว่า HTTP call ของ webhook จะใช้เวลานานแค่ไหน
+```ts
+// supabase/functions/edge-waituntil/index.ts
+declare const EdgeRuntime: { waitUntil: (promise: Promise<unknown>) => void }
+
+async function slowBackgroundWork() {
+  console.log(`[bg] started at ${new Date().toISOString()}`)
+  await new Promise((resolve) => setTimeout(resolve, 3000))
+  console.log(`[bg] finished at ${new Date().toISOString()}`)
+}
+
+Deno.serve((_req) => {
+  console.log(`[req] handler entered at ${new Date().toISOString()}`)
+  EdgeRuntime.waitUntil(slowBackgroundWork())
+  console.log(`[req] returning response at ${new Date().toISOString()}`)
+  return new Response(JSON.stringify({ accepted: true }), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+})
+```
+
+```text
+$ curl -w "\ntime_total=%{time_total}s\n" "$FUNCTIONS_URL/edge-waituntil" -H "Authorization: Bearer $ANON_KEY" -H "apikey: $ANON_KEY"
+{"accepted":true}
+time_total=0.059900s
+```
+
+`EdgeRuntime` เป็น global จริงตอน runtime ที่ Edge Runtime เองเป็นคนให้มา ไม่ใช่ Deno เปล่า ๆ — `deno check` เองไม่รู้จักมัน จึงต้องมี `declare const EdgeRuntime` ที่เห็นข้างบน ([`.d.ts` ทางการที่ publish ไว้ที่ `jsr:@supabase/functions-js/edge-runtime.d.ts`](https://github.com/supabase/supabase/blob/master/apps/docs/content/guides/functions/ai-models.mdx) ก็มีอยู่เหมือนกัน แต่จะ merge เข้าโปรเจกต์ได้สะอาดเฉพาะที่ตั้ง type workflow เต็มรูปแบบของ Supabase Functions ไว้แล้ว การ declare แบบง่าย ๆ ในเครื่องคือวิธีแก้ที่ใช้งานได้จริงสำหรับการ type-check แบบ standalone) response กลับมาใน **60ms** ทั้งที่ background task sleep ไว้ **3 วินาที** — และ log ของ function เอง ที่อ่านตรงจาก local stack ที่กำลังรันอยู่ โชว์ชัดว่าแต่ละอย่างเกิดขึ้นตอนไหนจริง ๆ
+
+```text
+[Info] [req] handler entered at 2026-09-29T04:35:46.823Z
+[Info] [bg] started at 2026-09-29T04:35:46.830Z
+[Info] [req] returning response at 2026-09-29T04:35:46.830Z
+[Info] [bg] finished at 2026-09-29T04:35:49.831Z
+```
+
+response ออกไปตอน `46.830Z` ส่วน background task เพิ่งเสร็จตอน `49.831Z` — สามวินาที *หลังจาก* ผู้เรียกได้คำตอบไปแล้ว กลไกทั้งหมดขึ้นอยู่กับรายละเอียดเดียว: `slowBackgroundWork()` ถูกเรียกโดยไม่ `await` แล้วส่ง promise ที่มันคืนมาเข้า `waitUntil` แทน — ถ้า `await` มันตรง ๆ response จะรอสามวินาทีเท่ากันเป๊ะ ทำลายจุดประสงค์ทั้งหมดไปเลย
+
+## Database Webhooks: ให้ฐานข้อมูลเรียกออกไปเอง
+
+Edge Function ทุกตัวก่อนหน้านี้ถูกเรียกโดย client ตรง ๆ ด้วย `supabase.functions.invoke()` หรือ `curl` งานจริง ๆ มักควรเกิดขึ้นเพราะ **การเปลี่ยนแปลงในฐานข้อมูล** แทน — row ที่โผล่ขึ้นมาใน table ไม่ใช่ client ที่จำได้ว่าต้องถาม Database Webhook คือ Postgres trigger ที่สร้างบน extension **`pg_net`** ที่ยิง HTTP request ทุกครั้งที่ insert/update/delete ที่เลือกไว้เกิดขึ้น พิสูจน์แบบ end-to-end กับ table ที่ namespace ไว้จริง
 
 ```sql
--- Roughly what a Database Webhook configures under the hood:
--- a trigger that calls pg_net on insert into public.profiles
-create trigger "profiles_insert_webhook"
-after insert on public.profiles
+-- supabase/migrations/9002_edge_events_webhook.sql
+create extension if not exists pg_net with schema extensions;
+
+create table public.edge_events (
+  id bigint generated always as identity primary key,
+  kind text not null,
+  created_at timestamptz not null default now()
+);
+
+create trigger "edge_events_webhook"
+after insert on public.edge_events
 for each row
 execute function supabase_functions.http_request(
-  'https://<project-ref>.supabase.co/functions/v1/welcome-email',
+  'http://supabase_kong_probe:8000/functions/v1/edge-webhook-receiver',
   'POST',
-  '{"Content-Type":"application/json"}',
+  '{"Content-Type":"application/json","Authorization":"Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0","apikey":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0"}',
   '{}',
   '5000'
 );
 ```
 
-ในทางปฏิบัติคุณตั้งค่านี้ผ่าน Dashboard ในส่วน Database Webhooks แทนที่จะเขียน trigger เอง แต่การรู้ว่าเป็น "trigger บวก `pg_net`" ช่วยอธิบายว่าทำไม webhook ถึง asynchronous และทำไมถึงชี้ไปที่ URL ของ Edge Function ได้เหมือน HTTP client ทั่วไป
+<Callout title="anon key นั้นไม่ใช่ secret ที่รั่วไหล">
+JWT ที่วางไว้ใน header ของ trigger ข้างบนคือ **local development demo key** ที่ตายตัวของ Supabase CLI — ทุก `supabase start` บนทุกเครื่องได้ค่าเดียวกันเป๊ะ เผยแพร่ไว้ใน default config และเอกสารของ CLI เอง นี่คือสิ่งที่ทำให้ migration ไฟล์นี้เป็น SQL statement เดียวที่รันได้เลย ไม่ต้องเป็น template ที่ต้อง interpolate ตอน runtime มันไม่ได้บอกอะไรเกี่ยวกับโปรเจกต์นี้โดยเฉพาะ และไม่ได้ให้สิทธิ์อะไรเกินกว่าที่ `anon` มีอยู่แล้วในเครื่อง Database Webhook จริงของ deployed project ตั้งค่าด้วย key จริงของโปรเจกต์นั้น ปกติผ่าน Webhooks UI ใน Dashboard ไม่ใช่เขียน trigger เองแบบนี้
+</Callout>
 
-## ตอบกลับเร็วในขณะที่งานยังทำต่อ EdgeRuntime.waitUntil
+function ที่รับแค่ log สิ่งที่ถูกส่งมา
 
-งานบางอย่างที่ trigger แบบนี้ไม่ควรทำให้ response ช้าลง เช่น ส่ง confirmation email เขียน analytics log หรือเรียก third-party API ที่ใช้เวลาสักไม่กี่วินาที การให้ผู้เรียกเดิม (ซึ่งมักเป็นกลไก webhook ของฐานข้อมูลเอง) รอสิ่งเหล่านั้นทั้งหมดเป็นเรื่องเสียเวลาเปล่า `EdgeRuntime.waitUntil(promise)` แก้ปัญหานี้ ทำเครื่องหมาย promise ว่าเป็น background task ที่ยังรันต่อได้แม้ function จะส่ง response ไปแล้ว
-
-```typescript
+```ts
+// supabase/functions/edge-webhook-receiver/index.ts
 Deno.serve(async (req) => {
   const payload = await req.json()
-
-  // Do not await this — let it run after the response is sent
-  EdgeRuntime.waitUntil(sendConfirmationEmail(payload))
-
-  return new Response('ok', { status: 200 })
-})
-
-async function sendConfirmationEmail(payload: unknown) {
-  // Slow third-party API call, logging, etc.
-}
-```
-
-จุดสำคัญคือไม่มี `await` อยู่หน้า `sendConfirmationEmail(payload)` ถ้า await ตรงนั้น response จะต้องรอจนกว่า email จะส่งเสร็จ การส่ง promise ที่ยังไม่ resolve เข้า `waitUntil` คือการบอก Deno runtime ให้เก็บ instance ของ function ไว้จนกว่า promise นั้นจะจบ โดยไม่ทำให้ HTTP response ต้องรอ
-
-## รวมสองอย่างเข้าด้วยกัน flow ยืนยันคำสั่งซื้อ
-
-ตัวอย่างจริงแบบครบวงจร Database Webhook ยิงตอน `insert` เข้า `orders` เรียก Edge Function ที่ตอบกลับทันทีเพื่อยืนยันว่าเขียนข้อมูลสำเร็จ ในขณะที่ confirmation email ถูกส่งอยู่เบื้องหลัง
-
-```typescript
-Deno.serve(async (req) => {
-  const { record } = await req.json() // the new orders row, from the webhook payload
-
-  EdgeRuntime.waitUntil(sendOrderConfirmationEmail(record))
-
+  console.log(`[webhook] received type=${payload.type} table=${payload.table} record=${JSON.stringify(payload.record)}`)
   return new Response(JSON.stringify({ received: true }), {
     headers: { 'Content-Type': 'application/json' },
   })
 })
-
-async function sendOrderConfirmationEmail(order: { id: string; email: string }) {
-  // Call an email provider here; this runs after the response is already sent
-}
 ```
 
-ฐานข้อมูลไม่ต้องรอ email provider เลย ผู้เรียก webhook ได้ `200` เร็ว ๆ และ email ก็ยังถูกส่งอยู่ดี เพียงแต่ส่งหลังจาก HTTP round trip จบไปแล้ว
+insert จริงหนึ่งครั้ง แล้วเห็นทั้งเชนทำงานจริง — trigger, audit trail ของ `pg_net` เอง, async HTTP response, และ log line ของ function ที่โชว์ shape ของ payload ที่ได้รับจริง
 
-<Mermaid title="Postgres insert trigger ไปยัง webhook, Edge Function และ background task" code={webhookBackgroundDiagram} />
+```text
+$ psql -c "insert into public.edge_events (kind) values ('edge_test_event') returning id, created_at;"
+ id |          created_at
+----+-------------------------------
+  1 | 2026-09-29 04:36:11.418738+00
+
+$ psql -c "select id, hook_table_id, hook_name, request_id from supabase_functions.hooks order by id desc limit 1;"
+ id | hook_table_id |      hook_name      | request_id
+----+---------------+---------------------+------------
+  1 |         21111 | edge_events_webhook |          1
+
+$ psql -c "select id, status_code, content::text from net._http_response order by id desc limit 1;"
+ id | status_code |      content
+----+-------------+-------------------
+  1 |         200 | {"received":true}
+
+# from the function's own log:
+[Info] [webhook] received type=INSERT table=edge_events record={"id":1,"kind":"edge_test_event","created_at":"2026-09-29T04:36:11.418738+00:00"}
+```
+
+shape ของ payload ที่ Database Webhook ส่งคือ `{ type, table, record, schema }` — `type` เป็น `INSERT`/`UPDATE`/`DELETE`, `record` คือ row ใหม่เป็น JSON ตรงกับ shape `WebhookPayload` ที่ function ที่รับควร declare ไว้
+
+<Mermaid title="Postgres insert สั่ง webhook, Edge Function และ background task" code={webhookBackgroundDiagram} />
 
 export const webhookBackgroundDiagram = `flowchart LR
-  insertRow["insert into orders"] --> webhook["Database Webhook (pg_net, async)"]
-  webhook --> edge["Edge Function"]
+  insertRow["insert into edge_events"] --> webhook["Database Webhook (pg_net, async)"]
+  webhook --> edge["edge-webhook-receiver"]
   edge --> respond["Immediate response: 200 received"]
-  edge -->|"EdgeRuntime.waitUntil"| bg["Background task: send confirmation email"]`;
+  edge -->|"EdgeRuntime.waitUntil"| bg["Background task (e.g. slow follow-up work)"]`;
+
+## `pg_net` เป็น asynchronous — พิสูจน์ด้วยเวลา ไม่ใช่แค่อ้างลอย ๆ
+
+เหตุผลทั้งหมดที่ทำให้ Database Webhook ปลอดภัยพอจะแปะไว้กับ write path ได้ คือ `pg_net` ไม่เคยทำให้ statement ที่ trigger มันต้องรอ HTTP response เลย พิสูจน์ด้วยการจับเวลา `insert` เองด้วย `\timing` ของ `psql` ไม่ใช่จับเวลา webhook call
+
+```text
+$ psql -c "\timing on" -c "insert into public.edge_events (kind) values ('edge_timing_test') returning id;"
+ id
+----
+  2
+INSERT 0 1
+Time: 2.767 ms
+```
+
+**2.767 มิลลิวินาที** สำหรับ `insert` ที่จะ return — ไม่พอเลยสำหรับ HTTP round trip เต็ม ๆ ไปยัง `edge-webhook-receiver` ผ่าน Kong และ Edge Runtime (ตัวเลข cold-start จากบทแรกบน stack เดียวกันนี้คือ 60-90ms) `pg_net` แค่ enqueue request แล้ว return การควบคุมกลับให้ผู้เรียกทันที HTTP call จริงเกิดขึ้นบน background worker ของ pg_net เอง และผลลัพธ์ไปโผล่ใน `net._http_response` ทีหลัง อ่าน*หลังจากนั้น*ตามที่โชว์ข้างบน ไม่ใช่สิ่งที่ `insert` รอ
+
+## Scheduled functions ด้วย `pg_cron`
+
+`pg_cron` รัน SQL ตามตารางเวลาจากในตัว Postgres — ไม่ได้ติดตั้งมาโดย default บน local stack นี้ (`select * from pg_extension` ไม่เจอจนกว่าจะเปิดใช้) พิสูจน์ด้วยการเปิดใช้จริง ตั้ง schedule 1 นาทีจริง แล้วรอให้มันทำงานจริง ไม่ใช่แค่เชื่อ schedule string
+
+```sql
+select cron.schedule('edge_ping_cron', '* * * * *', $$select 1$$);
+```
+
+```text
+$ psql -c "select jobid, runid, status, start_time, end_time from cron.job_run_details order by start_time desc limit 1;"
+ jobid | runid |  status   |          start_time           |           end_time
+-------+-------+-----------+--------------------------------+--------------------------------
+     1 |     1 | succeeded | 2026-09-29 04:37:00.022241+00 | 2026-09-29 04:37:00.023384+00
+```
+
+การรันนี้ตกลงที่วินาที `:00` ของนาทีถัดไป `succeeded` และเสร็จในเวลาประมาณ 1 มิลลิวินาที เป็นหลักฐานจริงว่า job ทำงานตามตารางเวลาจริง ไม่ใช่แค่ `cron.schedule()` return โดยไม่ error การเรียก Edge Function ตามตารางเวลา (แทนที่ `select 1`) ก็คือการเรียก `supabase_functions.http_request(...)` เดียวกับที่ trigger ของ webhook ใช้ข้างบน แค่ถูกเรียกโดย `cron.schedule` แทนที่จะเป็น table trigger การทดสอบ job ถูก unschedule ทันทีหลังพิสูจน์เสร็จ (`select cron.unschedule('edge_ping_cron')`) — ดูสรุปท้ายโมดูลนี้ว่าอะไรถูกทิ้งไว้ให้รัน กับอะไรถูกเก็บกวาดแล้ว
+
+## Idempotency: Database Webhooks ไม่ retry, Auth Hooks retry
+
+สอง feature ของ Supabase ที่เรียก HTTP endpoint จากในตัว Postgres มีพฤติกรรม retry ที่**ต่างกัน** — ควรแม่นยำเรื่องนี้ เพราะโค้ดที่ AI สร้าง (และเอกสารที่อ่านผ่าน ๆ) สับสนสองเรื่องนี้ได้ง่าย
+
+- **Auth Hooks** (HTTP hook ที่ตั้งค่าสำหรับ event เช่น "Customize Access Token Claims") retry อัตโนมัติ: *"On a retry-able error, such as an error with a 429 or 503 status code, HTTP Hooks will attempt up to three retries with a back-off of two seconds. We have a time budget of 5s for the entire webhook invocation, including retry requests"* ([เอกสาร Auth Hooks](https://github.com/supabase/supabase/blob/master/apps/docs/content/guides/auth/auth-hooks.mdx))
+- **Database Webhooks** (กลไก trigger ที่ใช้ `pg_net` ที่พิสูจน์ไว้ข้างบน) **ไม่มี retry ในตัว** — HTTP call ที่พังหรือช้าไม่ถูก retry อัตโนมัติโดยแพลตฟอร์ม คำแนะนำในคู่มือ debugging เองก็บอกให้ *query `net._http_response` หา failure เอง* ไม่ใช่ "รอ retry" ([pg_net troubleshooting](https://github.com/supabase/supabase/blob/master/apps/docs/content/troubleshooting/webhook-debugging-guide-M8sk47.mdx))
+
+ผลจริงในทางปฏิบัติ: function ที่รับ Database Webhook ต้องเขียนแบบ **idempotent** เอง — ปลอดภัยที่จะประมวลผล event เชิงตรรกะเดียวกันซ้ำสองครั้ง เพราะไม่มีอะไรในแพลตฟอร์มการันตี exactly-once delivery และต่างจาก Auth Hooks ตรงที่ไม่มีอะไร retry failure ให้อัตโนมัติด้วย pattern ที่ใช้ได้ผลบ่อยคือ idempotency key (primary key ของ row เอง หรือ `request_id` จาก `supabase_functions.hooks` ตาราง audit ที่โชว์ไว้ข้างบน) ที่ตรวจก่อนจะทำอะไรที่มี side effect
+
+## พฤติกรรมตอน shutdown
+
+เอกสารอธิบายกลไกที่เกี่ยวข้องกันสองอย่างที่คอร์สนี้ไม่ได้ reproduce ในเครื่อง บอกไว้ตรง ๆ ดีกว่าแกล้งทำให้เกิด: isolate ที่ใกล้ wall-clock limit จะยิง event `beforeunload` ก่อนจะ shutdown ให้ function บันทึก state หรือ log progress ได้
+
+```typescript
+addEventListener('beforeunload', (ev) => {
+  console.log('Function will be shutdown due to', ev.detail?.reason)
+})
+```
+
+และ payload ของ shutdown เองมี `reason` (`"WallClockTime"` เป็นค่าหนึ่งที่มีเอกสารระบุไว้) พร้อม resource usage ตอน shutdown ([เอกสาร shutdown reasons](https://github.com/supabase/supabase/blob/master/apps/docs/content/troubleshooting/edge-function-shutdown-reasons-explained.mdx)) พยายาม reproduce แบบนี้ในเครื่องด้วยการหยุด process `supabase functions serve` ของโมดูลนี้เอง แต่ **ไม่** trigger listener นี้เลย — การ kill process ของ CLI ทำให้ container ของ local Edge Runtime ทั้งตัวถูกรื้อทิ้งทันที ไม่ใช่การ retire isolate หนึ่งตัวอย่างนุ่มนวลตอนใกล้ wall-clock limit ซึ่งจะเกิดขึ้นจริงเฉพาะกับ function ที่ deploy แล้วใช้งานหนักมานานเท่านั้น กลไกและ shape ของ payload มาจากเอกสารข้างบน ไม่ใช่สิ่งที่วัดได้จริงในเครื่อง
 
 <Callout title="สรุปในบรรทัดเดียว">
-**Database Webhook** คือ Postgres trigger ที่สร้างบน extension **`pg_net`** ซึ่งยิง HTTP request แบบ asynchronous ไปยัง Edge Function ทุกครั้งที่ row event ที่เลือกไว้เกิดขึ้น ส่วน **`EdgeRuntime.waitUntil(promise)`** ทำให้ function นั้นคืน response ทันทีในขณะที่ promise ที่ไม่ได้ await ยังทำงานต่อ รวมกันแล้ว `insert` เข้า `orders` เรียก function ที่ยืนยันทันทีในขณะที่ confirmation email ถูกส่งอยู่เบื้องหลัง
+`EdgeRuntime.waitUntil(promise)` (พิสูจน์แล้ว: response **60ms** กลับมาขณะที่ background task **3 วินาที** ยังรันต่อ timestamp จาก log จริง) ทำให้ function ตอบเร็วในขณะที่งานเสร็จทีหลัง **Database Webhook** คือ Postgres trigger ที่สร้างบน **`pg_net`** (พิสูจน์แบบ end-to-end: insert → trigger → async HTTP call → function ได้รับ payload shape จริง `{type, table, record, schema}`) ที่เป็น **asynchronous** (พิสูจน์แล้ว: insert ที่ trigger มัน return ในเวลาต่ำกว่า 3ms) และ**ไม่มี retry อัตโนมัติ** (ต่างจาก Auth Hooks ที่มีเอกสารระบุ policy retry 3 ครั้ง/budget 5 วินาที) — receiver ต้อง idempotent เอง `pg_cron` schedule SQL จริงจากในตัว Postgres (พิสูจน์แล้ว: job 1 นาทีทำงานจริงและสำเร็จ) พฤติกรรม `beforeunload`/wall-clock ตอน shutdown มาจากเอกสาร บอกตรง ๆ ว่าไม่ได้ reproduce ในเครื่อง
 </Callout>
+
+## อ่านโค้ดที่ AI สร้าง
+
+AI ถูกขอให้ "เรียก `pg_net` ใน trigger แล้วตรวจว่า webhook สำเร็จก่อนจะ return" แล้วได้โค้ดนี้มา
+
+<SpotTheBug lang="sql" code={`create or replace function public.edge_notify_and_check()
+returns trigger
+language plpgsql
+as $$
+declare
+  req_id bigint;
+  resp record;
+begin
+  select net.http_post(
+    'http://supabase_kong_probe:8000/functions/v1/edge-webhook-receiver',
+    to_jsonb(new)
+  ) into req_id;
+
+  -- Check the response right away, in the same transaction
+  select * into resp from net._http_response where id = req_id;
+
+  if resp.status_code is null or resp.status_code >= 400 then
+    raise exception 'webhook failed';
+  end if;
+
+  return new;
+end;
+$$;
+`}>
+โค้ดนี้เข้าใจผิดเรื่องพฤติกรรม "asynchronous" ที่พิสูจน์ไว้ก่อนหน้าในบทนี้พอดี: `net.http_post()` return `request_id` **ทันที** โดยแค่ *enqueue* HTTP call ไว้เท่านั้น — request จริงอาจยังไม่ถูกส่งด้วยซ้ำ นับประสาอะไรกับเสร็จ ณ ตอนที่บรรทัดถัดไปรัน `select ... from net._http_response where id = req_id` ในตัว trigger เดียวกันแทบทุกครั้งจะไม่เจอ row เลย (response ยังไม่มาถึง) `resp.status_code is null` จึงเป็นจริงแทบทุกครั้ง แล้ว trigger ก็ raise `'webhook failed'` และ rollback การ insert — แม้ webhook call นั้นจะสำเร็จสมบูรณ์ก็ตาม แค่มาถึงช้ากว่าที่โค้ดนี้ตรวจไปไม่กี่มิลลิวินาที วิธีแก้ไม่ใช่ "รอนานขึ้น" (การ block trigger ด้วย network I/O ทำลายจุดประสงค์ทั้งหมดของการที่ `pg_net` เป็น async พิสูจน์ไว้ข้างบนด้วยเวลา `insert` แค่ 2.767ms) — แต่คือการไม่ตรวจแบบ synchronous เลย ปล่อยให้ insert commit ไปแล้วค่อย poll `net._http_response` ทีหลังแบบ out-of-band (เช่น `pg_cron` job แยกต่างหาก) หรือตามที่ section idempotency ของบทนี้พูดถึง ออกแบบ function ที่รับให้ retriable ได้อย่างปลอดภัย และเลิกพยายามสังเกตความสำเร็จในตัว transaction เดียวกับที่ trigger มันไปเลย
+</SpotTheBug>
+
+## Mental Model
+
+กลไกทั้งสองในบทนี้มีไว้ให้ส่วนหนึ่งของระบบพูดว่า "ทำต่อไปเลย ฉันไม่จำเป็นต้องรู้ผลลัพธ์ตอนนี้" — `waitUntil` พูดแบบนั้นเกี่ยวกับงานที่ยังรันอยู่ *ในฟังก์ชันเดียวกัน* ส่วน trigger `pg_net` ของ Database Webhook พูดแบบนั้นเกี่ยวกับงานที่ *Postgres เอง* สั่งไปแล้วไม่รอ ทั้งสองแบบ "ผู้เรียกได้ response แล้ว" กับ "งานที่ถูกสั่งเสร็จจริงแล้ว" กลายเป็นสองเหตุการณ์ที่แยกกันจริง ๆ ในเวลา พิสูจน์ตรง ๆ ในบทนี้ด้วย timestamp จริง (`waitUntil`) และ `insert` ที่เร็วต่ำกว่า 3ms คู่กับ request ที่ใช้เวลาเป็นสิบมิลลิวินาทีกว่าจะเสร็จจริง (`pg_net`) bug ใน SpotTheBug คือสิ่งที่เกิดขึ้นพอดีเมื่อโค้ดถูกเขียนราวกับสองเหตุการณ์นี้ยังเป็นอันเดียวกันอยู่: ตรวจหาผลลัพธ์ที่ ตามการออกแบบ ยังไม่มีอยู่
+
+## Trade-offs
+
+- **`EdgeRuntime.waitUntil` ทำให้ function ตอบเร็วในขณะที่งานจริงยังทำต่อ** — **แต่ต้องแลกกับการที่ผู้เรียกไม่มีทางรู้ว่างานพื้นหลังนั้นสำเร็จจริงไหม** นอกจากการออกแบบของ function เองจะเปิดเผยเรื่องนี้แยกต่างหาก (webhook ตามมาอีกที, row สถานะที่ client poll)
+- **การออกแบบ async ของ `pg_net` ทำให้ webhook ไม่เคย block การเขียนที่ trigger มัน** — **แต่ต้องแลกกับการไม่มี retry ในตัวหรือการยืนยันแบบ synchronous** พิสูจน์และอ้างอิงไว้ข้างบน — function ที่รับ และอะไรก็ตามที่สนใจว่ามันรันสำเร็จไหม ต้องถูกสร้างโดยสมมติว่าเป็น delivery แบบ at-most-once แบบ best-effort
+- **`pg_cron` รัน SQL จริงตามตารางเวลาโดยไม่ต้องมี infrastructure ภายนอกเลย** — **แต่ต้องแลกกับการอยู่ในตัว Postgres ล้วน ๆ**: cron job ที่ต้องเรียกออกไปอินเทอร์เน็ตยังต้องผ่าน `pg_net`/Edge Function อยู่ดี รับพฤติกรรม async ไม่มี retry เดียวกับ webhook มาเต็ม ๆ
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"`await` background task ในตัว `waitUntil` ปลอดภัยกว่า แค่ทำให้ response ช้าลงนิดหน่อย"** มันไม่ใช่แค่ "ช้าลงนิดหน่อย" — มันทำลายประโยชน์ทั้งหมดไปเลย พิสูจน์ข้างบน: `await` `slowBackgroundWork()` ตรง ๆ จะทำให้ response รอเต็ม 3 วินาที แทนที่จะเป็น 60ms
+- **"ถ้า `net.http_post()` return สำเร็จ แปลว่า webhook call สำเร็จแล้ว"** มัน return `request_id` ของ request ที่แค่ *enqueue* ไว้ — พิสูจน์ข้างบน (และใน SpotTheBug) ว่า HTTP call จริงและ status code ของมันรู้ได้ทีหลังเท่านั้น จาก `net._http_response`
+- **"Database Webhooks retry call ที่พังอัตโนมัติ เหมือน Auth Hooks"** ไม่จริง — พิสูจน์และอ้างอิงไว้ข้างบน: Auth Hooks มี policy retry 3 ครั้ง/budget 5 วินาทีที่มีเอกสารระบุไว้ Database Webhooks ไม่มีเลย และคู่มือ troubleshooting ของแพลตฟอร์มเองก็บอกให้ query `net._http_response` หา failure เอง ไม่ใช่คาดหวัง retry
+- **"`pg_cron` ต้องมี scheduler ภายนอกหรือ cron daemon บน server"** มันรันอยู่ในตัว Postgres ทั้งหมดในฐานะ extension — พิสูจน์ข้างบนด้วย job จริงที่ทำงานตาม schedule `* * * * *` โดยไม่มี process ภายนอกฐานข้อมูลเกี่ยวข้องเลย
 
 export const quizBackgroundWebhooks = [
   {
-    q: 'Database Webhooks ใช้ Postgres extension อะไรเป็นพื้นฐาน',
+    q: 'ในการพิสูจน์ EdgeRuntime.waitUntil response กลับมาใน 60ms ขณะที่ background task ใช้เวลา 3 วินาที อะไรทำให้เป็นแบบนั้นได้',
     options: [
-      'pg_cron',
-      'pg_net',
-      'pg_graphql',
-      'pg_stat_statements',
+      'background task รันบน server แยกต่างหาก',
+      'slowBackgroundWork() ถูกเรียกโดยไม่ await และ promise ที่ยังไม่ resolve ของมันถูกส่งเข้า waitUntil ซึ่งเก็บ isolate ไว้โดยไม่ทำให้ response ต้องรอ',
+      'ดีเลย์ 3 วินาทีเป็นของปลอมไม่ได้เกิดขึ้นจริง',
+      'waitUntil ยกเลิก background task ที่ช้าอัตโนมัติหลังส่ง response แล้ว',
     ],
     answer: 1,
+    explain: 'พิสูจน์ด้วย log timestamp จริง: response ออกไปตอน :46.830Z และ background task เสร็จตอน :49.831Z สามวินาทีถัดมา — เป็นไปได้เพราะ promise ไม่ถูก await ก่อน return เท่านั้น',
   },
   {
-    q: 'ทำไม pg_net ถึงทำให้ HTTP call ของ webhook เป็นแบบ asynchronous',
+    q: 'Database Webhook trigger ใช้ extension อะไรของ Postgres ในการยิง HTTP call และทำไมเรื่องนี้ถึงสำคัญกับการเขียนที่ trigger มัน',
     options: [
-      'เพื่อให้ client ที่เรียกต้อง poll ผลลัพธ์เอง',
-      'เพื่อไม่ให้ HTTP request ที่ช้าหรือ fail บล็อกการเขียนข้อมูลที่ทำให้เกิด trigger',
-      'เพื่อให้ใช้ได้เฉพาะการอ่านเท่านั้น ใช้กับการเขียนไม่ได้',
-      'พฤติกรรม asynchronous ไม่เกี่ยวกับ pg_net',
+      'pg_cron เพราะ call เกิดในรอบตารางเวลาถัดไป',
+      'pg_net ซึ่งยิง call แบบ asynchronous ทำให้ insert/update/delete ที่ trigger มันไม่ต้องรอ HTTP response เลย',
+      'pg_graphql เพราะ payload ถูกส่งเป็น GraphQL mutation',
+      'ใช้ HTTP client แบบ synchronous ดังนั้นการเขียนต้องรอจริง',
     ],
     answer: 1,
+    explain: 'พิสูจน์ข้างบน: insert ที่ trigger ทำงานนี้ return ในเวลา 2.767ms เร็วเกินกว่าจะมี HTTP round trip จริงอยู่ในนั้น — pg_net แค่ enqueue แล้ว return ทันที',
   },
   {
-    q: 'EdgeRuntime.waitUntil ทำให้ Edge Function ทำอะไรได้',
+    q: 'Database Webhooks (กลไก trigger pg_net) retry HTTP call ที่พังอัตโนมัติ เหมือนที่ Auth Hooks ทำหรือไม่',
     options: [
-      'ชะลอการส่ง response จนกว่า promise ทุกตัวจะ resolve',
-      'คืน HTTP response ทันทีในขณะที่ background task ยังทำงานต่อหลังจากนั้น',
-      'retry request ที่ fail ให้อัตโนมัติ',
-      'cache response ไว้ใช้กับ request ที่เหมือนกันในอนาคต',
+      'ใช่ ทั้งคู่ retry สูงสุด 3 ครั้งด้วย backoff 2 วินาที',
+      'ไม่ — Auth Hooks มีเอกสารระบุ policy retry 3 ครั้ง/budget 5 วินาที แต่ Database Webhooks ไม่มี retry ในตัว ต้องหา failure เองด้วยการ query net._http_response',
+      'Database Webhooks retry ไม่จำกัดจนกว่าจะสำเร็จ',
+      'ทั้งสองกลไกไม่ retry เลยสักอย่าง',
     ],
     answer: 1,
+    explain: 'อ้างอิงจากเอกสาร: Auth Hooks ระบุ "up to three retries with a back-off of two seconds... 5s ... budget" ส่วนคู่มือ pg_net/webhook debugging บอกให้ query net._http_response หา failure เอง',
   },
   {
-    q: 'ในตัวอย่างยืนยันคำสั่งซื้อแบบรวม ถ้า await promise ของการส่ง email แทนที่จะส่งเข้า waitUntil จะเกิดอะไรขึ้น',
+    q: 'trigger function เรียก net.http_post() แล้ว select จาก net._http_response ด้วย request_id ที่ได้มาทันที คาดว่าจะเห็น response status จะเกิดอะไรขึ้นจริง',
     options: [
-      'ไม่มีอะไรเปลี่ยน พฤติกรรมเหมือนเดิมทุกประการ',
-      'HTTP response จะต้องรอจนกว่า email จะส่งเสร็จ',
-      'การ insert ในฐานข้อมูลจะถูก rollback',
-      'Database Webhook จะหยุดยิง',
+      'เห็น response จริงเสมอ เพราะ net.http_post() block จนกว่า response จะมาถึง',
+      'แทบทุกครั้งจะไม่เจอ row เลย เพราะ HTTP call แค่ถูก enqueue ณ จุดนั้น ยังไม่เสร็จ การตรวจหาผลลัพธ์ทันทีหลังจากนั้นคือตรวจเร็วเกินไป',
+      'เกิด Postgres syntax error',
+      'net._http_response ถูกเติมข้อมูลแค่วันละครั้ง',
     ],
     answer: 1,
+    explain: 'นี่คือ SpotTheBug ข้างบน: net.http_post() return ทันทีโดยแค่ enqueue request ไว้ row ของ response ยังไม่มีอยู่ ณ จุดที่ trigger ที่มี bug ไปตรวจหา',
+  },
+  {
+    q: 'การพิสูจน์ pg_cron ตั้ง schedule เป็น `* * * * *` แล้วตรวจ cron.job_run_details พิสูจน์อะไรมากกว่าแค่ cron.schedule() return โดยไม่ error',
+    options: [
+      'ไม่มีอะไรมากกว่านั้น การเรียก cron.schedule() สำเร็จก็เพียงพอแล้วว่าจะทำงานจริง',
+      'ว่า job ทำงานจริงตามเวลาที่ตั้งไว้และสำเร็จ — พิสูจน์ด้วย row จริงที่โชว์ start_time/end_time/status ไม่ใช่แค่การตั้งค่าไม่ error',
+      'ว่า pg_cron ต้องมี systemd service แยกต่างหากนอก Postgres',
+      'ว่า cron job เรียก Edge Function ไม่ได้ เรียกได้แค่ SQL ธรรมดา',
+    ],
+    answer: 1,
+    explain: 'cron.job_run_details โชว์การรันจริง: status "succeeded" พร้อม start_time/end_time ห่างกันประมาณ 1 มิลลิวินาที ตกที่ขอบนาทีถัดไปพอดี — schedule ทำงานจริง ไม่ใช่แค่ถูกยอมรับ',
+  },
+  {
+    q: 'ทำไม idempotency ถึงสำคัญกับ function ที่รับ Database Webhook โดยเฉพาะ (มากกว่า function ที่ client เรียกตรง ๆ)',
+    options: [
+      'จริง ๆ ไม่ได้สำคัญกว่ากัน Edge Functions ทุกตัวต้องการเท่ากันหมด',
+      'เพราะ Database Webhooks ไม่มี retry ในตัวหรือการรับประกันการส่ง function ที่รับควรปลอดภัยที่จะประมวลผล event เชิงตรรกะเดียวกันซ้ำมากกว่าหนึ่งครั้ง แทนที่จะสมมติว่าส่งแบบ exactly-once',
+      'เพราะ Database Webhooks ส่งทุก event ซ้ำสองครั้งเสมอ',
+      'idempotency สำคัญแค่กับ function ที่เขียนลง storage bucket เท่านั้น',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์และอ้างอิงไว้ข้างบน: เมื่อไม่มี retry อัตโนมัติและไม่มีการยืนยันแบบ synchronous ให้ trigger ใช้ได้ สมมติฐานที่ปลอดภัยที่สุดสำหรับ webhook receiver คือ delivery แบบ best-effort ที่อาจซ้ำได้ — ออกแบบให้ idempotent จัดการทั้งสองกรณีได้ถูกต้อง',
   },
 ];
 

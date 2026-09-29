@@ -1,6 +1,6 @@
 ---
 title: 'Background Tasks and Webhooks with Functions'
-description: 'Triggering an Edge Function from a database change with Database Webhooks, and running work after the response with EdgeRuntime.waitUntil.'
+description: 'Triggering an Edge Function from a database change with Database Webhooks, running work after the response with EdgeRuntime.waitUntil, pg_net async semantics, pg_cron, idempotency, and shutdown behavior.'
 sidebar:
   order: 4
 ---
@@ -8,130 +8,300 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
 
 A **Database Webhook** lets a row change in Postgres call an Edge Function automatically, and `EdgeRuntime.waitUntil` lets that function respond immediately while finishing slower work in the background.
 
+## `EdgeRuntime.waitUntil`, proved with real timestamps
+
+`EdgeRuntime.waitUntil(promise)` marks a promise as a background task that keeps running after the function has already sent its response — the function instance stays alive until the promise settles, without holding up the HTTP response. Proof needs the **missing `await`** to be visible, and needs to show the response actually returning before the background work finishes, not just claim it:
+
+```ts
+// supabase/functions/edge-waituntil/index.ts
+declare const EdgeRuntime: { waitUntil: (promise: Promise<unknown>) => void }
+
+async function slowBackgroundWork() {
+  console.log(`[bg] started at ${new Date().toISOString()}`)
+  await new Promise((resolve) => setTimeout(resolve, 3000))
+  console.log(`[bg] finished at ${new Date().toISOString()}`)
+}
+
+Deno.serve((_req) => {
+  console.log(`[req] handler entered at ${new Date().toISOString()}`)
+  EdgeRuntime.waitUntil(slowBackgroundWork())
+  console.log(`[req] returning response at ${new Date().toISOString()}`)
+  return new Response(JSON.stringify({ accepted: true }), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+})
+```
+
+```text
+$ curl -w "\ntime_total=%{time_total}s\n" "$FUNCTIONS_URL/edge-waituntil" -H "Authorization: Bearer $ANON_KEY" -H "apikey: $ANON_KEY"
+{"accepted":true}
+time_total=0.059900s
+```
+
+`EdgeRuntime` is a real global at runtime, provided by the Edge Runtime itself, not by vanilla Deno — `deno check` on its own does not know about it, hence the local `declare const EdgeRuntime` above (the [official `.d.ts` published at `jsr:@supabase/functions-js/edge-runtime.d.ts`](https://github.com/supabase/supabase/blob/master/apps/docs/content/guides/functions/ai-models.mdx) exists too, but only merges cleanly into a project set up with the full Supabase Functions type workflow; a minimal local declaration is the pragmatic fix for a standalone type-check). The response came back in **60ms** even though the background task sleeps for **3 seconds** — and the function's own logs, read straight from the running local stack, show exactly when each thing actually happened:
+
+```text
+[Info] [req] handler entered at 2026-09-29T04:35:46.823Z
+[Info] [bg] started at 2026-09-29T04:35:46.830Z
+[Info] [req] returning response at 2026-09-29T04:35:46.830Z
+[Info] [bg] finished at 2026-09-29T04:35:49.831Z
+```
+
+The response left at `46.830Z`; the background task did not finish until `49.831Z` — three seconds *after* the caller already had its answer. The whole mechanism hinges on one detail: `slowBackgroundWork()` is called without `await` and its returned promise is handed to `waitUntil` instead — `await`ing it directly would make the response wait for the same three seconds, defeating the entire point.
+
 ## Database Webhooks: letting the database call out
 
-Every Edge Function so far has been invoked by a client, explicitly, with `supabase.functions.invoke()`. But plenty of real work should happen because of a **database change**, not because a client remembered to ask for it — send a welcome email when a row appears in `profiles`, notify a downstream system when an order is placed. Database Webhooks cover exactly this: configure one on a table for `insert`, `update`, or `delete`, and Supabase fires an HTTP request whenever that event happens.
-
-Under the hood, a Database Webhook is a convenience wrapper around a Postgres trigger, built on the **`pg_net`** extension. `pg_net` makes HTTP requests **asynchronously** from inside Postgres, so a slow or failing network call never blocks the write that triggered it — the `insert` commits regardless of how long the webhook's HTTP call takes.
+Every Edge Function so far has been invoked by a client, explicitly, with `supabase.functions.invoke()` or a direct `curl`. Real work should often happen because of a **database change** instead — a row appearing in a table, not a client remembering to ask. A Database Webhook is a Postgres trigger, built on the **`pg_net`** extension, that fires an HTTP request whenever a chosen insert/update/delete happens — proved end to end against a real namespaced table:
 
 ```sql
--- Roughly what a Database Webhook configures under the hood:
--- a trigger that calls pg_net on insert into public.profiles
-create trigger "profiles_insert_webhook"
-after insert on public.profiles
+-- supabase/migrations/9002_edge_events_webhook.sql
+create extension if not exists pg_net with schema extensions;
+
+create table public.edge_events (
+  id bigint generated always as identity primary key,
+  kind text not null,
+  created_at timestamptz not null default now()
+);
+
+create trigger "edge_events_webhook"
+after insert on public.edge_events
 for each row
 execute function supabase_functions.http_request(
-  'https://<project-ref>.supabase.co/functions/v1/welcome-email',
+  'http://supabase_kong_probe:8000/functions/v1/edge-webhook-receiver',
   'POST',
-  '{"Content-Type":"application/json"}',
+  '{"Content-Type":"application/json","Authorization":"Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0","apikey":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0"}',
   '{}',
   '5000'
 );
 ```
 
-In practice you configure this from the Dashboard's Database Webhooks UI rather than writing the trigger by hand, but knowing it is "a trigger plus `pg_net`" explains why it is asynchronous and why it can point at an Edge Function URL just like any other HTTP client.
+<Callout title="That anon key is not a leaked secret">
+The JWT pasted into the trigger's headers above is Supabase CLI's fixed **local development demo key** — every `supabase start` on every machine gets the exact same value, published in the CLI's own default config and docs. It is what lets this migration file stay a single, runnable SQL statement instead of a template needing runtime interpolation; it identifies nothing about this specific project and grants nothing beyond what `anon` already has locally. A deployed project's real Database Webhook is configured with that project's own keys, normally from the Dashboard's Webhooks UI rather than a hand-written trigger.
+</Callout>
 
-## Responding fast while work continues: EdgeRuntime.waitUntil
+The receiving function just logs what it was sent:
 
-Some work triggered this way should not delay the response — sending a confirmation email, writing an analytics log, calling a third-party API that takes a few seconds. Making the original caller (often the database's webhook mechanism itself) wait for all of that is wasteful. `EdgeRuntime.waitUntil(promise)` solves this: it marks a promise as a background task that keeps running after the function has already sent its response.
-
-```typescript
+```ts
+// supabase/functions/edge-webhook-receiver/index.ts
 Deno.serve(async (req) => {
   const payload = await req.json()
-
-  // Do not await this — let it run after the response is sent
-  EdgeRuntime.waitUntil(sendConfirmationEmail(payload))
-
-  return new Response('ok', { status: 200 })
-})
-
-async function sendConfirmationEmail(payload: unknown) {
-  // Slow third-party API call, logging, etc.
-}
-```
-
-The key detail is the missing `await` on `sendConfirmationEmail(payload)`. If you awaited it, the response would wait for the email to finish sending. Passing the unresolved promise to `waitUntil` tells the Deno runtime to keep the function instance alive until that promise settles, without holding up the HTTP response.
-
-## Combining both: an order confirmation flow
-
-A realistic end-to-end example: a Database Webhook fires on `insert` into `orders`, calling an Edge Function that responds immediately to acknowledge the write, while a confirmation email sends in the background.
-
-```typescript
-Deno.serve(async (req) => {
-  const { record } = await req.json() // the new orders row, from the webhook payload
-
-  EdgeRuntime.waitUntil(sendOrderConfirmationEmail(record))
-
+  console.log(`[webhook] received type=${payload.type} table=${payload.table} record=${JSON.stringify(payload.record)}`)
   return new Response(JSON.stringify({ received: true }), {
     headers: { 'Content-Type': 'application/json' },
   })
 })
-
-async function sendOrderConfirmationEmail(order: { id: string; email: string }) {
-  // Call an email provider here; this runs after the response is already sent
-}
 ```
 
-The database never waits on the email provider, the webhook caller gets a fast `200`, and the email still gets sent — just after the HTTP round trip has already completed.
+One real insert, and the whole chain firing for real — the trigger, `pg_net`'s own audit trail, the async HTTP response, and the function's own log line showing the exact payload shape it received:
+
+```text
+$ psql -c "insert into public.edge_events (kind) values ('edge_test_event') returning id, created_at;"
+ id |          created_at
+----+-------------------------------
+  1 | 2026-09-29 04:36:11.418738+00
+
+$ psql -c "select id, hook_table_id, hook_name, request_id from supabase_functions.hooks order by id desc limit 1;"
+ id | hook_table_id |      hook_name      | request_id
+----+---------------+---------------------+------------
+  1 |         21111 | edge_events_webhook |          1
+
+$ psql -c "select id, status_code, content::text from net._http_response order by id desc limit 1;"
+ id | status_code |      content
+----+-------------+-------------------
+  1 |         200 | {"received":true}
+
+# from the function's own log:
+[Info] [webhook] received type=INSERT table=edge_events record={"id":1,"kind":"edge_test_event","created_at":"2026-09-29T04:36:11.418738+00:00"}
+```
+
+The payload shape a Database Webhook sends is `{ type, table, record, schema }` — `type` is `INSERT`/`UPDATE`/`DELETE`, `record` is the new row as JSON, matching the `WebhookPayload` shape a function receiving one should declare.
 
 <Mermaid title="A Postgres insert triggering a webhook, an Edge Function, and a background task" code={webhookBackgroundDiagram} />
 
 export const webhookBackgroundDiagram = `flowchart LR
-  insertRow["insert into orders"] --> webhook["Database Webhook (pg_net, async)"]
-  webhook --> edge["Edge Function"]
+  insertRow["insert into edge_events"] --> webhook["Database Webhook (pg_net, async)"]
+  webhook --> edge["edge-webhook-receiver"]
   edge --> respond["Immediate response: 200 received"]
-  edge -->|"EdgeRuntime.waitUntil"| bg["Background task: send confirmation email"]`;
+  edge -->|"EdgeRuntime.waitUntil"| bg["Background task (e.g. slow follow-up work)"]`;
+
+## `pg_net` is asynchronous — proved with timing, not just claimed
+
+The whole reason a Database Webhook is safe to attach to a write path is that `pg_net` never makes the triggering statement wait for the HTTP response. Proof: timing the `insert` itself with `psql`'s own `\timing`, not the webhook call:
+
+```text
+$ psql -c "\timing on" -c "insert into public.edge_events (kind) values ('edge_timing_test') returning id;"
+ id
+----
+  2
+INSERT 0 1
+Time: 2.767 ms
+```
+
+**2.767 milliseconds** for the `insert` to return — nowhere near enough time for a full HTTP round trip to `edge-webhook-receiver` through Kong and the Edge Runtime (the cold-start numbers from the first lesson were 60-90ms on this same stack). `pg_net` enqueues the request and returns control to the caller immediately; the actual HTTP call happens on pg_net's own background worker, and its result lands later in `net._http_response` — read *after* the fact, as shown above, not awaited by the `insert`.
+
+## Scheduled functions with `pg_cron`
+
+`pg_cron` runs SQL on a schedule from inside Postgres — not installed by default on this local stack (`select * from pg_extension` shows it absent until enabled), so it is proved here by enabling it, scheduling a real one-minute job, and waiting for it to actually fire, not just trusting the schedule string:
+
+```sql
+select cron.schedule('edge_ping_cron', '* * * * *', $$select 1$$);
+```
+
+```text
+$ psql -c "select jobid, runid, status, start_time, end_time from cron.job_run_details order by start_time desc limit 1;"
+ jobid | runid |  status   |          start_time           |           end_time
+-------+-------+-----------+--------------------------------+--------------------------------
+     1 |     1 | succeeded | 2026-09-29 04:37:00.022241+00 | 2026-09-29 04:37:00.023384+00
+```
+
+The run landed at second `:00` of the next minute, `succeeded`, and finished in about a millisecond — real proof the job fired on schedule, not just that `cron.schedule()` returned without error. Calling an Edge Function on a schedule (rather than `select 1`) is the same `supabase_functions.http_request(...)` call used for the webhook trigger above, just invoked by `cron.schedule` instead of by a table trigger. The test job was unscheduled immediately after this proof (`select cron.unschedule('edge_ping_cron')`) — see the wrap-up at the end of this module for what was left running vs. cleaned up.
+
+## Idempotency: Database Webhooks do not retry, Auth Hooks do
+
+Two different Supabase features both call an HTTP endpoint from inside Postgres, and they have **different** retry behavior — worth being precise about, since AI-generated code (and the docs skimmed quickly) can easily conflate them:
+
+- **Auth Hooks** (HTTP hooks configured for events like "Customize Access Token Claims") retry automatically: *"On a retry-able error, such as an error with a 429 or 503 status code, HTTP Hooks will attempt up to three retries with a back-off of two seconds. We have a time budget of 5s for the entire webhook invocation, including retry requests"* ([Auth Hooks docs](https://github.com/supabase/supabase/blob/master/apps/docs/content/guides/auth/auth-hooks.mdx)).
+- **Database Webhooks** (the `pg_net`-based trigger proved above) have **no built-in retry** — a failed or slow webhook call is not automatically retried by the platform. The debugging guide's own troubleshooting advice is to *query `net._http_response` for failures yourself*, not "wait for the retry" ([pg_net troubleshooting](https://github.com/supabase/supabase/blob/master/apps/docs/content/troubleshooting/webhook-debugging-guide-M8sk47.mdx)).
+
+The practical consequence: a Database Webhook receiver must be written **idempotently** on its own — safe to process the same logical event twice — because nothing in the platform guarantees exactly-once delivery, and unlike Auth Hooks, nothing retries a failure automatically either. A common, effective pattern is an idempotency key (the row's own primary key, or a `request_id` from `supabase_functions.hooks`, the audit table shown above) checked before doing anything with side effects.
+
+## Shutdown behavior
+
+Docs describe two related mechanisms this course did not reproduce locally, stated honestly rather than staged: an isolate nearing its wall-clock limit fires a `beforeunload` event before shutting down, letting a function save state or log progress:
+
+```typescript
+addEventListener('beforeunload', (ev) => {
+  console.log('Function will be shutdown due to', ev.detail?.reason)
+})
+```
+
+and the shutdown payload itself carries a `reason` (`"WallClockTime"` is one documented value) plus resource usage at the moment of shutdown ([shutdown reasons docs](https://github.com/supabase/supabase/blob/master/apps/docs/content/troubleshooting/edge-function-shutdown-reasons-explained.mdx)). Attempting to reproduce this locally by stopping this module's own `supabase functions serve` process did **not** trigger the listener — killing the CLI process tears down the whole local Edge Runtime container abruptly rather than retiring one isolate gracefully near its wall-clock limit, which only really happens on a long-lived, heavily-used deployed function. The mechanism and its payload shape are docs-sourced above, not locally measured.
 
 <Callout title="The one-line takeaway">
-A **Database Webhook** is a Postgres trigger built on the **`pg_net`** extension that fires an HTTP request asynchronously to an Edge Function whenever a chosen row event happens, and **`EdgeRuntime.waitUntil(promise)`** lets that function return its response immediately while an un-awaited promise keeps running afterward — combined, an `insert` into `orders` can trigger a function that acknowledges instantly while a confirmation email sends in the background.
+`EdgeRuntime.waitUntil(promise)` (proved: a **60ms** response returned while a **3-second** background task kept running, timestamps from real logs) lets a function acknowledge fast while finishing work after. A **Database Webhook** is a Postgres trigger built on **`pg_net`** (proved end to end: insert → trigger → async HTTP call → function received the real payload shape `{type, table, record, schema}`) that is **asynchronous** (proved: the triggering insert returned in under 3ms) and has **no automatic retry** (unlike Auth Hooks' documented 3-retry/5s-budget policy) — receivers must be idempotent on their own. `pg_cron` schedules real SQL from inside Postgres (proved: a 1-minute job actually fired and succeeded); shutdown's `beforeunload`/wall-clock behavior is docs-sourced here, honestly not reproduced locally.
 </Callout>
+
+## Reading AI-generated code
+
+An AI assistant asked to "call `pg_net` in a trigger and check whether the webhook succeeded before returning" produced this:
+
+<SpotTheBug lang="sql" code={`create or replace function public.edge_notify_and_check()
+returns trigger
+language plpgsql
+as $$
+declare
+  req_id bigint;
+  resp record;
+begin
+  select net.http_post(
+    'http://supabase_kong_probe:8000/functions/v1/edge-webhook-receiver',
+    to_jsonb(new)
+  ) into req_id;
+
+  -- Check the response right away, in the same transaction
+  select * into resp from net._http_response where id = req_id;
+
+  if resp.status_code is null or resp.status_code >= 400 then
+    raise exception 'webhook failed';
+  end if;
+
+  return new;
+end;
+$$;
+`}>
+This misunderstands the exact "asynchronous" behavior proved earlier in this lesson: `net.http_post()` returns a `request_id` **immediately**, having only *enqueued* the HTTP call — the actual request has not necessarily even been sent yet, let alone completed, by the time the very next line runs. `select ... from net._http_response where id = req_id` inside the same trigger will almost always find **no row at all** (the response has not arrived yet), so `resp.status_code is null` is true essentially every time, and the trigger raises `'webhook failed'` and rolls back the insert — even when the webhook call would have succeeded perfectly fine, just a few milliseconds later than this code checked for it. The fix is not "wait longer" (blocking a trigger on network I/O defeats the entire point of `pg_net` being async, proved above with the 2.767ms `insert` timing) — it is to not check synchronously at all: let the insert commit, and either poll `net._http_response` later out-of-band (a separate scheduled `pg_cron` job, say) or, as this lesson's idempotency section covers, design the receiving function to be safely retriable and skip trying to observe success inside the same transaction that triggered it.
+</SpotTheBug>
+
+## Mental Model
+
+Both mechanisms in this lesson exist to let one part of the system say "keep going, I don't need to know how this turns out right now" — `waitUntil` says it about work still running *inside the same function*, and a Database Webhook's `pg_net` trigger says it about work `Postgres itself* kicked off and does not wait for. In both cases, "the caller got its response" and "the triggered work actually finished" become two genuinely separate events in time — proved directly in this lesson by real timestamps (`waitUntil`) and a real sub-3ms `insert` next to a request that took tens of milliseconds to actually complete (`pg_net`). The SpotTheBug bug is exactly what happens when code is written as though those two events were still one: checking for a result that, by design, is not there yet.
+
+## Trade-offs
+
+- **`EdgeRuntime.waitUntil` lets a function return fast while real work continues** — **at the cost of the caller having no way to know whether that background work actually succeeded**, unless the function's own design surfaces that separately (a follow-up webhook, a status row the client polls).
+- **`pg_net`'s async design means a webhook never blocks the write that triggered it** — **at the cost of no built-in retry or synchronous confirmation**, proved above and cited from docs — the receiving function, and anything that cares whether it ran, must be built assuming at-most-once, best-effort delivery.
+- **`pg_cron` runs real SQL on a schedule with zero external infrastructure** — **at the cost of living entirely inside Postgres**: a cron job that needs to call out to the internet still has to go through `pg_net`/an Edge Function, inheriting the exact same async, no-retry behavior as a webhook.
+
+## Common Misconceptions
+
+- **"`await`ing the background task inside `waitUntil` is safer, it just also delays the response a bit."** It does not "delay it a bit" — it eliminates the entire benefit, proved above: `await`ing `slowBackgroundWork()` directly would make the response wait the full 3 seconds instead of 60ms.
+- **"If `net.http_post()` returned successfully, the webhook call succeeded."** It returned a `request_id` for an *enqueued* request — proved above (and in the SpotTheBug) that the actual HTTP call, and its status code, are only knowable later, from `net._http_response`.
+- **"Database Webhooks retry failed calls automatically, same as Auth Hooks."** They do not — proved and cited above: Auth Hooks have a documented 3-retry/5s-budget policy; Database Webhooks have none, and the platform's own troubleshooting guide tells you to query `net._http_response` for failures yourself rather than expect a retry.
+- **"`pg_cron` needs an external scheduler or cron daemon on the server."** It runs entirely inside Postgres as an extension — proved above with a real job firing on a `* * * * *` schedule with no process outside the database involved.
 
 export const quizBackgroundWebhooks = [
   {
-    q: 'What Postgres extension powers Database Webhooks',
+    q: 'In the EdgeRuntime.waitUntil proof, the response returned in 60ms while the background task took 3 seconds. What made that possible?',
     options: [
-      'pg_cron',
-      'pg_net',
-      'pg_graphql',
-      'pg_stat_statements',
+      'The background task ran on a separate server',
+      'slowBackgroundWork() was called without await, and its unresolved promise was passed to waitUntil, which keeps the isolate alive without blocking the response',
+      'The 3-second delay was fake and did not actually happen',
+      'waitUntil automatically cancels slow background tasks after the response is sent',
     ],
     answer: 1,
+    explain: 'Proved with real log timestamps: the response left at :46.830Z and the background task finished at :49.831Z, three seconds later — only possible because the promise was not awaited before returning.',
   },
   {
-    q: 'Why does pg_net make webhook HTTP calls asynchronous',
+    q: 'What Postgres extension does a Database Webhook trigger use to make its HTTP call, and why does that matter for the write that triggers it?',
     options: [
-      'So the calling client has to poll for the result',
-      'So a slow or failing HTTP request never blocks the database write that triggered it',
-      'So it can only be used for reads, never writes',
-      'Asynchronous behavior is not related to pg_net',
+      'pg_cron, so the call happens on the next scheduled tick',
+      'pg_net, which makes the call asynchronously so the triggering insert/update/delete never waits on the HTTP response',
+      'pg_graphql, so the payload is sent as a GraphQL mutation',
+      'It uses a synchronous HTTP client, so the write does wait',
     ],
     answer: 1,
+    explain: 'Proved above: the insert that fired the trigger returned in 2.767ms, far too fast to include a real HTTP round trip — pg_net enqueues and returns immediately.',
   },
   {
-    q: 'What does EdgeRuntime.waitUntil let an Edge Function do',
+    q: 'Do Database Webhooks (the pg_net trigger mechanism) automatically retry a failed HTTP call, the way Auth Hooks do?',
     options: [
-      'Delay sending any response until all promises resolve',
-      'Return its HTTP response immediately while a background task keeps running afterward',
-      'Retry a failed request automatically',
-      'Cache the response for future identical requests',
+      'Yes, both retry up to 3 times with a 2-second backoff',
+      'No — Auth Hooks have a documented 3-retry/5s-budget policy, but Database Webhooks have no built-in retry; failures must be found by querying net._http_response',
+      'Database Webhooks retry indefinitely until they succeed',
+      'Neither mechanism ever retries',
     ],
     answer: 1,
+    explain: 'Cited from the docs: Auth Hooks documents "up to three retries with a back-off of two seconds... 5s ... budget"; the pg_net/webhook debugging guide instead tells you to query net._http_response for failures yourself.',
   },
   {
-    q: 'In the combined order confirmation example, what happens if you await the email-sending promise instead of passing it to waitUntil',
+    q: 'A trigger function calls net.http_post() and then immediately selects from net._http_response using the returned request_id, expecting to see the response status. What actually happens?',
     options: [
-      'Nothing changes, behavior is identical',
-      'The HTTP response would wait until the email finished sending',
-      'The database insert would be rolled back',
-      'The Database Webhook would stop firing',
+      'It reliably sees the real response, because net.http_post() blocks until the response arrives',
+      'It almost always finds no row yet, because the HTTP call is only enqueued at that point, not completed — checking for a result synchronously right after is checking too early',
+      'It raises a Postgres syntax error',
+      'net._http_response is only populated once a day',
     ],
     answer: 1,
+    explain: 'This is the SpotTheBug above: net.http_post() returns immediately having only enqueued the request; the response row does not exist yet at the point the buggy trigger checks for it.',
+  },
+  {
+    q: 'The pg_cron proof scheduled a job for `* * * * *` and then checked cron.job_run_details. What did that prove, beyond cron.schedule() returning without error?',
+    options: [
+      'Nothing more, a successful cron.schedule() call is proof enough that it will fire',
+      'That the job actually fired at the real scheduled time and succeeded — proved with a real row showing start_time/end_time/status, not just that scheduling it did not error',
+      'That pg_cron requires a separate systemd service outside Postgres',
+      'That cron jobs cannot call Edge Functions, only plain SQL',
+    ],
+    answer: 1,
+    explain: 'cron.job_run_details showed a real run: status "succeeded" with real start_time/end_time about a millisecond apart, landing on the next minute boundary — the schedule genuinely fired, not merely accepted.',
+  },
+  {
+    q: 'Why is idempotency important for a function that receives a Database Webhook, specifically (more so than for a function invoked directly by a client)?',
+    options: [
+      'It is not actually more important, all Edge Functions need it equally',
+      'Because Database Webhooks have no built-in retry or delivery guarantee, a receiver should be safe to process the same logical event more than once rather than assume exactly-once delivery',
+      'Because Database Webhooks always deliver every event exactly twice',
+      'Idempotency only matters for functions that write to storage buckets',
+    ],
+    answer: 1,
+    explain: 'Proved and cited above: with no automatic retry and no synchronous confirmation available to the trigger, the safest assumption for a webhook receiver is best-effort, possibly-repeated delivery — designing for idempotency handles that correctly either way.',
   },
 ];
 
