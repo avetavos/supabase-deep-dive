@@ -38,6 +38,9 @@ export default defineConfig({
         { label: 'Edge Functions', items: [{ autogenerate: { directory: 'edge-functions' } }] },
         { label: 'Client Development', items: [{ autogenerate: { directory: 'client-development' } }] },
         { label: 'Production & Ecosystem', items: [{ autogenerate: { directory: 'production-and-ecosystem' } }] },
+        { label: 'How Supabase Works', translations: { th: 'Supabase ทำงานอย่างไรข้างใน' }, items: [{ autogenerate: { directory: 'supabase-internals' } }] },
+        { label: 'Reading AI-generated Supabase', translations: { th: 'อ่านโค้ด Supabase ที่ AI เขียน' }, items: [{ autogenerate: { directory: 'reading-supabase' } }] },
+        { label: 'Glossary', translations: { th: 'อภิธานศัพท์' }, link: 'glossary' },
       ],
       }), preact()],
 });
