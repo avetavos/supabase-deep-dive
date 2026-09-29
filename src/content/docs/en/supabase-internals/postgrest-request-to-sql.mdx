@@ -181,10 +181,14 @@ At `t+0s`, the freshly created function does not exist as far as PostgREST's sch
 
 ## Proof: `EXPLAIN` on the generated query shows an RLS policy as an `InitPlan`
 
-Adding a policy that uses the same `(select auth.uid())` wrap [RLS Patterns and Pitfalls](/supabase/en/auth-and-row-level-security/rls-patterns-and-pitfalls/) already proved turns into a once-per-query `InitPlan` rather than a once-per-row re-evaluation, then running `EXPLAIN` on the *exact* column list PostgREST's own `pgrst_source` CTE generates for a plain `select * from int_orders`:
+Adding a policy that uses the same `(select auth.uid())` wrap [RLS Patterns and Pitfalls](/supabase/en/auth-and-row-level-security/rls-patterns-and-pitfalls/) already proved turns into a once-per-query `InitPlan` rather than a once-per-row re-evaluation, then running `EXPLAIN` on the *exact* column list PostgREST's own `pgrst_source` CTE generates for a plain `select * from int_orders`. This lesson recreates `int_orders` (same shape as the [Postgres Roles and Grants](/supabase/en/supabase-internals/postgres-roles-and-grants/) lesson that first proved it) so the fence below stands alone:
 
 ```sql
 -- supabase/migrations/9502_int_orders_read_policy.sql
+create table if not exists public.int_orders (
+  id uuid primary key default gen_random_uuid(),
+  note text
+);
 create policy int_orders_read on public.int_orders
   for select to authenticated
   using ((select auth.uid()) is not null);

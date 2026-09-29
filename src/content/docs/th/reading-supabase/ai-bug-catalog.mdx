@@ -97,9 +97,16 @@ alter table public.profiles add constraint profiles_id_fkey
 ```ts
 // src/widgets.ts
 import { createClient } from '@supabase/supabase-js'
-import type { Database } from '../database.types'
 
-const supabase = createClient<Database>('http://127.0.0.1:55321', 'anon-key-placeholder')
+// Hand-kept snapshot of what `supabase gen types` produced BEFORE the rename below —
+// the same "stale type" stand-in this course's own typed-queries lesson uses for this
+// exact scenario, in place of importing the shared, live-schema-tracking database.types.ts.
+type RdWidgetsRow = { id: string; qty: number }
+type StaleDatabase = {
+  public: { Tables: { rd_widgets: { Row: RdWidgetsRow; Insert: Partial<RdWidgetsRow>; Update: Partial<RdWidgetsRow> } } }
+}
+
+const supabase = createClient<StaleDatabase>('http://127.0.0.1:55321', 'anon-key-placeholder')
 
 async function bumpQty(id: string) {
   const { data, error } = await supabase.from('rd_widgets').select('id, qty').eq('id', id)

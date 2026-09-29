@@ -122,6 +122,8 @@ Not "should be the same" — proven the same, by intercepting the real outgoing 
 // @run
 import { createClient } from '@supabase/supabase-js';
 
+declare const process: { env: Record<string, string | undefined>; exit: (code?: number) => never };
+
 const API_URL = process.env.SUPABASE_URL!;
 const ANON_KEY = process.env.SUPABASE_ANON_KEY!;
 const admin = createClient(API_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!);

@@ -207,10 +207,15 @@ Every column from the hand-written migration above shows up correctly typed, wit
 
 ## Seeding and branching — same CLI, mostly docs from here
 
-`supabase/seed.sql` runs automatically after `supabase db reset` (and optionally on `db push --include-seed`) — a fixed set of rows for local development and CI, not something migrations should carry:
+`supabase/seed.sql` runs automatically after `supabase db reset` (and optionally on `db push --include-seed`) — a fixed set of rows for local development and CI, not something migrations should carry. `fnd_widgets` above was created in a disposable scratch project rather than this course's own `supabase/migrations/`, so this lesson recreates it here (same shape as the hand-written migration earlier) to stand alone:
 
 ```sql
 -- supabase/seed.sql
+create table if not exists public.fnd_widgets (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  created_at timestamptz not null default now()
+);
 insert into public.fnd_widgets (name) values ('seeded widget one'), ('seeded widget two');
 ```
 

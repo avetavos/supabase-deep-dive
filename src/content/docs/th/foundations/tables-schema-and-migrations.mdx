@@ -207,10 +207,15 @@ fnd_widgets: {
 
 ## Seeding กับ Branching — CLI เดียวกัน ส่วนใหญ่เป็นเอกสาร
 
-`supabase/seed.sql` รันอัตโนมัติหลัง `supabase db reset` (และรันได้ด้วยถ้าใส่ `db push --include-seed`) — ชุด row ตายตัวสำหรับ local development และ CI ไม่ใช่สิ่งที่ migration ควรแบก:
+`supabase/seed.sql` รันอัตโนมัติหลัง `supabase db reset` (และรันได้ด้วยถ้าใส่ `db push --include-seed`) — ชุด row ตายตัวสำหรับ local development และ CI ไม่ใช่สิ่งที่ migration ควรแบก `fnd_widgets` ด้านบนถูกสร้างใน scratch project แยกต่างหาก ไม่ใช่ `supabase/migrations/` ของคอร์สนี้เอง บทเรียนนี้จึงสร้างตารางซ้ำที่นี่ (โครงสร้างเดียวกับ migration ที่เขียนด้วยมือก่อนหน้า) เพื่อให้ fence นี้ยืนได้ด้วยตัวเอง:
 
 ```sql
 -- supabase/seed.sql
+create table if not exists public.fnd_widgets (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  created_at timestamptz not null default now()
+);
 insert into public.fnd_widgets (name) values ('seeded widget one'), ('seeded widget two');
 ```
 

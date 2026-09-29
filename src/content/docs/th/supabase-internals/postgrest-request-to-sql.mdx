@@ -181,10 +181,14 @@ $ curl -s -w " http=%{http_code}\n" -X POST "$API_URL/rest/v1/rpc/int_schema_cac
 
 ## พิสูจน์: `EXPLAIN` บน query ที่ generate โชว์ policy ของ RLS เป็น `InitPlan`
 
-เพิ่ม policy ที่ใช้ wrap `(select auth.uid())` แบบเดียวกับที่ [RLS Patterns and Pitfalls](/supabase/th/auth-and-row-level-security/rls-patterns-and-pitfalls/) พิสูจน์ไปแล้วว่ากลายเป็น `InitPlan` ครั้งเดียวต่อ query แทนที่จะประเมินซ้ำทุกแถว แล้วรัน `EXPLAIN` บน column list ที่ PostgREST เองสร้างจริง ๆ ใน `pgrst_source` CTE สำหรับ `select * from int_orders` ธรรมดา:
+เพิ่ม policy ที่ใช้ wrap `(select auth.uid())` แบบเดียวกับที่ [RLS Patterns and Pitfalls](/supabase/th/auth-and-row-level-security/rls-patterns-and-pitfalls/) พิสูจน์ไปแล้วว่ากลายเป็น `InitPlan` ครั้งเดียวต่อ query แทนที่จะประเมินซ้ำทุกแถว แล้วรัน `EXPLAIN` บน column list ที่ PostgREST เองสร้างจริง ๆ ใน `pgrst_source` CTE สำหรับ `select * from int_orders` ธรรมดา บทเรียนนี้สร้าง `int_orders` ซ้ำ (โครงสร้างเดียวกับบทเรียน [Postgres Roles and Grants](/supabase/th/supabase-internals/postgres-roles-and-grants/) ที่พิสูจน์มันไว้ก่อน) เพื่อให้ fence ด้านล่างยืนได้ด้วยตัวเอง:
 
 ```sql
 -- supabase/migrations/9502_int_orders_read_policy.sql
+create table if not exists public.int_orders (
+  id uuid primary key default gen_random_uuid(),
+  note text
+);
 create policy int_orders_read on public.int_orders
   for select to authenticated
   using ((select auth.uid()) is not null);
