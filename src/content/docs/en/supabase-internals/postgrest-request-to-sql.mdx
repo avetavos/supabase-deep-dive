@@ -1,0 +1,310 @@
+---
+title: 'PostgREST: Request to SQL'
+description: 'The literal SQL PostgREST compiles a select/filter/count/insert/RPC request into — read back from pg_stat_statements — the pgrst_source CTE shape, why Prefer: tx=rollback is silently ignored by default, the schema cache reload race, and an EXPLAIN showing an RLS policy as an InitPlan.'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+Every Data API request PostgREST handles — `select`, `insert`, an RPC call, with or without `count=exact` — compiles down to **one parameterized SQL statement built around a `pgrst_source` common table expression**, executed once, with the request's filters/columns/body spliced into that one CTE and a fixed outer `SELECT` doing JSON aggregation and response-header/status plumbing around it.
+
+## Setup: a clean view via `pg_stat_statements`
+
+Reusing this module's own `int_orders` table and `int_whoami()` function from the previous lesson keeps this proof inside this module's namespace rather than colliding with another module's queries on the shared stack. Resetting the view first so only this lesson's own requests show up:
+
+```sql
+-- sql/int_pgrst_reset_stats.sql
+select pg_stat_statements_reset();
+```
+
+Four requests, one of each shape this lesson covers — a filtered `select`, a `count=exact`, an `insert`, and an `rpc` call:
+
+```text
+$ curl -s "$API_URL/rest/v1/int_orders?select=id,note&note=eq.secret-order-1" -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY"
+$ curl -s -D - "$API_URL/rest/v1/int_orders?select=id&limit=0" -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" -H "Prefer: count=exact" -o /dev/null | grep -i content-range
+Content-Range: */1
+$ curl -s -X POST "$API_URL/rest/v1/int_orders" -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" -H "Content-Type: application/json" -H "Prefer: return=representation" -d '{"note":"pgrst-proof-row"}'
+$ curl -s -X POST "$API_URL/rest/v1/rpc/int_whoami" -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" -H "Content-Type: application/json" -d '{}'
+```
+
+Reading the exact SQL Postgres actually executed for each, straight from `pg_stat_statements` (`select query from pg_stat_statements where query ilike '%int_orders%' or query ilike '%int_whoami%'`):
+
+## Proof: a filtered `select` compiles to one `pgrst_source` CTE
+
+```text
+WITH pgrst_source AS (
+  SELECT "public"."int_orders"."id", "public"."int_orders"."note"
+  FROM "public"."int_orders"
+  WHERE "public"."int_orders"."note" = $1
+  LIMIT $2 OFFSET $3
+)
+SELECT $4::bigint AS total_result_set,
+       pg_catalog.count(_postgrest_t) AS page_total,
+       coalesce(json_agg(_postgrest_t), $5) AS body,
+       nullif(current_setting($6, $7), $8) AS response_headers,
+       nullif(current_setting($9, $10), $11) AS response_status,
+       $12 AS response_inserted
+FROM (SELECT * FROM pgrst_source) _postgrest_t
+```
+
+`?select=id,note` became the exact column list inside `pgrst_source`; `?note=eq.secret-order-1` became `WHERE ... = $1`. Everything **outside** `pgrst_source` — `json_agg`, the two `current_setting` calls for headers/status, `response_inserted` — is fixed scaffolding present on every request shape below. This is the answer to a question the earlier `int_whoami` RPC proof left open: `set_config('request.jwt.claims', ...)`/`response.headers`/`response.status` are all session-local GUCs that a `security definer` PL/pgSQL function can set (`response.status`, notably, is how a function can force a custom HTTP status code) and this outer query reads right back with `current_setting`.
+
+## Proof: `count=exact` is a separate counting CTE, not a window function
+
+```text
+WITH pgrst_source AS (
+  SELECT "public"."int_orders"."id"
+  FROM "public"."int_orders"
+  LIMIT $1 OFFSET $2
+),
+pgrst_source_count AS (
+  SELECT $3 FROM "public"."int_orders"
+)
+SELECT (SELECT pg_catalog.count(*) FROM pgrst_source_count) AS total_result_set,
+       pg_catalog.count(_postgrest_t) AS page_total,
+       coalesce(json_agg(_postgrest_t), $4) AS body,
+       nullif(current_setting($5, $6), $7) AS response_headers,
+       nullif(current_setting($8, $9), $10) AS response_status,
+       $11 AS response_inserted
+FROM (SELECT * FROM pgrst_source) _postgrest_t
+```
+
+<Callout title="Correction to a common assumption about count=exact">
+Some older material (and the naive mental model) describes `count=exact` as adding a `count(*) OVER()` window function to the same query. That is **not** what this PostgREST version (v16.2, confirmed via `curl $API_URL/rest/v1/` root `"version":"16.2"`) generates — it builds a genuinely **second CTE**, `pgrst_source_count`, that re-scans the table independently from `pgrst_source` and is counted separately. Practically this means `count=exact`'s cost is a second full scan/count of whatever the filter matches, not a "free" column tacked onto the first scan — real, worth knowing before reaching for `count=exact` on a large, frequently-filtered table.
+</Callout>
+
+## Proof: `insert` compiles to a CTE with `RETURNING`
+
+```text
+WITH pgrst_source AS (
+  INSERT INTO "public"."int_orders"("note")
+  SELECT "pgrst_body"."note"
+  FROM (SELECT $1 AS json_data) pgrst_payload,
+       LATERAL (SELECT "note" FROM json_to_record(pgrst_payload.json_data) AS _("note" text)) pgrst_body
+  RETURNING "public"."int_orders".*
+)
+SELECT $2 AS total_result_set,
+       pg_catalog.count(_postgrest_t) AS page_total,
+       array[]::text[] AS header,
+       coalesce(json_agg(_postgrest_t), $3) AS body,
+       nullif(current_setting($4, $5), $6) AS response_headers,
+       nullif(current_setting($7, $8), $9) AS response_status,
+       $10 AS response_inserted
+FROM (SELECT "int_orders".* FROM "pgrst_source" AS "int_orders") _postgrest_t
+```
+
+Your JSON body never becomes a literal Postgres value substituted field-by-field — it arrives as **one** `$1` bound parameter (the raw JSON text), and `json_to_record` inside a `LATERAL` join is what PostgREST uses to turn that single parameter back into typed columns (`"note" text` here) for the `INSERT`. `RETURNING "public"."int_orders".*` inside the same CTE is what makes `Prefer: return=representation` "free" — the inserted row is already sitting in `pgrst_source`, no second round trip needed.
+
+## Proof: an RPC call compiles to a function-call CTE
+
+```text
+WITH pgrst_source AS (
+  SELECT "pgrst_call".* FROM "public"."int_whoami"() pgrst_call
+)
+SELECT null::bigint AS total_result_set,
+       pg_catalog.count(_postgrest_t) AS page_total,
+       coalesce(json_agg(_postgrest_t), '[]') AS body,
+       nullif(current_setting('response.headers', true), '') AS response_headers,
+       nullif(current_setting('response.status', true), '') AS response_status,
+       '' AS response_inserted
+FROM (SELECT "record".* FROM "pgrst_source" AS "record" LIMIT $1 OFFSET $2) _postgrest_t
+```
+
+`rpc/int_whoami` became a plain `SELECT * FROM public.int_whoami()` inside `pgrst_source` — the exact same wrapper shape as `select`/`insert` around it, which is *why* `/rest/v1/rpc/<fn>` and `/rest/v1/<table>` share so much of PostgREST's own query-building code, and why `stable`/`immutable` functions can be called with `GET` (covered in [RPC as functions](/supabase/en/auto-generated-api/database-functions-as-rpc/)) while `volatile` ones cannot — Postgres's own planner decides GET-safety from that same function-call shape.
+
+<Mermaid title="One request, one compiled SQL statement, built around pgrst_source" code={requestToSqlDiagram} />
+
+export const requestToSqlDiagram = `flowchart TD
+  req["HTTP request: select / filter / count / insert / rpc"] --> parse["PostgREST parses query string + body"]
+  parse --> cache{"Function/table in the schema cache?"}
+  cache -->|no| err["PGRST202 / PGRST205 — 404, before any SQL runs"]
+  cache -->|yes| build["Build ONE parameterized statement:\\nWITH pgrst_source AS (...) SELECT json_agg(...) ..."]
+  build --> tx["Open a transaction, SET LOCAL ROLE, set_config(request.jwt.claims)"]
+  tx --> exec["Execute the one statement"]
+  exec --> commit{"db-tx-end: commit (default) or rollback?"}
+  commit -->|commit, default| done["COMMIT — response returned"]
+  commit -->|rollback / override| rb["ROLLBACK — response still returned, nothing persisted"]`;
+
+## Proof: `Prefer: tx=rollback` is silently ignored by default
+
+Per PostgREST's own docs, `db-tx-end` controls this and defaults to `commit` — the `tx` Prefer header is *"not enabled by default"*, only honored when the server operator sets `db-tx-end` to `commit-allow-override` or a rollback mode ([postgrest.org, Transaction End Preference](https://postgrest.org/en/stable/references/api/preferences.html#tx)). This course's local stack does not set `PGRST_DB_TX_END` at all (confirmed: `docker inspect supabase_rest_probe --format '{{range .Config.Env}}{{println .}}{{end}}'` lists no `PGRST_DB_TX_END` variable), so it runs the undocumented-by-omission default:
+
+```text
+$ curl -s -D - "$API_URL/rest/v1/int_orders" -X POST -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" \
+    -H "Content-Type: application/json" -H "Prefer: tx=rollback,return=representation" -d '{"note":"tx-rollback-check-2"}'
+HTTP/1.1 201 Created
+...
+Preference-Applied: return=representation
+...
+[{"id":"42152ea0-bca7-4ae3-ba43-cc769624787b","note":"tx-rollback-check-2"}]
+
+$ docker exec -i supabase_db_probe psql -U postgres -c "select note from public.int_orders where note = 'tx-rollback-check-2';"
+        note
+---------------------
+ tx-rollback-check-2
+(1 row)
+```
+
+`Preference-Applied` lists `return=representation` but **not** `tx=rollback` — PostgREST's own response is telling you the preference was not applied, and the row is really there afterward. This is a genuine, easy-to-hit footgun: reaching for `Prefer: tx=rollback` as a client-side "dry run" flag against a hosted Supabase project (or any PostgREST server whose operator hasn't opted in) does nothing but add a response header nobody reads — the write commits exactly as if the header were absent.
+
+## Proof: the schema cache has a real, measurable reload gap
+
+`\dy` on this course's own stack shows two Supabase-managed event triggers watching DDL:
+
+```text
+$ docker exec -i supabase_db_probe psql -U postgres -c "\dy"
+ pgrst_ddl_watch  | ddl_command_end | supabase_admin | enabled
+ pgrst_drop_watch | sql_drop        | supabase_admin | enabled
+```
+
+Their source (`\sf pgrst_ddl_watch`) is a plain PL/pgSQL event trigger: for a fixed list of DDL command tags (`CREATE FUNCTION`, `CREATE TABLE`, `ALTER TABLE`, `CREATE VIEW`, ... — the full list is in the function body) it runs exactly one line, `NOTIFY pgrst, 'reload schema';`. PostgREST keeps a persistent `LISTEN pgrst` connection open and reloads its in-memory schema cache on that notification — but that reload is **asynchronous**, not part of the DDL transaction. Creating a brand-new function and calling it immediately, with zero manual reload step:
+
+```text
+$ docker exec -i supabase_db_probe psql -U postgres -c "create or replace function public.int_schema_cache_probe3() returns text language sql as \$\$ select 'cache-probe-v3'::text \$\$; grant execute on function public.int_schema_cache_probe3() to service_role;"
+
+$ curl -s -w " http=%{http_code}\n" -X POST "$API_URL/rest/v1/rpc/int_schema_cache_probe3" -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" -H "Content-Type: application/json" -d '{}'
+{"code":"PGRST202","details":"Searched for the function public.int_schema_cache_probe3 without parameters or with a single unnamed json/jsonb parameter, but no matches were found in the schema cache.", ...} http=404
+
+# two seconds later, still with zero manual NOTIFY of any kind:
+$ curl -s -w " http=%{http_code}\n" -X POST "$API_URL/rest/v1/rpc/int_schema_cache_probe3" -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" -H "Content-Type: application/json" -d '{}'
+"cache-probe-v3" http=200
+```
+
+At `t+0s`, the freshly created function does not exist as far as PostgREST's schema cache is concerned — a real `PGRST202`, not a database error, because the function genuinely does exist in Postgres by then (the `create function` already committed) but PostgREST hasn't reloaded its own cache yet. By `t+2s`, with nothing manual in between, it works — the automatic `NOTIFY pgrst, 'reload schema'` from `pgrst_ddl_watch` reached PostgREST's `LISTEN` connection and it reloaded on its own. On a PostgREST setup **without** this event trigger installed (vanilla PostgREST, or a hosted setup where it was removed), the function would stay invisible indefinitely until an operator ran `NOTIFY pgrst, 'reload schema';` by hand or restarted the server — Supabase ships `pgrst_ddl_watch`/`pgrst_drop_watch` specifically so that manual step is rarely needed, not because the reload became synchronous.
+
+## Proof: `EXPLAIN` on the generated query shows an RLS policy as an `InitPlan`
+
+Adding a policy that uses the same `(select auth.uid())` wrap [RLS Patterns and Pitfalls](/supabase/en/auth-and-row-level-security/rls-patterns-and-pitfalls/) already proved turns into a once-per-query `InitPlan` rather than a once-per-row re-evaluation, then running `EXPLAIN` on the *exact* column list PostgREST's own `pgrst_source` CTE generates for a plain `select * from int_orders`:
+
+```sql
+-- supabase/migrations/9502_int_orders_read_policy.sql
+create policy int_orders_read on public.int_orders
+  for select to authenticated
+  using ((select auth.uid()) is not null);
+```
+
+```text
+$ docker exec -i supabase_db_probe psql -U postgres <<'SQL'
+begin;
+set local role authenticated;
+select set_config('request.jwt.claims', '{"role":"authenticated","sub":"11111111-1111-1111-1111-111111111111"}', true);
+explain select "public"."int_orders"."id", "public"."int_orders"."note" from "public"."int_orders";
+rollback;
+SQL
+                          QUERY PLAN
+---------------------------------------------------------------
+ Seq Scan on int_orders  (cost=0.03..20.73 rows=1065 width=48)
+   Filter: ((InitPlan 1).col1 IS NOT NULL)
+   InitPlan 1
+     ->  Result  (cost=0.00..0.03 rows=1 width=16)
+```
+
+This is the mechanism check, not a re-derivation: [RLS Patterns and Pitfalls](/supabase/en/auth-and-row-level-security/rls-patterns-and-pitfalls/) already proved `(select auth.uid())` beats bare `auth.uid()` under `EXPLAIN ANALYZE` on a larger table; this lesson's contribution is confirming the *exact same* `InitPlan` shape appears on the literal SQL this module has been reading out of `pg_stat_statements` all lesson — RLS is not a separate query PostgREST bolts on, it is a `USING` clause the planner folds directly into `pgrst_source`'s own plan.
+
+## Reading AI-generated code
+
+<SpotTheBug lang="ts" code={`// AI-generated "safe dry-run" helper before a real insert
+async function previewOrderInsert(supabase: SupabaseClient, note: string) {
+  const { data, error } = await supabase
+    .from('int_orders')
+    .insert({ note })
+    .select()
+    .headers({ Prefer: 'tx=rollback' } as any); // "rolls back, so this is just a preview"
+
+  if (error) throw error;
+  console.log('Preview (not actually saved):', data);
+  return data;
+}`}>
+Proven above with a real header-level check: on any PostgREST server that hasn't explicitly set `db-tx-end` to an override-allowing mode (this course's own local stack included — `docker inspect` shows no `PGRST_DB_TX_END` at all, meaning the undocumented-by-omission default `commit`), `Prefer: tx=rollback` is silently ignored. `Preference-Applied` in the real response above lists only `return=representation` — PostgREST's own reply is telling the caller the rollback preference was dropped — and the inserted row was confirmed still present with a direct `psql` read afterward. This function's comment ("rolls back, so this is just a preview") is exactly backwards on an unconfigured server: it is a **real insert** that happens to also claim, via a header nobody is required to honor, that it wasn't one. The actual fix is either a real database transaction the client controls and explicitly rolls back itself (not available over the stateless Data API), a `postgres_fdw`/dry-run RPC function that does its own `ROLLBACK`, or simply not trusting `tx=rollback` for anything client-facing unless you (the server operator) have personally set `db-tx-end` to an override-allowing value and verified it exactly the way this lesson just did.
+</SpotTheBug>
+
+## Mental Model
+
+PostgREST is not an ORM translating your request into idiomatic hand-written SQL — it is a **compiler with one fixed output template**: a `pgrst_source` CTE whose *inside* changes per request (a `WHERE`, an `INSERT ... RETURNING`, a bare function call) and whose *outside* never does (JSON aggregation, response-header/status GUC reads, the transaction and role-switch wrapper this module's first lesson proved). Reading `pg_stat_statements` is reading PostgREST's own compiler output, not a black box — every REST-API concept this course has taught (embedding, `count=exact`, `Prefer` headers, RPC) is a specific, inspectable shape of that one template.
+
+## Trade-offs
+
+| Design choice | Benefit | Cost |
+|---|---|---|
+| One `pgrst_source` CTE template for every request shape | A single, auditable code path — one place to read to understand any request's real SQL, proven above across select/count/insert/rpc | The generated SQL is verbose and parameterized in a way that is not obviously matched back to `pg_stat_statements` rows without knowing this shape first |
+| `count=exact` as a genuinely separate counting CTE | Correct, isolated count regardless of the main query's `LIMIT`/`OFFSET` | A real second scan of whatever the filter matches — proven above, not a free window-function column |
+| Async schema-cache reload via `LISTEN`/`NOTIFY`, not a synchronous check per request | Zero per-request overhead from consulting the catalog on every call | A real, measured gap (proven above: invisible at `t+0s`, visible by `t+2s`) where a just-created function or table is briefly a 404 |
+| `db-tx-end` defaulting to `commit`, `tx` Prefer header opt-in only | Safe default — a client cannot accidentally roll back a write the server operator expects to persist | The inverse footgun proven above: a client *assuming* `tx=rollback` works as a dry-run flag silently gets a real commit instead |
+
+## Common Misconceptions
+
+- **"`count=exact` adds a cheap `count(*) OVER()` window column to the same scan."** Disproved above: this PostgREST version builds a real second CTE (`pgrst_source_count`) that scans independently — a genuine second cost, not a free column.
+- **"`Prefer: tx=rollback` is always honored — it's in the docs, so it must be enabled."** Disproved above with a real `Preference-Applied` header that omits it and a `psql` read confirming the row persisted: it requires the server operator to opt in via `db-tx-end`, which this course's own local stack does not do.
+- **"The schema cache updates synchronously the instant a `CREATE FUNCTION` transaction commits."** Disproved above: a real two-second window existed where the function was a genuine `PGRST202` 404 despite already being committed in Postgres — the reload is async, driven by `LISTEN`/`NOTIFY`, not a per-request catalog check.
+- **"RLS is evaluated as a separate step, after PostgREST's own query runs."** Disproved above: the `EXPLAIN` output shows the policy's `(select auth.uid())` compiled directly into the *same* plan as an `InitPlan`, inside the identical `pgrst_source`-shaped query this lesson has been reading all along — one plan, one execution, not two.
+
+## Quiz
+
+export const quizPostgrestRequestToSql = [
+  {
+    q: 'Every request shape this lesson captured from pg_stat_statements (select, count=exact, insert, rpc) shared what structural feature?',
+    options: [
+      'They each used a completely different query-building strategy',
+      'They were all built around one pgrst_source CTE, with a fixed JSON-aggregation/response-header wrapper outside it',
+      'They all used a stored procedure PostgREST calls internally',
+      'They were identical except for the table name',
+    ],
+    answer: 1,
+    explain: 'Proven above across all four captured queries: the inner pgrst_source CTE differs (a WHERE, an INSERT...RETURNING, a bare function call) but json_agg/current_setting(\'response.headers\')/current_setting(\'response.status\') wrap every single one identically.',
+  },
+  {
+    q: 'The real pg_stat_statements output for count=exact showed a pgrst_source_count CTE. What does that structurally mean, compared to the "count(*) OVER()" assumption?',
+    options: [
+      'They are the same thing, just different syntax',
+      'count=exact performs a genuinely separate scan/count of the filtered table, not a free window-function column on the main scan',
+      'count=exact never actually counts anything, it estimates',
+      'pgrst_source_count replaces pgrst_source entirely',
+    ],
+    answer: 1,
+    explain: 'The captured SQL shows two independent CTEs, pgrst_source and pgrst_source_count, each scanning the table separately, with the count computed via a scalar subquery against the second one — a real second cost, proven directly from the captured query text.',
+  },
+  {
+    q: 'The real curl proof showed inserting a row with `Prefer: tx=rollback` still returning the row in psql afterward, with `Preference-Applied: return=representation` only. What does the PostgREST docs say governs whether tx=rollback is honored?',
+    options: [
+      'It is always honored regardless of server config',
+      'db-tx-end, which defaults to "commit" and only allows Prefer: tx=rollback to override when explicitly set to commit-allow-override or a rollback mode',
+      'It depends on the client SDK version, not the server',
+      'It is controlled per-table via a config.toml setting',
+    ],
+    answer: 1,
+    explain: 'Quoted above from postgrest.org: the tx preference "is not enabled by default" and requires db-tx-end to be configured to allow an override — this course\'s local stack has no PGRST_DB_TX_END set at all, so it silently uses the commit default.',
+  },
+  {
+    q: 'The schema-cache proof showed a freshly created function returning PGRST202 at t+0s and working at t+2s with zero manual reload command. What mechanism explains the gap?',
+    options: [
+      'PostgREST re-checks the catalog on every single request, and the gap was just normal query latency',
+      'The pgrst_ddl_watch event trigger fired NOTIFY pgrst, \'reload schema\' automatically on the CREATE FUNCTION, but PostgREST\'s LISTEN-driven reload is asynchronous relative to the DDL transaction, not instantaneous',
+      'The function genuinely did not exist in Postgres until t+2s',
+      'PGRST202 is unrelated to the schema cache; it is a network timeout',
+    ],
+    answer: 1,
+    explain: 'The function existed in Postgres immediately (CREATE FUNCTION already committed) — proven by the fact that no further DDL ran between the two checks — so the only thing that changed was PostgREST\'s own in-memory schema cache, updated asynchronously via the NOTIFY the event trigger fired automatically.',
+  },
+  {
+    q: 'The EXPLAIN proof reused the (select auth.uid()) pattern from RLS Patterns and Pitfalls. What did it add on top of that earlier lesson\'s own proof?',
+    options: [
+      'It proved (select auth.uid()) is faster than bare auth.uid() for the first time',
+      'It confirmed the same InitPlan shape appears in the literal SQL this lesson captured from pg_stat_statements — RLS is compiled directly into the same pgrst_source-shaped plan, not a separate query',
+      'It disproved the earlier lesson\'s InitPlan finding',
+      'It showed RLS policies are evaluated in a completely separate database connection',
+    ],
+    answer: 1,
+    explain: 'This lesson deliberately did not re-derive the InitPlan-vs-per-row timing difference (that proof already exists in RLS Patterns and Pitfalls) — it added the missing link: the exact same query shape this lesson spent its whole body reading out of pg_stat_statements is what RLS policies compile into, visible as an InitPlan in the real EXPLAIN output above.',
+  },
+];
+
+<Quiz client:visible id="supabase-internals/postgrest-request-to-sql" questions={quizPostgrestRequestToSql} />
+
+<ProgressTracker client:visible id="supabase-internals/postgrest-request-to-sql" />

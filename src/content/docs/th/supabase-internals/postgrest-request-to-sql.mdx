@@ -1,0 +1,310 @@
+---
+title: 'PostgREST: Request to SQL'
+description: 'SQL ตัวจริงที่ PostgREST คอมไพล์ request select/filter/count/insert/RPC ไปเป็น — อ่านย้อนกลับจาก pg_stat_statements — รูปร่าง pgrst_source CTE, ทำไม Prefer: tx=rollback ถึงถูกเมินโดยดีฟอลต์, ช่องว่างของการ reload schema cache, และ EXPLAIN ที่โชว์ policy ของ RLS เป็น InitPlan'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ใจความสำคัญในหนึ่งประโยค
+
+ทุก request ของ Data API ที่ PostgREST จัดการ — `select`, `insert`, การเรียก RPC, จะมีหรือไม่มี `count=exact` — คอมไพล์ลงเป็น **statement SQL parameterized ตัวเดียว สร้างรอบ common table expression ชื่อ `pgrst_source`** รันครั้งเดียว โดยเอา filter/column/body ของ request ไปแทรกใน CTE ตัวนั้น และ `SELECT` ชั้นนอกที่ตายตัวทำ JSON aggregation กับจัดการ response-header/status รอบมันอีกที
+
+## เตรียมการ: มุมมองสะอาด ๆ ผ่าน `pg_stat_statements`
+
+ใช้ตาราง `int_orders` และ function `int_whoami()` ของโมดูลนี้เองจากบทก่อนหน้าต่อ เพื่อให้การพิสูจน์นี้อยู่ใน namespace ของโมดูลนี้ ไม่ชนกับ query ของโมดูลอื่นบน shared stack รีเซ็ตมุมมองก่อน เพื่อให้เห็นแค่ request ของบทนี้เอง:
+
+```sql
+-- sql/int_pgrst_reset_stats.sql
+select pg_stat_statements_reset();
+```
+
+สี่ request หนึ่งรูปแบบต่อหนึ่งเรื่องที่บทนี้ครอบคลุม — `select` แบบมี filter, `count=exact`, `insert`, และการเรียก `rpc`:
+
+```text
+$ curl -s "$API_URL/rest/v1/int_orders?select=id,note&note=eq.secret-order-1" -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY"
+$ curl -s -D - "$API_URL/rest/v1/int_orders?select=id&limit=0" -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" -H "Prefer: count=exact" -o /dev/null | grep -i content-range
+Content-Range: */1
+$ curl -s -X POST "$API_URL/rest/v1/int_orders" -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" -H "Content-Type: application/json" -H "Prefer: return=representation" -d '{"note":"pgrst-proof-row"}'
+$ curl -s -X POST "$API_URL/rest/v1/rpc/int_whoami" -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" -H "Content-Type: application/json" -d '{}'
+```
+
+อ่าน SQL จริงที่ Postgres รันจริงสำหรับแต่ละอัน ตรงจาก `pg_stat_statements` (`select query from pg_stat_statements where query ilike '%int_orders%' or query ilike '%int_whoami%'`):
+
+## พิสูจน์: `select` แบบมี filter คอมไพล์ลงเป็น `pgrst_source` CTE เดียว
+
+```text
+WITH pgrst_source AS (
+  SELECT "public"."int_orders"."id", "public"."int_orders"."note"
+  FROM "public"."int_orders"
+  WHERE "public"."int_orders"."note" = $1
+  LIMIT $2 OFFSET $3
+)
+SELECT $4::bigint AS total_result_set,
+       pg_catalog.count(_postgrest_t) AS page_total,
+       coalesce(json_agg(_postgrest_t), $5) AS body,
+       nullif(current_setting($6, $7), $8) AS response_headers,
+       nullif(current_setting($9, $10), $11) AS response_status,
+       $12 AS response_inserted
+FROM (SELECT * FROM pgrst_source) _postgrest_t
+```
+
+`?select=id,note` กลายเป็น column list เป๊ะ ๆ ข้างใน `pgrst_source`; `?note=eq.secret-order-1` กลายเป็น `WHERE ... = $1` ทุกอย่าง **ข้างนอก** `pgrst_source` — `json_agg`, การเรียก `current_setting` สองครั้งสำหรับ headers/status, `response_inserted` — คือโครงที่ตายตัว ปรากฏในทุกรูปแบบ request ด้านล่างนี้ นี่คือคำตอบของคำถามที่พิสูจน์ RPC `int_whoami` ก่อนหน้าทิ้งไว้: `set_config('request.jwt.claims', ...)`/`response.headers`/`response.status` ล้วนเป็น session-local GUC ที่ function `security definer` แบบ PL/pgSQL ตั้งได้ (`response.status` โดยเฉพาะ คือวิธีที่ function บังคับ HTTP status code เองได้) และ query ชั้นนอกนี้อ่านกลับมาด้วย `current_setting` พอดี
+
+## พิสูจน์: `count=exact` เป็น CTE นับแยกต่างหาก ไม่ใช่ window function
+
+```text
+WITH pgrst_source AS (
+  SELECT "public"."int_orders"."id"
+  FROM "public"."int_orders"
+  LIMIT $1 OFFSET $2
+),
+pgrst_source_count AS (
+  SELECT $3 FROM "public"."int_orders"
+)
+SELECT (SELECT pg_catalog.count(*) FROM pgrst_source_count) AS total_result_set,
+       pg_catalog.count(_postgrest_t) AS page_total,
+       coalesce(json_agg(_postgrest_t), $4) AS body,
+       nullif(current_setting($5, $6), $7) AS response_headers,
+       nullif(current_setting($8, $9), $10) AS response_status,
+       $11 AS response_inserted
+FROM (SELECT * FROM pgrst_source) _postgrest_t
+```
+
+<Callout title="แก้ความเข้าใจที่พบบ่อยเรื่อง count=exact">
+เอกสารเก่าบางแห่ง (และ mental model แบบไร้เดียงสา) อธิบาย `count=exact` ว่าเป็นการเพิ่ม window function `count(*) OVER()` เข้าไปใน query เดียวกัน นั่น **ไม่ใช่** สิ่งที่ PostgREST เวอร์ชันนี้ (v16.2 ยืนยันผ่าน `curl $API_URL/rest/v1/` root `"version":"16.2"`) สร้างขึ้นจริง — มันสร้าง CTE ที่สอง **จริง ๆ** ชื่อ `pgrst_source_count` ที่ scan ตารางแยกต่างหากจาก `pgrst_source` แล้วนับแยก ในทางปฏิบัติหมายความว่าต้นทุนของ `count=exact` คือ scan/count รอบที่สองของสิ่งที่ filter match ไม่ใช่คอลัมน์ "ฟรี" ที่แถมมากับ scan แรก — เรื่องจริง ควรรู้ไว้ก่อนจะหยิบ `count=exact` มาใช้บนตารางใหญ่ที่ถูก filter บ่อย ๆ
+</Callout>
+
+## พิสูจน์: `insert` คอมไพล์ลงเป็น CTE ที่มี `RETURNING`
+
+```text
+WITH pgrst_source AS (
+  INSERT INTO "public"."int_orders"("note")
+  SELECT "pgrst_body"."note"
+  FROM (SELECT $1 AS json_data) pgrst_payload,
+       LATERAL (SELECT "note" FROM json_to_record(pgrst_payload.json_data) AS _("note" text)) pgrst_body
+  RETURNING "public"."int_orders".*
+)
+SELECT $2 AS total_result_set,
+       pg_catalog.count(_postgrest_t) AS page_total,
+       array[]::text[] AS header,
+       coalesce(json_agg(_postgrest_t), $3) AS body,
+       nullif(current_setting($4, $5), $6) AS response_headers,
+       nullif(current_setting($7, $8), $9) AS response_status,
+       $10 AS response_inserted
+FROM (SELECT "int_orders".* FROM "pgrst_source" AS "int_orders") _postgrest_t
+```
+
+JSON body ของคุณไม่เคยกลายเป็นค่า Postgres ตรง ๆ ที่ถูกแทนทีละฟิลด์ — มันมาถึงเป็น bound parameter `$1` **ตัวเดียว** (JSON text ดิบ) และ `json_to_record` ข้างใน `LATERAL` join คือสิ่งที่ PostgREST ใช้แปลง parameter ตัวเดียวนั้นกลับเป็นคอลัมน์ที่มี type (`"note" text` ในที่นี้) สำหรับ `INSERT` `RETURNING "public"."int_orders".*` ข้างใน CTE เดียวกันคือสิ่งที่ทำให้ `Prefer: return=representation` "ฟรี" — แถวที่ insert ไปแล้วอยู่ใน `pgrst_source` อยู่แล้ว ไม่ต้องไปกลับอีกรอบ
+
+## พิสูจน์: การเรียก RPC คอมไพล์ลงเป็น CTE เรียก function
+
+```text
+WITH pgrst_source AS (
+  SELECT "pgrst_call".* FROM "public"."int_whoami"() pgrst_call
+)
+SELECT null::bigint AS total_result_set,
+       pg_catalog.count(_postgrest_t) AS page_total,
+       coalesce(json_agg(_postgrest_t), '[]') AS body,
+       nullif(current_setting('response.headers', true), '') AS response_headers,
+       nullif(current_setting('response.status', true), '') AS response_status,
+       '' AS response_inserted
+FROM (SELECT "record".* FROM "pgrst_source" AS "record" LIMIT $1 OFFSET $2) _postgrest_t
+```
+
+`rpc/int_whoami` กลายเป็น `SELECT * FROM public.int_whoami()` ธรรมดา ข้างใน `pgrst_source` — รูปร่าง wrapper เดียวกันเป๊ะกับ `select`/`insert` รอบมัน ซึ่งเป็น *เหตุผล* ที่ `/rest/v1/rpc/<fn>` กับ `/rest/v1/<table>` ใช้โค้ดสร้าง query ของ PostgREST ร่วมกันเยอะขนาดนี้ และทำไม function ที่เป็น `stable`/`immutable` ถึงเรียกด้วย `GET` ได้ (ครอบคลุมใน [RPC as functions](/supabase/th/auto-generated-api/database-functions-as-rpc/)) ขณะที่ `volatile` เรียกไม่ได้ — planner ของ Postgres เองตัดสินความปลอดภัยของ GET จากรูปร่างการเรียก function แบบเดียวกันนี้
+
+<Mermaid title="Request เดียว, SQL ที่คอมไพล์แล้วหนึ่งชุด, สร้างรอบ pgrst_source" code={requestToSqlDiagram} />
+
+export const requestToSqlDiagram = `flowchart TD
+  req["HTTP request: select / filter / count / insert / rpc"] --> parse["PostgREST parses query string + body"]
+  parse --> cache{"Function/table in the schema cache?"}
+  cache -->|no| err["PGRST202 / PGRST205 — 404, before any SQL runs"]
+  cache -->|yes| build["Build ONE parameterized statement:\\nWITH pgrst_source AS (...) SELECT json_agg(...) ..."]
+  build --> tx["Open a transaction, SET LOCAL ROLE, set_config(request.jwt.claims)"]
+  tx --> exec["Execute the one statement"]
+  exec --> commit{"db-tx-end: commit (default) or rollback?"}
+  commit -->|commit, default| done["COMMIT — response returned"]
+  commit -->|rollback / override| rb["ROLLBACK — response still returned, nothing persisted"]`;
+
+## พิสูจน์: `Prefer: tx=rollback` ถูกเมินโดยดีฟอลต์
+
+ตามเอกสารของ PostgREST เอง `db-tx-end` คือตัวควบคุมเรื่องนี้ และดีฟอลต์เป็น `commit` — header `tx` Prefer *"ไม่ได้เปิดใช้โดยดีฟอลต์"* จะมีผลก็ต่อเมื่อ operator ของ server ตั้ง `db-tx-end` เป็น `commit-allow-override` หรือโหมด rollback แบบใดแบบหนึ่ง ([postgrest.org, Transaction End Preference](https://postgrest.org/en/stable/references/api/preferences.html#tx)) local stack ของคอร์สนี้ไม่ได้ตั้ง `PGRST_DB_TX_END` เลย (ยืนยันแล้ว: `docker inspect supabase_rest_probe --format '{{range .Config.Env}}{{println .}}{{end}}'` ไม่มี `PGRST_DB_TX_END` อยู่ในนั้น) ดังนั้นมันรันค่าดีฟอลต์ที่ไม่มีระบุไว้ให้เห็นชัด ๆ:
+
+```text
+$ curl -s -D - "$API_URL/rest/v1/int_orders" -X POST -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" \
+    -H "Content-Type: application/json" -H "Prefer: tx=rollback,return=representation" -d '{"note":"tx-rollback-check-2"}'
+HTTP/1.1 201 Created
+...
+Preference-Applied: return=representation
+...
+[{"id":"42152ea0-bca7-4ae3-ba43-cc769624787b","note":"tx-rollback-check-2"}]
+
+$ docker exec -i supabase_db_probe psql -U postgres -c "select note from public.int_orders where note = 'tx-rollback-check-2';"
+        note
+---------------------
+ tx-rollback-check-2
+(1 row)
+```
+
+`Preference-Applied` แสดงแค่ `return=representation` **ไม่มี** `tx=rollback` — คำตอบของ PostgREST เองกำลังบอกว่า preference นี้ไม่ถูกนำไปใช้ และแถวนั้นก็ยังอยู่จริงหลังจากนั้น นี่คือกับดักจริง ๆ ที่เจอง่ายมาก: การหยิบ `Prefer: tx=rollback` มาใช้เป็น flag "dry run" ฝั่ง client กับ Supabase project แบบ hosted (หรือ PostgREST server ไหนก็ตามที่ operator ยังไม่ได้เปิด) ไม่ทำอะไรเลยนอกจากเพิ่ม response header ที่ไม่มีใครอ่าน — การเขียนข้อมูล commit เหมือนกับไม่มี header นั้นอยู่เลย
+
+## พิสูจน์: schema cache มีช่องว่างการ reload จริง วัดได้
+
+`\dy` บน stack ของคอร์สนี้โชว์ event trigger ที่ Supabase จัดการเอง สอง ตัว คอยจับตา DDL:
+
+```text
+$ docker exec -i supabase_db_probe psql -U postgres -c "\dy"
+ pgrst_ddl_watch  | ddl_command_end | supabase_admin | enabled
+ pgrst_drop_watch | sql_drop        | supabase_admin | enabled
+```
+
+Source ของมัน (`\sf pgrst_ddl_watch`) เป็น event trigger PL/pgSQL ธรรมดา: สำหรับรายการ DDL command tag ที่กำหนดไว้ตายตัว (`CREATE FUNCTION`, `CREATE TABLE`, `ALTER TABLE`, `CREATE VIEW`, ... — รายการเต็มอยู่ในตัว function) มันรันแค่บรรทัดเดียว `NOTIFY pgrst, 'reload schema';` PostgREST เปิด connection `LISTEN pgrst` ค้างไว้ตลอด แล้ว reload schema cache ในหน่วยความจำเมื่อได้ notification นั้น — แต่การ reload นั้น **asynchronous** ไม่ใช่ส่วนหนึ่งของ DDL transaction สร้าง function ใหม่เอี่ยมแล้วเรียกมันทันที โดยไม่มีขั้นตอน reload ด้วยมือเลย:
+
+```text
+$ docker exec -i supabase_db_probe psql -U postgres -c "create or replace function public.int_schema_cache_probe3() returns text language sql as \$\$ select 'cache-probe-v3'::text \$\$; grant execute on function public.int_schema_cache_probe3() to service_role;"
+
+$ curl -s -w " http=%{http_code}\n" -X POST "$API_URL/rest/v1/rpc/int_schema_cache_probe3" -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" -H "Content-Type: application/json" -d '{}'
+{"code":"PGRST202","details":"Searched for the function public.int_schema_cache_probe3 without parameters or with a single unnamed json/jsonb parameter, but no matches were found in the schema cache.", ...} http=404
+
+# สองวินาทีถัดมา ยังไม่มี NOTIFY ด้วยมือใด ๆ เลย:
+$ curl -s -w " http=%{http_code}\n" -X POST "$API_URL/rest/v1/rpc/int_schema_cache_probe3" -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" -H "Content-Type: application/json" -d '{}'
+"cache-probe-v3" http=200
+```
+
+ที่ `t+0s` function ที่เพิ่งสร้างใหม่ยังไม่มีอยู่ในสายตาของ schema cache ของ PostgREST — เป็น `PGRST202` จริง ๆ ไม่ใช่ database error เพราะ function มีอยู่จริงใน Postgres แล้วตอนนั้น (`create function` commit ไปแล้ว) แต่ PostgREST ยัง reload cache ของตัวเองไม่ทัน พอถึง `t+2s` โดยไม่มีอะไรด้วยมือคั่นกลางเลย มันก็ใช้ได้ — `NOTIFY pgrst, 'reload schema'` อัตโนมัติจาก `pgrst_ddl_watch` ไปถึง connection `LISTEN` ของ PostgREST แล้วมัน reload เอง บน PostgREST setup ที่**ไม่มี** event trigger นี้ติดตั้งอยู่ (PostgREST เปล่า ๆ หรือ hosted setup ที่เอาออกไป) function จะมองไม่เห็นต่อไปเรื่อย ๆ จนกว่า operator จะรัน `NOTIFY pgrst, 'reload schema';` เองด้วยมือ หรือ restart server — Supabase ใส่ `pgrst_ddl_watch`/`pgrst_drop_watch` มาให้เพื่อให้ขั้นตอนด้วยมือแทบไม่จำเป็นต้องทำ ไม่ใช่เพราะการ reload กลายเป็น synchronous
+
+## พิสูจน์: `EXPLAIN` บน query ที่ generate โชว์ policy ของ RLS เป็น `InitPlan`
+
+เพิ่ม policy ที่ใช้ wrap `(select auth.uid())` แบบเดียวกับที่ [RLS Patterns and Pitfalls](/supabase/th/auth-and-row-level-security/rls-patterns-and-pitfalls/) พิสูจน์ไปแล้วว่ากลายเป็น `InitPlan` ครั้งเดียวต่อ query แทนที่จะประเมินซ้ำทุกแถว แล้วรัน `EXPLAIN` บน column list ที่ PostgREST เองสร้างจริง ๆ ใน `pgrst_source` CTE สำหรับ `select * from int_orders` ธรรมดา:
+
+```sql
+-- supabase/migrations/9502_int_orders_read_policy.sql
+create policy int_orders_read on public.int_orders
+  for select to authenticated
+  using ((select auth.uid()) is not null);
+```
+
+```text
+$ docker exec -i supabase_db_probe psql -U postgres <<'SQL'
+begin;
+set local role authenticated;
+select set_config('request.jwt.claims', '{"role":"authenticated","sub":"11111111-1111-1111-1111-111111111111"}', true);
+explain select "public"."int_orders"."id", "public"."int_orders"."note" from "public"."int_orders";
+rollback;
+SQL
+                          QUERY PLAN
+---------------------------------------------------------------
+ Seq Scan on int_orders  (cost=0.03..20.73 rows=1065 width=48)
+   Filter: ((InitPlan 1).col1 IS NOT NULL)
+   InitPlan 1
+     ->  Result  (cost=0.00..0.03 rows=1 width=16)
+```
+
+นี่คือการเช็กกลไก ไม่ใช่การพิสูจน์ซ้ำ: [RLS Patterns and Pitfalls](/supabase/th/auth-and-row-level-security/rls-patterns-and-pitfalls/) พิสูจน์ไปแล้วว่า `(select auth.uid())` ชนะ `auth.uid()` เปล่า ๆ ภายใต้ `EXPLAIN ANALYZE` บนตารางที่ใหญ่กว่า; สิ่งที่บทนี้เพิ่มเข้ามาคือยืนยันว่ารูปร่าง `InitPlan` แบบเดียวกันเป๊ะ ๆ ปรากฏใน SQL ตัวจริงที่โมดูลนี้อ่านจาก `pg_stat_statements` มาตลอดทั้งบท — RLS ไม่ใช่ query แยกต่างหากที่ PostgREST แปะเข้าไป มันคือ clause `USING` ที่ planner พับเข้าไปตรง ๆ ใน plan ของ `pgrst_source` เอง
+
+## อ่านโค้ดที่ AI เขียน
+
+<SpotTheBug lang="ts" code={`// AI-generated "safe dry-run" helper before a real insert
+async function previewOrderInsert(supabase: SupabaseClient, note: string) {
+  const { data, error } = await supabase
+    .from('int_orders')
+    .insert({ note })
+    .select()
+    .headers({ Prefer: 'tx=rollback' } as any); // "rolls back, so this is just a preview"
+
+  if (error) throw error;
+  console.log('Preview (not actually saved):', data);
+  return data;
+}`}>
+พิสูจน์ด้านบนแล้วด้วยการเช็กระดับ header จริง ๆ: บน PostgREST server ไหนก็ตามที่ยังไม่ได้ตั้ง `db-tx-end` เป็นโหมดที่ยอม override ชัดเจน (รวมถึง local stack ของคอร์สนี้เอง — `docker inspect` โชว์ว่าไม่มี `PGRST_DB_TX_END` เลย หมายความว่าใช้ดีฟอลต์ `commit` ที่ไม่มีระบุไว้ให้เห็น) `Prefer: tx=rollback` ถูกเมินเงียบ ๆ `Preference-Applied` ใน response จริงด้านบนแสดงแค่ `return=representation` — คำตอบของ PostgREST เองกำลังบอกผู้เรียกว่า rollback preference ถูกทิ้งไป และแถวที่ insert ก็ยืนยันแล้วว่ายังอยู่จริงด้วยการอ่านผ่าน `psql` โดยตรงหลังจากนั้น comment ของ function นี้ ("rolls back, so this is just a preview") ผิดกลับด้านเป๊ะบน server ที่ไม่ได้ config ไว้: มันคือ **insert จริง** ที่บังเอิญยังอ้างผ่าน header ที่ไม่มีใครจำเป็นต้องทำตามว่ามันไม่ใช่ วิธีแก้จริง ๆ คือใช้ database transaction จริงที่ client ควบคุมเองและ rollback เอง (ไม่มีให้ผ่าน stateless Data API), function RPC แบบ dry-run ที่ใช้ `postgres_fdw`/ทำ `ROLLBACK` เอง หรือง่ายที่สุดคือไม่เชื่อใจ `tx=rollback` สำหรับอะไรที่ client-facing เลย นอกจากคุณ (operator ของ server) จะตั้ง `db-tx-end` เป็นค่าที่ยอม override เองแล้วตรวจสอบแบบเดียวกับที่บทนี้เพิ่งทำไปเป๊ะ ๆ
+</SpotTheBug>
+
+## Mental Model
+
+PostgREST ไม่ใช่ ORM ที่แปล request ของคุณเป็น SQL ที่เขียนมือแบบ idiomatic — มันคือ **compiler ที่มี output template ตายตัวหนึ่งอัน**: CTE `pgrst_source` ที่ *ข้างใน* เปลี่ยนไปตาม request (a `WHERE`, `INSERT ... RETURNING`, การเรียก function เปล่า ๆ) และ *ข้างนอก* ไม่เคยเปลี่ยนเลย (JSON aggregation, การอ่าน GUC response-header/status, wrapper ของ transaction กับการสลับ role ที่บทแรกของโมดูลนี้พิสูจน์ไปแล้ว) การอ่าน `pg_stat_statements` คือการอ่าน output ของ compiler ของ PostgREST เอง ไม่ใช่กล่องดำ — ทุก concept ของ REST API ที่คอร์สนี้สอนมา (embedding, `count=exact`, header `Prefer`, RPC) เป็นรูปร่างเฉพาะเจาะจงที่ตรวจสอบได้ของ template ตัวเดียวกันนั้น
+
+## Trade-offs
+
+| ทางเลือกการออกแบบ | ข้อดี | ต้นทุน |
+|---|---|---|
+| Template CTE `pgrst_source` ตัวเดียวสำหรับทุกรูปแบบ request | Code path เดียว ตรวจสอบได้ — ที่เดียวให้อ่านเพื่อเข้าใจ SQL จริงของ request ไหนก็ได้ พิสูจน์ด้านบนครอบคลุม select/count/insert/rpc | SQL ที่ generate ออกมายาวและ parameterized ในแบบที่จับคู่กลับไปที่แถวใน `pg_stat_statements` ไม่ได้ง่าย ๆ ถ้าไม่รู้รูปร่างนี้มาก่อน |
+| `count=exact` เป็น CTE นับแยกต่างหากจริง ๆ | นับถูกต้อง แยกอิสระจาก `LIMIT`/`OFFSET` ของ query หลัก | scan รอบที่สองจริง ๆ ของสิ่งที่ filter match — พิสูจน์ด้านบน ไม่ใช่คอลัมน์ window function ฟรี |
+| Schema-cache reload แบบ async ผ่าน `LISTEN`/`NOTIFY` ไม่ใช่การเช็กแบบ synchronous ทุก request | ไม่มี overhead ต่อ request จากการถาม catalog ทุกครั้ง | ช่องว่างจริง วัดได้ (พิสูจน์ด้านบน: มองไม่เห็นที่ `t+0s`, มองเห็นตอน `t+2s`) ที่ function หรือตารางที่เพิ่งสร้างจะเป็น 404 ชั่วคราว |
+| `db-tx-end` ดีฟอลต์เป็น `commit`, header `tx` Prefer เป็น opt-in เท่านั้น | ดีฟอลต์ปลอดภัย — client ไม่สามารถ rollback การเขียนที่ server operator คาดหวังให้ persist โดยไม่ตั้งใจ | กับดักกลับด้านที่พิสูจน์ด้านบน: client ที่ *สมมติ* ว่า `tx=rollback` ทำงานเป็น flag dry-run จะได้ commit จริง ๆ แบบเงียบ ๆ แทน |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"`count=exact` เพิ่มคอลัมน์ window function `count(*) OVER()` ถูก ๆ เข้าไปใน scan เดียวกัน"** พิสูจน์ว่าผิดด้านบน: PostgREST เวอร์ชันนี้สร้าง CTE ที่สองจริง ๆ (`pgrst_source_count`) ที่ scan แยกต่างหาก — ต้นทุนจริงรอบที่สอง ไม่ใช่คอลัมน์ฟรี
+- **"`Prefer: tx=rollback` ถูกนำไปใช้เสมอ — มันอยู่ในเอกสารนี่ ต้องเปิดใช้อยู่แล้ว"** พิสูจน์ว่าผิดด้านบนด้วย header `Preference-Applied` จริงที่ไม่มีมัน และการอ่านผ่าน `psql` ยืนยันว่าแถวยังอยู่: มันต้องการให้ server operator เปิดใช้ผ่าน `db-tx-end` ซึ่ง local stack ของคอร์สนี้ไม่ได้ทำ
+- **"Schema cache อัปเดตแบบ synchronous ทันทีที่ transaction `CREATE FUNCTION` commit"** พิสูจน์ว่าผิดด้านบน: มีช่องว่างสองวินาทีจริง ๆ ที่ function เป็น `PGRST202` 404 จริง ทั้งที่ commit ใน Postgres ไปแล้ว — การ reload เป็น async ขับเคลื่อนด้วย `LISTEN`/`NOTIFY` ไม่ใช่การเช็ก catalog ทุก request
+- **"RLS ถูกประเมินเป็นขั้นตอนแยกต่างหาก หลังจาก query ของ PostgREST เองรันเสร็จ"** พิสูจน์ว่าผิดด้านบน: output ของ `EXPLAIN` โชว์ว่า `(select auth.uid())` ของ policy ถูก compile ตรงเข้าไปใน plan *เดียวกัน* เป็น `InitPlan` ข้างใน query รูปร่าง `pgrst_source` เดียวกันเป๊ะที่บทนี้อ่านมาตลอด — plan เดียว การรันเดียว ไม่ใช่สอง
+
+## แบบทดสอบ
+
+export const quizPostgrestRequestToSql = [
+  {
+    q: 'ทุกรูปแบบ request ที่บทนี้เก็บมาจาก pg_stat_statements (select, count=exact, insert, rpc) มีลักษณะโครงสร้างร่วมกันแบบไหน (Every request shape captured shared what structural feature?)',
+    options: [
+      'They each used a completely different query-building strategy',
+      'They were all built around one pgrst_source CTE, with a fixed JSON-aggregation/response-header wrapper outside it',
+      'They all used a stored procedure PostgREST calls internally',
+      'They were identical except for the table name',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ด้านบนแล้วในทั้งสี่ query ที่เก็บมา: CTE ข้างในชื่อ pgrst_source ต่างกัน (a WHERE, INSERT...RETURNING, การเรียก function เปล่า ๆ) แต่ json_agg/current_setting(\'response.headers\')/current_setting(\'response.status\') ห่อทุกอันเหมือนกันเป๊ะ',
+  },
+  {
+    q: 'Output จริงของ pg_stat_statements สำหรับ count=exact โชว์ CTE ชื่อ pgrst_source_count สิ่งนี้หมายความว่าอะไรในเชิงโครงสร้าง เทียบกับสมมติฐาน "count(*) OVER()" (What does the pgrst_source_count CTE structurally mean?)',
+    options: [
+      'They are the same thing, just different syntax',
+      'count=exact performs a genuinely separate scan/count of the filtered table, not a free window-function column on the main scan',
+      'count=exact never actually counts anything, it estimates',
+      'pgrst_source_count replaces pgrst_source entirely',
+    ],
+    answer: 1,
+    explain: 'SQL ที่เก็บมาโชว์ CTE อิสระสองตัว คือ pgrst_source กับ pgrst_source_count แต่ละตัว scan ตารางแยกกัน โดยนับผ่าน scalar subquery กับตัวที่สอง — ต้นทุนจริงรอบที่สอง พิสูจน์ตรง ๆ จากข้อความ query ที่เก็บมา',
+  },
+  {
+    q: 'พิสูจน์ curl จริงโชว์ว่า insert แถวด้วย `Prefer: tx=rollback` ยังคืนแถวนั้นใน psql หลังจากนั้น พร้อม `Preference-Applied: return=representation` เท่านั้น เอกสาร PostgREST บอกว่าอะไรควบคุมว่า tx=rollback จะถูกนำไปใช้หรือไม่ (What governs whether tx=rollback is honored?)',
+    options: [
+      'It is always honored regardless of server config',
+      'db-tx-end, which defaults to "commit" and only allows Prefer: tx=rollback to override when explicitly set to commit-allow-override or a rollback mode',
+      'It depends on the client SDK version, not the server',
+      'It is controlled per-table via a config.toml setting',
+    ],
+    answer: 1,
+    explain: 'อ้างจาก postgrest.org ด้านบน: tx preference "ไม่ได้เปิดใช้โดยดีฟอลต์" ต้องการให้ตั้ง db-tx-end เพื่อยอม override ก่อน — local stack ของคอร์สนี้ไม่มี PGRST_DB_TX_END เลย จึงใช้ดีฟอลต์ commit แบบเงียบ ๆ',
+  },
+  {
+    q: 'พิสูจน์ schema-cache โชว์ว่า function ที่เพิ่งสร้างคืน PGRST202 ที่ t+0s แล้วใช้ได้ที่ t+2s โดยไม่มีคำสั่ง reload ด้วยมือเลย กลไกอะไรอธิบายช่องว่างนี้ (What mechanism explains the gap?)',
+    options: [
+      'PostgREST re-checks the catalog on every single request, and the gap was just normal query latency',
+      'The pgrst_ddl_watch event trigger fired NOTIFY pgrst, \'reload schema\' automatically on the CREATE FUNCTION, but PostgREST\'s LISTEN-driven reload is asynchronous relative to the DDL transaction, not instantaneous',
+      'The function genuinely did not exist in Postgres until t+2s',
+      'PGRST202 is unrelated to the schema cache; it is a network timeout',
+    ],
+    answer: 1,
+    explain: 'Function มีอยู่ใน Postgres ทันที (CREATE FUNCTION commit ไปแล้ว) — พิสูจน์จากการที่ไม่มี DDL อื่นรันระหว่างสองการเช็ก — ดังนั้นสิ่งเดียวที่เปลี่ยนคือ schema cache ในหน่วยความจำของ PostgREST เอง อัปเดตแบบ async ผ่าน NOTIFY ที่ event trigger ยิงอัตโนมัติ',
+  },
+  {
+    q: 'พิสูจน์ EXPLAIN ใช้ pattern (select auth.uid()) ซ้ำจาก RLS Patterns and Pitfalls มันเพิ่มอะไรเข้าไปเหนือพิสูจน์ของบทก่อนหน้านั้น (What did it add on top of the earlier lesson\'s proof?)',
+    options: [
+      'It proved (select auth.uid()) is faster than bare auth.uid() for the first time',
+      'It confirmed the same InitPlan shape appears in the literal SQL this lesson captured from pg_stat_statements — RLS is compiled directly into the same pgrst_source-shaped plan, not a separate query',
+      'It disproved the earlier lesson\'s InitPlan finding',
+      'It showed RLS policies are evaluated in a completely separate database connection',
+    ],
+    answer: 1,
+    explain: 'บทนี้ตั้งใจไม่พิสูจน์ซ้ำเรื่องความต่างของเวลา InitPlan-เทียบกับ-ต่อแถว (พิสูจน์นั้นมีอยู่แล้วใน RLS Patterns and Pitfalls) — มันเติมจุดที่ขาดไป: รูปร่าง query แบบเดียวกันเป๊ะที่บทนี้ใช้เวลาทั้งบทอ่านจาก pg_stat_statements คือสิ่งที่ policy ของ RLS คอมไพล์ลงไป เห็นเป็น InitPlan ใน EXPLAIN output จริงด้านบน',
+  },
+];
+
+<Quiz client:visible id="supabase-internals/postgrest-request-to-sql" questions={quizPostgrestRequestToSql} />
+
+<ProgressTracker client:visible id="supabase-internals/postgrest-request-to-sql" />
