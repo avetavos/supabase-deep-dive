@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
@@ -30,6 +31,31 @@ for select
 to authenticated
 using (auth.uid() = id);
 ```
+
+พิสูจน์ด้วย RPC function จริง เรียกผ่าน Data API ได้ ที่แค่ report กลับมาว่า role ไหนเป็นคนรันมัน:
+
+```sql
+-- sql/fnd_whoami.sql (already applied — reference only, not re-collected by the harness)
+create or replace function public.fnd_whoami()
+returns table(who text, pg_role text)
+language sql
+security invoker
+as $$
+  select current_user::text, current_setting('role', true)::text;
+$$;
+
+grant execute on function public.fnd_whoami() to anon, authenticated;
+```
+
+```text
+$ curl -s -X POST "$API_URL/rest/v1/rpc/fnd_whoami" -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY" -H "Content-Type: application/json" -d '{}'
+[{"who":"anon","pg_role":"anon"}]
+
+$ curl -s -X POST "$API_URL/rest/v1/rpc/fnd_whoami" -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" -H "Content-Type: application/json" -d '{}'
+[{"who":"service_role","pg_role":"service_role"}]
+```
+
+function เดียวกัน connection pool เดียวกันข้างใน แต่ `current_user` เองเปลี่ยนไปตาม key ที่เซ็น request — ไม่ใช่ header ที่ PostgREST แค่อ่านแล้วเชื่อ แต่คือ Postgres session role จริงที่ query รันในฐานะนั้นจริง ๆ
 
 ## PostgREST แปล HTTP เป็น SQL ไม่ enforce อะไรเอง
 
@@ -61,6 +87,43 @@ export const architectureDiagram = `flowchart LR
   storage["Storage"] --> pg
   realtime["Realtime (reads WAL)"] --> pg`;
 
+## อ่านโค้ดที่ AI สร้าง
+
+AI assistant ถูกขอให้ "add a check that only admins can call this function" แล้วสร้างสิ่งนี้:
+
+<SpotTheBug lang="sql" code={`-- An AI assistant's attempt at an "admin-only" RPC guard
+create or replace function public.fnd_admin_report()
+returns table(total bigint)
+language plpgsql
+security definer
+as $$
+begin
+  if current_user != 'service_role' then
+    raise exception 'admins only';
+  end if;
+  return query select count(*) from public.fnd_widgets;
+end;
+$$;
+`}>
+สิ่งนี้ดูเหมือน guard จริง และมันจะทำงานได้จริงถ้าถูกเรียกด้วย service_role key ตรง ๆ กับ Postgres เท่านั้น — แต่มันถูกเขียนมาเพื่อ expose ผ่าน Data API เป็น RPC function ซึ่งทุก request ที่มาถึงมันผ่าน PostgREST มาในฐานะ role *บางอย่าง* อยู่แล้ว บั๊กคือ: `security definer` ทำให้ function นี้รันด้วยสิทธิ์ของ **owner ของ function** (ปกติคือ `postgres`) ซึ่ง proof จาก RPC request ข้างบนพิสูจน์ไปแล้วว่า `current_user` สะท้อน *role ของ request ที่เรียก* ไม่ใช่ owner — ดังนั้น check นี้เทียบผิดตัวไปเลยสำหรับ call ส่วนใหญ่ และแย่กว่านั้น อันตรายจริงของ function `security definer` (บท RPC ข้าง ๆ บทนี้พูดถึงลึกกว่านี้) คือมันต้องการ `set search_path = ''` เพื่อกัน schema-injection ซึ่งก็ขาดไปด้วยเช่นกัน ทางแก้ที่ตรงกับสถาปัตยกรรมของคอร์สนี้จริง ๆ: อย่าพยายามเช็ค `current_user` ข้างใน function `security definer` เลย — ไม่ว่าจะถอด `security definer` ออก (default เป็น `security invoker` แล้วให้ RLS กับ grant บน `fnd_widgets` ตัดสินสิทธิ์แบบปกติ) หรือถ้าจำเป็นต้องมีสิทธิ์ยกระดับจริง ๆ ให้เช็ค identity จริงของผู้เรียกผ่าน `auth.uid()` เทียบกับ flag `profiles.is_admin` (pattern ที่ module Edge Functions พิสูจน์ไว้) ไม่ใช่เทียบ `current_user` กับชื่อ role
+</SpotTheBug>
+
+## Mental Model
+
+มองทุก request ที่เข้า Data API ว่ามาถึง Postgres พร้อม name tag ติดตัวอยู่แล้ว — Postgres role — และทุกอย่างข้างล่าง (grant, RLS policy) อ่าน name tag นั้น ไม่ใช่ header หรือ body ของ request งานเดียวของ PostgREST คือเลือกว่าจะติด name tag ไหน (`anon`, `authenticated` หรือ `service_role` ตาม JWT ที่ได้รับมา) แล้วก็หลีกทางออกไป proof ข้างบนแสดงว่า name tag นี้ไม่ใช่เรื่องสมมติที่ PostgREST แค่จำไว้ในใจ แต่คือ `current_user` จริงที่ Postgres เองเห็นตลอด request นั้น
+
+## Trade-offs
+
+- **การบังคับ access control ไว้ใน Postgres ทั้งหมด (grant + RLS) ทำให้ client ทุกตัว — REST, GraphQL, client ในอนาคตที่คอร์สนี้ยังไม่ได้พูดถึง — ได้ guarantee เดียวกันอัตโนมัติ** — **แลกมาด้วยต้องคิดแบบ role กับ policy แทนที่จะเป็น check แบบ "if (user.isAdmin)" ที่คุ้นเคยกว่า** พิสูจน์ข้างบนแล้วว่าพังพอดีแบบนั้นเมื่อพอร์ตแบบไม่ระวังเข้าไปใน function security definer
+- **`security definer` ให้ function ทำอะไรบางอย่างที่ role ของผู้เรียกเองทำไม่ได้โดยตรง** (pattern admin-report แบบที่ทำถูก) — **แลกมาด้วย function เองกลายเป็น access-control boundary ทั้งหมด** เพราะ Postgres ไม่ apply ข้อจำกัดของผู้เรียกเองข้างในมันเลย
+- **PostgREST แปล HTTP เป็น SQL ตรง ๆ ทำให้ API surface sync กับ schema อัตโนมัติ** — **แลกมาด้วย grant และ RLS ของ schema เองเป็นสิ่งเดียวที่กั้นระหว่าง "reachable" กับ "secure"** ไม่มี application-layer authorization code สำรองไว้เผื่อ rule ระดับ database ผิด
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"มีแค่ anon กับ authenticated ที่สำคัญจริง — service_role แค่ convenience สำหรับ script"** proof whoami ข้างบนปฏิบัติกับมันเหมือนกันทุกอย่าง: มันคือ Postgres role จริงเหมือนอีกสองตัว แค่มี attribute `bypassrls` เพิ่มมา ไม่มีอะไร special-case นอกจาก attribute นั้นตัวเดียว
+- **"function security definer รู้อัตโนมัติว่าผู้เรียกตัวจริงคือใคร"** ถูกหักล้างด้วย SpotTheBug ข้างบน: current_user ข้างใน function security definer สะท้อน *owner* ของ function ไม่ใช่ผู้เรียก ซึ่งเป็นเหตุผลที่เช็ค current_user เพื่อ authorization ข้างในมันกลับตาลปัตรเลย
+- **"PostgREST มีระบบ user/session ของตัวเองแยกจาก Postgres"** ไม่มี session store แยกเลย — พิสูจน์ข้างบนแล้วว่ากลไก authorization ทั้งหมดของ PostgREST คือการเลือกว่าจะรัน query ในฐานะ Postgres role ตัวไหน
+
 <Callout title="สรุปหนึ่งบรรทัด">
 ทุก request พก **Postgres role** มาด้วยเสมอ — `anon` สำหรับ request ที่ไม่ได้ authenticate, `authenticated` สำหรับ user ที่ login แล้ว (มี `auth.uid()` ใช้ได้) และ `service_role` สำหรับ server code ที่เชื่อถือได้ซึ่ง bypass **Row Level Security** **PostgREST** แปล HTTP เป็น SQL แล้วรันในฐานะ role นั้น แต่ไม่ enforce อะไรเอง access control อยู่ที่ grant และ RLS policy ของ Postgres ทั้งหมด **Auth**, **Storage** และ **Realtime** เป็น service แยกกัน แต่สุดท้ายทุกตัวอ่านเขียน Postgres database เดียวกันนี้
 </Callout>
@@ -75,6 +138,7 @@ export const quizArchitecture = [
       'ไม่มี role เลย request ที่ไม่ได้ authenticate ถูกปฏิเสธก่อนถึง Postgres',
     ],
     answer: 2,
+    explain: 'พิสูจน์ตรง ๆ ข้างบนด้วย RPC call จริงที่ใช้ anon key: function fnd_whoami report กลับมาว่า current_user = "anon"',
   },
   {
     q: 'access control ของ auto-generated API ใน Supabase ถูก enforce อยู่ที่ไหนจริง ๆ',
@@ -85,6 +149,7 @@ export const quizArchitecture = [
       'ไม่มีการ enforce ที่ไหนเลย อาศัยความไม่รู้ของผู้โจมตี',
     ],
     answer: 1,
+    explain: 'PostgREST แค่เลือกว่าจะรัน query ในฐานะ role ไหน (พิสูจน์ข้างบน) — ที่เหลือคือ grant และ RLS ปกติของ Postgres ทั้งหมด',
   },
   {
     q: 'server-side code ที่เชื่อถือได้ใช้ role ไหนเพื่อ bypass Row Level Security',
@@ -95,6 +160,7 @@ export const quizArchitecture = [
       'admin',
     ],
     answer: 2,
+    explain: 'พิสูจน์ข้างบนด้วย RPC call เดียวกัน ใช้ service_role key: current_user คืนมาเป็น "service_role"',
   },
   {
     q: 'Auth, Storage และ Realtime เกี่ยวข้องกับ Postgres database ข้างล่างยังไง',
@@ -105,6 +171,18 @@ export const quizArchitecture = [
       'ทั้งสามตัวแทนที่ Postgres ไปเลยสำหรับข้อมูลของตัวเอง',
     ],
     answer: 1,
+    explain: 'นี่คือ theme ที่คอร์สที่เหลือยืนยันซ้ำตลอด — ทุก service ที่คอร์สนี้ครอบคลุมสุดท้ายคือ client ของ Postgres instance เดียวกัน',
+  },
+  {
+    q: 'RPC function ที่ AI สร้างเช็ค `if current_user != \'service_role\' then raise exception` เพื่อบังคับ "admins only" แต่ function ประกาศเป็น `security definer` ทำไม check นี้ถึงไม่ทำสิ่งที่มันดูเหมือนจะทำ',
+    options: [
+      'security definer ไม่มีผลกับ RPC function เลย',
+      'ข้างใน function security definer current_user สะท้อน owner ของ function ไม่ใช่ role ของ request ที่เรียก ดังนั้น check นี้เทียบผิด identity ไปเลย',
+      'current_user เป็น NULL เสมอข้างใน Postgres function ทุกตัว',
+      'check นี้ทำงานถูกต้องแล้ว ไม่มีบั๊ก',
+    ],
+    answer: 1,
+    explain: 'SpotTheBug ข้างบนไล่ตรงนี้เป๊ะ — ทางแก้คือถอด security definer ออก (default เป็น security invoker) หรือเช็คผู้เรียกตัวจริงผ่าน auth.uid() ไม่ใช่ current_user ข้างใน function security definer',
   },
 ];
 

@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
@@ -30,6 +31,31 @@ for select
 to authenticated
 using (auth.uid() = id);
 ```
+
+Proved with a real RPC function, callable through the Data API, that simply reports back which role executed it:
+
+```sql
+-- sql/fnd_whoami.sql (already applied — reference only, not re-collected by the harness)
+create or replace function public.fnd_whoami()
+returns table(who text, pg_role text)
+language sql
+security invoker
+as $$
+  select current_user::text, current_setting('role', true)::text;
+$$;
+
+grant execute on function public.fnd_whoami() to anon, authenticated;
+```
+
+```text
+$ curl -s -X POST "$API_URL/rest/v1/rpc/fnd_whoami" -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY" -H "Content-Type: application/json" -d '{}'
+[{"who":"anon","pg_role":"anon"}]
+
+$ curl -s -X POST "$API_URL/rest/v1/rpc/fnd_whoami" -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" -H "Content-Type: application/json" -d '{}'
+[{"who":"service_role","pg_role":"service_role"}]
+```
+
+Same function, same connection pool underneath, and `current_user` itself changes depending on which key signed the request — not a header PostgREST merely reads and trusts, but the actual Postgres session role the query executes as.
 
 ## PostgREST translates HTTP into SQL — it does not enforce anything itself
 
@@ -61,6 +87,43 @@ export const architectureDiagram = `flowchart LR
   storage["Storage"] --> pg
   realtime["Realtime (reads WAL)"] --> pg`;
 
+## Reading AI-generated code
+
+An AI assistant, asked to "add a check that only admins can call this function," produced this:
+
+<SpotTheBug lang="sql" code={`-- An AI assistant's attempt at an "admin-only" RPC guard
+create or replace function public.fnd_admin_report()
+returns table(total bigint)
+language plpgsql
+security definer
+as $$
+begin
+  if current_user != 'service_role' then
+    raise exception 'admins only';
+  end if;
+  return query select count(*) from public.fnd_widgets;
+end;
+$$;
+`}>
+This looks like a real guard, and it would even work if it were only ever called with the service_role key directly against Postgres — but it was written to be exposed through the Data API as an RPC function, where every request that reaches it has already gone through PostgREST as *some* role. The bug: `security definer` makes this function run with the **function owner's** privileges (typically `postgres`), which the RPC-request proof above already established `current_user` reflects for the *caller's request role*, not the owner — so this check is comparing the wrong thing entirely for most call shapes, and worse, a `security definer` function's real danger (this lesson's neighboring RPC lesson covers it in depth) is that it needs `set search_path = ''` to avoid schema-injection, which is missing here too. The fix that actually matches this course's own architecture: do not try to check `current_user` inside a `security definer` function at all — either drop `security definer` (default to `security invoker`, so RLS and grants on `fnd_widgets` decide access the normal way) or, if elevated privileges are genuinely required, check the caller's real identity via `auth.uid()` against a `profiles.is_admin` flag (the pattern the Edge Functions module proves), never by comparing `current_user` to a role name.
+</SpotTheBug>
+
+## Mental Model
+
+Think of every request to the Data API as arriving at Postgres already wearing a name tag — the Postgres role — and everything downstream (grants, RLS policies) reads that name tag, not the request's headers or body. PostgREST's only job is choosing which name tag to attach (`anon`, `authenticated`, or `service_role`, based on the JWT it was handed) and then getting out of the way; the proof above shows the name tag is not a polite fiction PostgREST tracks internally, it is the actual `current_user` Postgres itself sees for the duration of that request.
+
+## Trade-offs
+
+- **Enforcing access control entirely inside Postgres (grants + RLS) means every client — REST, GraphQL, a future client this course has not covered yet — gets the same guarantees automatically** — **at the cost of needing to think in terms of roles and policies instead of the more familiar "if (user.isAdmin)" check**, proved above to fail exactly that way when ported naively into a security definer function.
+- **`security definer` lets a function do something the caller's own role could not do directly** (the admin-report pattern, done correctly) — **at the cost of the function itself becoming the entire access-control boundary**, since Postgres no longer applies the caller's own restrictions inside it at all.
+- **PostgREST translating HTTP straight into SQL keeps the API surface automatically in sync with the schema** — **at the cost of the schema's own grants and RLS being the only thing standing between "reachable" and "secure,"** with no separate application-layer authorization code to fall back on if the database-level rules are wrong.
+
+## Common Misconceptions
+
+- **"Only anon and authenticated actually matter — service_role is just a convenience for scripts."** The whoami proof above treats it identically: it is a real Postgres role like the other two, just one with `bypassrls` — nothing about it is special-cased outside that one attribute.
+- **"A security definer function automatically knows who the original caller was."** Disproved by the SpotTheBug above: current_user inside a security definer function reflects the function's *owner*, not the caller, which is exactly why checking current_user for authorization inside one is backwards.
+- **"PostgREST has its own user/session system separate from Postgres."** There is no separate session store — proved above, PostgREST's entire authorization mechanism is picking which literal Postgres role to run the query as.
+
 <Callout title="The one-line takeaway">
 Every request carries a **Postgres role** — `anon` for unauthenticated requests, `authenticated` for logged-in users (with `auth.uid()` available), and `service_role` for trusted server code that bypasses **Row Level Security**. **PostgREST** turns HTTP into SQL executed as that role, but enforces nothing itself — access control lives entirely in Postgres's own grants and RLS policies. **Auth**, **Storage**, and **Realtime** are separate services, but all of them ultimately read and write the same underlying Postgres database.
 </Callout>
@@ -75,6 +138,7 @@ export const quizArchitecture = [
       'There is no role, unauthenticated requests are rejected before reaching Postgres',
     ],
     answer: 2,
+    explain: 'Proved directly above with a real RPC call using the anon key: the fnd_whoami function reported back current_user = "anon".',
   },
   {
     q: 'Where is access control actually enforced for Supabase\'s auto-generated API?',
@@ -85,6 +149,7 @@ export const quizArchitecture = [
       'Access control is not enforced anywhere, it relies on obscurity',
     ],
     answer: 1,
+    explain: 'PostgREST only chooses which role to run the query as (proved above) — everything after that is ordinary Postgres grants and RLS.',
   },
   {
     q: 'What role does trusted server-side code use to bypass Row Level Security?',
@@ -95,6 +160,7 @@ export const quizArchitecture = [
       'admin',
     ],
     answer: 2,
+    explain: 'Proved above with the same RPC call using the service_role key: current_user came back as "service_role".',
   },
   {
     q: 'How do Auth, Storage, and Realtime relate to the underlying Postgres database?',
@@ -105,6 +171,18 @@ export const quizArchitecture = [
       'They replace Postgres entirely for their own data',
     ],
     answer: 1,
+    explain: 'This is the theme the rest of the course keeps confirming — every service this course covers is ultimately a client of the one Postgres instance.',
+  },
+  {
+    q: 'An AI-generated RPC function checks `if current_user != \'service_role\' then raise exception` to enforce "admins only," but the function is declared `security definer`. Why does this check not do what it looks like it does?',
+    options: [
+      'security definer has no effect on RPC functions at all',
+      'Inside a security definer function, current_user reflects the function\'s owner, not the caller\'s request role, so the check is comparing the wrong identity entirely',
+      'current_user is always NULL inside any Postgres function',
+      'The check works correctly and there is no bug',
+    ],
+    answer: 1,
+    explain: 'The SpotTheBug above walks through exactly this — the fix is either dropping security definer (default to security invoker) or checking the real caller via auth.uid(), never current_user inside a security definer function.',
   },
 ];
 
