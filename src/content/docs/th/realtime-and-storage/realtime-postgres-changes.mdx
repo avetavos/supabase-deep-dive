@@ -1,6 +1,6 @@
 ---
 title: 'Realtime: Postgres Changes'
-description: 'Realtime สตรีม event INSERT UPDATE DELETE ออกจาก write-ahead log ของ Postgres ได้ยังไง และทำไมทุก table ถึงเงียบสนิทจนกว่าจะเปิด replication เอง'
+description: 'Supabase Realtime สตรีม INSERT, UPDATE, DELETE ออกจาก write-ahead log ของ Postgres ได้อย่างไร ทำไมทุกตารางจึงเงียบสนิทจนกว่าจะเปิด replication เอง และทำไม RLS ถึงถูกเช็คซ้ำต่อผู้ subscribe แต่ละคน'
 sidebar:
   order: 1
 ---
@@ -8,110 +8,360 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
-## ไอเดียในหนึ่งประโยค
+## แนวคิดในประโยคเดียว
 
-**Postgres Changes** สตรีม write-ahead log ของ database เองไปให้ client ที่ subscribe อยู่ ในรูป event `INSERT`/`UPDATE`/`DELETE` แต่ฟีเจอร์นี้**ปิดอยู่โดย default สำหรับทุก table** จนกว่าคุณจะเพิ่ม table นั้นเข้า publication เอง
+**Postgres Changes** สตรีม write-ahead log ของฐานข้อมูลตัวเองไปให้ client ที่ subscribe เป็น event `INSERT`/`UPDATE`/`DELETE` แต่กลไกนี้ **ปิดอยู่โดย default สำหรับทุกตาราง** จนกว่าคุณจะเพิ่มตารางนั้นเข้า publication เอง และทุก event จะถูก re-authorize ต่อผู้ subscribe แต่ละคนตาม Row Level Security
 
-## จาก row change ไปถึง callback ฝั่ง client
+## จากการเปลี่ยนแปลงของแถวหนึ่งไปสู่ callback ฝั่ง client
 
-Postgres เก็บ record ของทุก write ไว้แบบ durable และเรียงลำดับอยู่แล้วใน **write-ahead log (WAL)** — ใช้สำหรับ crash recovery และ replication ภายในตัวเอง Supabase Realtime อ่าน WAL ตัวเดียวกันนี้ผ่านฟีเจอร์ **logical replication** ของ Postgres แล้วแปลงทุก change ที่ commit แล้วให้กลายเป็น message ที่ push ผ่าน WebSocket ได้ client subscribe เข้า channel หนึ่ง บอกว่าสนใจ table ไหนและ event type อะไร แล้วจะได้ callback ยิงทุกครั้งที่ row เปลี่ยนตรงกับเงื่อนไข แบบสด ๆ โดยไม่ต้อง poll table เป็นช่วง ๆ เลย
+Postgres เก็บบันทึกการเขียนทุกครั้งไว้อย่างเป็นระเบียบและคงทนอยู่แล้วใน **write-ahead log (WAL)** — ใช้ภายในเพื่อ crash recovery และ replication Supabase Realtime อ่าน WAL เดียวกันนี้ผ่านฟีเจอร์ **logical replication** ของ Postgres แล้วแปลงทุกการเปลี่ยนแปลงที่ commit แล้วให้กลายเป็นข้อความที่ push ผ่าน WebSocket ได้ client subscribe เข้า channel หนึ่ง บอกว่าสนใจตารางไหนและ event ประเภทไหน แล้วจะได้ callback ทำงานทุกครั้งที่มีแถวเปลี่ยนแปลงตรงเงื่อนไข แบบ live โดยไม่ต้อง poll ตารางเป็นช่วง ๆ
 
-ข้อเท็จจริงสำคัญที่ต้องจำก่อนเขียนโค้ดเลยคือ **pipeline นี้ปิดอยู่โดย default สำหรับทุก table ที่คุณสร้าง** Realtime ไม่ได้ watch ทั้ง schema ให้อัตโนมัติ — write ของ table หนึ่งจะไปถึง WAL stream ที่ Realtime แตะอยู่ก็ต่อเมื่อ table นั้นถูกเพิ่มเข้า `supabase_realtime` publication แล้วเท่านั้น ตราบใดที่ยังไม่ทำ client จะ subscribe ทั้งวันก็ไม่ได้อะไรกลับมาเลย
+ข้อเท็จจริงสำคัญที่ต้องจำให้ขึ้นใจก่อนเขียนโค้ดใด ๆ: **pipeline นี้ปิดอยู่โดย default สำหรับทุกตารางที่คุณสร้าง** Realtime ไม่ได้เฝ้าดู schema ทั้งหมดของคุณโดยอัตโนมัติ — การเขียนของตารางหนึ่งจะไปถึง WAL stream ที่ Realtime แตะอยู่ก็ต่อเมื่อตารางนั้นถูกเพิ่มเข้า publication ชื่อ `supabase_realtime` แล้วเท่านั้น จนกว่าจะทำแบบนั้น client จะ subscribe ทั้งวันก็ไม่ได้อะไรเลย
 
-เปิดใช้งานด้วย SQL ธรรมดา
+## พิสูจน์: ตารางที่อยู่นอก publication เงียบสนิท
+
+เริ่มจากตารางธรรมดา ๆ ที่ตั้งใจ **ไม่** เพิ่มเข้า publication ใด ๆ เลย:
 
 ```sql
-alter publication supabase_realtime add table public.messages;
+-- supabase/migrations/6001_rt_items_and_publication.sql
+create table public.rt_items (
+  id bigint generated always as identity primary key,
+  label text not null,
+  created_at timestamptz not null default now()
+);
 ```
 
-สวิตช์ตัวเดียวกันนี้มีอยู่ใน Studio ที่ **Database > Replication** เหมือนกัน ถ้าไม่อยากรัน SQL เอง — ข้างในทำงานแบบเดียวกันทุกประการ
+Subscribe ด้วย anon client รอสักครู่ แล้ว insert แถวด้วย `service_role` (การ bypass RLS ไม่เกี่ยวอะไรตรงนี้เลย — ประเด็นคือ Realtime ไม่เห็นการเขียนนี้เลยด้วยซ้ำ ไม่ว่าจะมี RLS หรือไม่):
+
+```text
+channel status: SUBSCRIBED
+inserted row via service_role, id = 1 (table is NOT in supabase_realtime publication yet)
+waited 5s after insert. event received: false
+channel status: CLOSED
+```
+
+ผลลัพธ์จริงจาก Mac เครื่องนี้ container `supabase_realtime_probe` ใน `tools/probe` — ห้าวินาทีเต็ม ไม่มี event เลยสักครั้ง ไม่มี error ที่ไหนเลย นี่คือความล้มเหลวแบบเงียบ (silent failure) ที่พบบ่อยที่สุดในโค้ด Supabase Realtime ที่ AI สร้าง (โค้ด `channel.on('postgres_changes', ...)` ที่ดูถูกต้องสมบูรณ์แบบแต่ไม่เคยทำงานเลย): ตารางมีอยู่จริง คอลัมน์ถูกต้อง การ subscribe เชื่อมต่อสำเร็จและรายงาน `SUBSCRIBED` แต่ไม่มีอะไรมาถึงเลย เพราะไม่มีใครรันคำสั่ง SQL หนึ่งบรรทัดที่ทำให้ตารางถูกเชื่อมเข้ากับ replication จริง ๆ
+
+<Callout title="หมายเหตุเรื่องเวลา">
+เวลาที่ระบุในบทนี้ทั้งหมดมาจากการรันจริงบน local stack ของ Mac เครื่องนี้ การ query Realtime ครั้งแรกกับตารางที่เพิ่งเปลี่ยนสถานะ publication membership บางครั้งอาจต้องรอเพิ่มอีกไม่กี่วินาทีก่อนที่ replication connection จะรับรู้ — ทุกการพิสูจน์ด้านล่างใช้เวลารอหลายวินาทีเพื่อรองรับเรื่องนี้โดยเฉพาะ และทุกอันถูกรันซ้ำเพื่อยืนยันว่าผ่านอย่างสม่ำเสมอเมื่อ stack นิ่งแล้ว ไม่ใช่แค่ครั้งเดียว
+</Callout>
+
+เปิดใช้งานด้วย SQL ธรรมดา — ไฟล์ migration เดียวกัน ต่อจาก `create table` ทันที:
+
+```sql
+-- supabase/migrations/6001_rt_items_and_publication.sql
+alter publication supabase_realtime add table public.rt_items;
+alter table public.rt_items replica identity full;
+```
+
+สวิตช์แบบเดียวกันนี้มีอยู่ใน Studio ที่หน้า **Database > Replication** ด้วย ถ้าไม่อยากรัน SQL เอง — ทำสิ่งเดียวกันทุกประการภายใต้ฉากหลัง
 
 ## Subscribe จากฝั่ง client
 
-พอ `public.messages` อยู่ใน publication แล้ว client ฝั่ง `supabase-js` ก็ subscribe การเปลี่ยนแปลงบน table นั้นได้
+เมื่อ `rt_items` อยู่ใน publication แล้ว `supabase-js` client ก็ subscribe รับการเปลี่ยนแปลงได้:
 
-```typescript
+```ts
+// src/rt-items-subscribe.ts
+import { createClient } from '@supabase/supabase-js';
+import type { Database } from '../database.types';
+
+declare const process: { env: Record<string, string | undefined>; exit: (code?: number) => never };
+
+const supabase = createClient<Database>(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_ANON_KEY!
+);
+
 const channel = supabase
-  .channel('room1')
+  .channel('rt:items')
   .on(
     'postgres_changes',
-    { event: 'INSERT', schema: 'public', table: 'messages' },
+    { event: 'INSERT', schema: 'public', table: 'rt_items' },
     (payload) => {
-      console.log('New message:', payload.new);
+      console.log('New item:', payload.new);
     }
   )
   .subscribe();
 ```
 
-`event` รับค่าได้เป็น `INSERT`, `UPDATE`, `DELETE` หรือ `*` เพื่อรับทั้งสามแบบพร้อมกัน `schema` กับ `table` ใช้จำกัดขอบเขตให้ subscribe แค่ table เดียว และลงทะเบียน `.on('postgres_changes', ...)` หลายตัวบน channel เดียวกันได้ ถ้าอยากฟังหลาย event type หรือหลาย table พร้อมกัน
+`event` รับค่า `INSERT`, `UPDATE`, `DELETE` หรือ `*` เพื่อรับทั้งสามแบบ `schema` กับ `table` จำกัดขอบเขตการ subscribe ไว้ที่ตารางเดียว คุณลงทะเบียน `.on('postgres_changes', ...)` หลายตัวบน channel เดียวกันเพื่อฟังหลาย event type หรือหลายตารางพร้อมกันได้
 
-ยังมีช่องโหว่อีกจุดที่ต้องปิดให้ครบ โดย default Postgres จะใส่มาแค่ column ของ **primary key** ของ row เก่าใน payload ของ `UPDATE` หรือ `DELETE` เท่านั้น ไม่ใช่ row เก่าเต็ม ๆ ถ้า logic ฝั่งแอปต้องเทียบค่าเก่ากับค่าใหม่ (เช่น อยากรู้ว่า field หนึ่งเปลี่ยนมาจากอะไร) ให้ตั้ง replica identity ของ table เป็น `full`
+## `filter` จำกัดการ subscribe ให้เหลือเฉพาะแถวที่ตรงเงื่อนไข
 
-```sql
-alter table public.messages replica identity full;
+นอกจาก `event`/`schema`/`table` แล้ว ยังมีตัวเลือกที่สี่คือ `filter` ที่จำกัดการ subscribe ให้เหลือเฉพาะแถวที่ตรงเงื่อนไขเดียว — syntax แบบ `column=operator.value` เดียวกันกับที่ PostgREST ใช้ใน query string เช่น `id=eq.1` พิสูจน์ด้วยการ seed สองแถวก่อน แล้ว subscribe ด้วย filter ที่ตรงกับแค่ id ของแถวเดียว:
+
+```ts
+// src/rt-items-filter.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+declare const process: { env: Record<string, string | undefined>; exit: (code?: number) => never };
+
+const anon = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!);
+const admin = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+
+const { data: target } = await admin.from('rt_items').insert({ label: 'filter-target' }).select().single();
+const { data: other } = await admin.from('rt_items').insert({ label: 'filter-other' }).select().single();
+
+const matched: any[] = [];
+const channel = anon
+  .channel('rt:filter-check')
+  .on(
+    'postgres_changes',
+    { event: 'UPDATE', schema: 'public', table: 'rt_items', filter: `id=eq.${target.id}` },
+    (payload) => matched.push(payload)
+  )
+  .subscribe();
+
+await new Promise((r) => setTimeout(r, 6000));
+
+await admin.from('rt_items').update({ label: 'other-updated' }).eq('id', other.id);
+await new Promise((r) => setTimeout(r, 3000));
+console.log('after updating the NON-matching row, matched events:', matched.length);
+
+await admin.from('rt_items').update({ label: 'target-updated' }).eq('id', target.id);
+await new Promise((r) => setTimeout(r, 4000));
+console.log('after updating the matching row, matched events:', matched.length);
+console.log('matched payload.old:', JSON.stringify(matched[0]?.old));
+
+await anon.removeChannel(channel);
+process.exit(matched.length === 1 && matched[0]?.old?.id === target.id ? 0 : 1);
 ```
 
-พอตั้ง `replica identity full` แล้ว `payload.old` ใน event `UPDATE` หรือ `DELETE` จะมีทุก column ของ row ตามสภาพก่อนเปลี่ยน ไม่ใช่แค่ primary key อีกต่อไป
+```text
+after updating the NON-matching row, matched events: 0
+after updating the matching row, matched events: 1
+matched payload.old: {"id":1,"label":"filter-target","created_at":"2026-09-29T04:33:05.011034+00:00"}
+```
 
-<Callout title="เมื่อ scale ใหญ่ขึ้น: ใช้ Broadcast แทน Postgres Changes">
-Postgres Changes ต้องตรวจสิทธิ์ (authorize) ทุก event แยกกับ subscriber ทุกตัว ดังนั้น throughput จะ scale ตามจำนวน subscriber ที่ดู change เดียวกัน ไม่ใช่ตามความเร็วในการเขียน row — คำแนะนำจาก Supabase เองคือให้เปลี่ยนไปใช้ Broadcast แทน (ใช้ trigger เรียกฟังก์ชัน `realtime.broadcast_changes()` ทุกครั้งที่ row เปลี่ยน แล้ว client subscribe channel นั้นแบบเดียวกับที่บท Broadcast ถัดไปจะอธิบาย) เมื่อคาดว่าจะมี concurrent subscriber มากกว่าหลักพันบนการเปลี่ยนแปลงเดียวกัน สำหรับ traffic ทั่วไปของแอป Postgres Changes ตามที่อธิบายไว้ข้างบนยังคือตัวเลือก default ที่ถูกต้อง ให้มองเรื่องนี้เป็นทางออกตอน scale ใหญ่ ไม่ใช่สิ่งที่ต้องรีบใช้ตั้งแต่วันแรก
+การอัปเดตแถวของ `other` ไม่ทำให้เกิด callback เลยสักครั้ง — filter ถูกใช้งานก่อนที่ client จะเห็น event ด้วยซ้ำ ไม่ใช่การกรองฝั่ง client ภายหลัง — ส่วนการอัปเดตแถวของ `target` ทำให้ event ยิงมาพอดีหนึ่งครั้ง
+
+## `replica identity full` — ความต่างใน `payload.old`
+
+โดย default Postgres จะใส่เฉพาะคอลัมน์ **primary key** ของแถวเก่าใน payload ของ `UPDATE` หรือ `DELETE` เท่านั้น — ไม่ใช่แถวเก่าเต็มรูปแบบ พิสูจน์กับตารางที่ยังใช้ replica identity แบบ default (`relreplident = 'd'` ก่อนที่ `alter table ... replica identity full` ด้านบนจะถูกใช้งาน):
+
+```text
+EVENT: UPDATE old= {"id":4} new= {"id":4,"label":"debug-row-updated","created_at":"2026-09-29T04:31:04.807268+00:00"}
+EVENT: DELETE old= {"id":5} new= {}
+```
+
+`old` มีแค่ `id` ในทั้งสอง event type — คอลัมน์อื่นหายไปหมด เพราะ WAL record ของแถวเก่าที่ Postgres เขียนไว้มีแค่ replica identity (primary key โดย default) เท่านั้น การพิสูจน์ `filter` ด้านบนรันขึ้น **หลังจาก** `alter table public.rt_items replica identity full;` แล้ว และ `matched[0].old` ของมันออกมาเป็น `{"id":1,"label":"filter-target","created_at":"..."}` — ครบทุกคอลัมน์ รวมถึงค่า `label` ก่อนหน้าที่จะถูกอัปเดต นั่นคือผลทั้งหมดของ `replica identity full`: มันบอก Postgres ให้เขียนแถวเก่าทั้งแถวลง WAL ไม่ใช่แค่คอลัมน์ identity เท่านั้น เพื่อให้ Realtime มีอะไรใส่ใน `payload.old` มากกว่าแค่ primary key ถ้า logic ของแอปคุณต้องเทียบค่าเก่ากับค่าใหม่ (เช่น เพื่อรู้ว่าฟิลด์หนึ่งเปลี่ยน *จาก* อะไร) คุณต้องตั้งค่านี้ — ถ้าไม่ตั้ง `payload.old` บน `UPDATE`/`DELETE` จะขาดทุกคอลัมน์ที่ไม่ใช่ key ไปแบบเงียบ ๆ
+
+## RLS มีผลกับ Postgres Changes ด้วย ต่อผู้ subscribe แต่ละคน
+
+Postgres Changes ไม่ใช่ firehose ที่ข้ามระบบความปลอดภัยของตารางไปเฉย ๆ — Realtime เช็ค policy `select` ของ Row Level Security ของผู้ subscribe แต่ละคนซ้ำทุกครั้งสำหรับทุก event โดยใช้ session ที่ client นั้น authenticate ไว้ ผู้ใช้จริงสองคน ตารางที่มี policy จำกัดตาม owner และการ subscribe แบบไม่มี `filter` เลย:
+
+```sql
+-- supabase/migrations/6002_rt_notes_rls.sql
+create table public.rt_notes (
+  id bigint generated always as identity primary key,
+  user_id uuid not null,
+  body text not null
+);
+
+alter table public.rt_notes enable row level security;
+
+create policy "rt_notes_own_rows_select"
+on public.rt_notes
+for select
+to authenticated
+using (auth.uid() = user_id);
+
+create policy "rt_notes_own_rows_insert"
+on public.rt_notes
+for insert
+to authenticated
+with check (auth.uid() = user_id);
+
+alter publication supabase_realtime add table public.rt_notes;
+```
+
+ผู้ใช้จริงสองคนที่สมัครผ่าน GoTrue (`rt-alice@example.com`, `rt-bob@example.com`) แต่ละคนมี `supabase-js` client instance และ session เป็นของตัวเอง (`signInWithPassword` — ไม่ต้องเรียก `realtime.setAuth()` เพิ่มสำหรับ `postgres_changes` ต่างจากกรณี private channel ในบทถัดไป; การ sign in บน client จะรีเฟรช auth ของ Realtime connection ของ client นั้นให้อัตโนมัติ) Alice subscribe แบบไม่มี `filter` เลย จากนั้น bob insert แถวของตัวเองผ่าน client ของเขา และ alice insert แถวของตัวเองผ่าน client ของเธอ:
+
+```ts
+// src/rt-notes-rls-scoping.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+declare const process: { env: Record<string, string | undefined>; exit: (code?: number) => never };
+
+const API_URL = process.env.SUPABASE_URL!;
+const ANON_KEY = process.env.SUPABASE_ANON_KEY!;
+const admin = createClient(API_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+
+async function ensureUser(email: string, password: string) {
+  const { data, error } = await admin.auth.admin.createUser({ email, password, email_confirm: true });
+  if (!error) return data.user;
+  const { data: list } = await admin.auth.admin.listUsers();
+  const existing = list.users.find((u) => u.email === email);
+  if (!existing) throw error;
+  return existing;
+}
+
+const alice = await ensureUser('rt-alice@example.com', 'rt-pw-alice-12345');
+const bob = await ensureUser('rt-bob@example.com', 'rt-pw-bob-12345');
+
+const aliceClient = createClient(API_URL, ANON_KEY);
+const bobClient = createClient(API_URL, ANON_KEY);
+await aliceClient.auth.signInWithPassword({ email: 'rt-alice@example.com', password: 'rt-pw-alice-12345' });
+await bobClient.auth.signInWithPassword({ email: 'rt-bob@example.com', password: 'rt-pw-bob-12345' });
+
+const aliceEvents: any[] = [];
+const channel = aliceClient
+  .channel('rt:notes-scoping')
+  .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'rt_notes' }, (payload) => {
+    aliceEvents.push(payload.new);
+  })
+  .subscribe();
+
+await new Promise((r) => setTimeout(r, 6000));
+
+await bobClient.from('rt_notes').insert({ user_id: bob.id, body: 'bob private note' });
+await aliceClient.from('rt_notes').insert({ user_id: alice.id, body: 'alice private note' });
+
+await new Promise((r) => setTimeout(r, 5000));
+
+console.log('events alice received:', aliceEvents.length, JSON.stringify(aliceEvents.map((e) => e.body)));
+const onlyOwnRows = aliceEvents.every((e) => e.user_id === alice.id);
+const receivedHerOwn = aliceEvents.some((e) => e.user_id === alice.id);
+
+await aliceClient.removeChannel(channel);
+process.exit(onlyOwnRows && receivedHerOwn ? 0 : 1);
+```
+
+```text
+events alice received: 1 ["alice private note"]
+```
+
+การ subscribe แบบไม่มี filter ของ alice เห็น `INSERT` แค่หนึ่งครั้งเท่านั้น — เป็นของเธอเอง — แม้ว่าการ insert ของ bob จะเกิดขึ้นบนตารางเดียวกัน channel type เดียวกันเป๊ะ แถวของ bob ถูกเขียนลง Postgres สำเร็จตามปกติ (insert ของเขาไม่ error) แต่ Realtime ไม่เคยส่ง event นั้นไปยัง socket ของ alice เลย เพราะ policy `select` ใน session ของเธอบนตาราง `rt_notes` ไม่อนุญาตให้เห็นแถวของเขา นี่คือกลไกจริง ไม่ใช่เรื่องบังเอิญ: **ทุก event ของ Postgres Changes ถูก authorize ต่อผู้ subscribe แต่ละคนแยกกัน** ซึ่งก็เป็นเหตุผลเดียวกับที่มันไม่ scale เกินไม่กี่พันผู้ subscribe พร้อมกัน (หัวข้อถัดไป)
+
+<Callout title="เมื่อต้อง scale: ใช้ Broadcast แทน Postgres Changes">
+ตามเอกสารทางการ *"Postgres Changes authorizes every event against each subscriber. When you make a single change to a table with 100 subscribed users, Realtime performs 100 authorization checks — one per user — so throughput scales with the number of subscribers, not the write rate"* และ *"If you expect more than ~3,000 concurrent subscribers on the same changes, use Broadcast to stream database changes instead"* ([supabase.com/docs/guides/realtime/postgres-changes](https://supabase.com/docs/guides/realtime/postgres-changes), Scaling Postgres Changes) ผู้ใช้จริงสองคนด้านบนแต่ละคนมีต้นทุนหนึ่ง authorization check ต่อ event หนึ่งอัน ที่ 3,000 ผู้ subscribe พร้อมกัน นั่นคือ 3,000 การเช็คสำหรับการเปลี่ยนแปลงหนึ่งแถว ทั้งหมดประมวลผลบน thread เดียวที่ Realtime ใช้เพื่อรักษาลำดับของ event Broadcast (บทถัดไป รวมถึง "Broadcast from database" ผ่าน `realtime.broadcast_changes()`) authorize แค่ครั้งเดียวต่อ **channel** ไม่ใช่ต่อ **ผู้ subscribe** ต้นทุนของมันจึงไม่โตตามจำนวนผู้ชมเหมือนที่ per-subscriber RLS evaluation ของ Postgres Changes เป็น — ดู `/supabase/th/supabase-internals/realtime-wal-pipeline/` สำหรับ pipeline WAL → replication slot → Realtime → channel ที่การเช็คต่อผู้ subscribe นี้อยู่ข้างใน สำหรับ traffic ของแอปทั่วไป Postgres Changes แบบที่อธิบายไว้ด้านบนคือ default ที่ถูกต้องแล้ว ให้มอง Broadcast from database เป็นทางออกตอนต้อง scale ไม่ใช่สิ่งที่ต้องรีบใช้ตั้งแต่วันแรก
 </Callout>
 
-<Mermaid title="row change จะถึง client ได้ก็ต่อเมื่อ table อยู่ใน publication" code={postgresChangesDiagram} />
+<Mermaid title="แถวที่เปลี่ยนแปลงจะไปถึง client ก็ต่อเมื่อตารางอยู่ใน publication และ RLS ถูกเช็คซ้ำต่อผู้ subscribe" code={postgresChangesDiagram} />
 
 export const postgresChangesDiagram = `flowchart LR
   insert["Postgres INSERT/UPDATE/DELETE"] --> wal["Write-ahead log (WAL)"]
   wal --> gate{"Is the table added to supabase_realtime publication?"}
   gate -->|no| nothing["No event is ever sent"]
   gate -->|yes| realtime["Realtime server reads WAL via logical replication"]
-  realtime --> client["Client's postgres_changes callback fires"]`;
+  realtime --> perSub{"For EACH subscriber: does their RLS select policy admit this row?"}
+  perSub -->|no| skip["That subscriber gets nothing"]
+  perSub -->|yes| client["That subscriber's postgres_changes callback fires"]`;
 
-<Callout title="สรุปหนึ่งบรรทัด">
-**Postgres Changes** อ่าน write-ahead log ของ Postgres เองผ่าน logical replication แล้ว push event `INSERT`/`UPDATE`/`DELETE` ไปให้ client ที่ subscribe อยู่ แต่ฟีเจอร์นี้**ปิดอยู่โดย default สำหรับทุก table** — ต้องรัน `alter publication supabase_realtime add table your_table;` เอง (หรือกดสวิตช์เดียวกันใน Studio ที่ Replication settings) ก่อน subscription แบบ `channel.on('postgres_changes', ...)` จะได้อะไรกลับมา และต้อง `alter table your_table replica identity full;` ด้วยถ้าอยากได้ row เก่าเต็ม ๆ ใน payload ของ `UPDATE`/`DELETE`
+<Callout title="สรุปในบรรทัดเดียว">
+**Postgres Changes** อ่าน write-ahead log ของ Postgres เองผ่าน logical replication แล้ว push event `INSERT`/`UPDATE`/`DELETE` ไปยัง client ที่ subscribe แต่กลไกนี้ **ปิดอยู่โดย default สำหรับทุกตาราง** — พิสูจน์แล้วด้านบนว่าเงียบสนิทเต็มห้าวินาที — จนกว่า `alter publication supabase_realtime add table your_table;` จะถูกรัน `replica identity full` คือสิ่งที่ทำให้ทุกคอลัมน์ (ไม่ใช่แค่ primary key) ถูกใส่ใน `payload.old` ตอน `UPDATE`/`DELETE`, ตัวเลือกแบบ `filter: 'id=eq.1'` จำกัดการ subscribe ให้เหลือแถวที่ตรงเงื่อนไขก่อนที่ client จะเห็น event และ — พิสูจน์แล้วด้านบนด้วยผู้ใช้จริงสองคน — ทุก event ถูก **re-authorize ตาม policy `select` ของ RLS ของผู้ subscribe แต่ละคน** ซึ่งเป็นเหตุผลที่เอกสารทางการของ Supabase แนะนำ Broadcast from database เมื่อคาดว่าจะมีผู้ subscribe พร้อมกันเกินประมาณ 3,000 คนสำหรับการเปลี่ยนแปลงเดียวกัน
 </Callout>
+
+## อ่านโค้ดที่ AI สร้าง
+
+AI assistant ถูกขอให้ "เพิ่ม live activity feed เมื่อมีแถวถูก insert เข้า `orders`" แล้วสร้าง migration นี้มา พร้อมคิดว่าฟีเจอร์เสร็จแล้ว:
+
+<SpotTheBug lang="sql" code={`create table public.orders (
+  id bigint generated always as identity primary key,
+  customer_id uuid not null,
+  total numeric not null,
+  created_at timestamptz not null default now()
+);
+
+alter table public.orders enable row level security;
+
+create policy "orders_select_own"
+on public.orders
+for select
+to authenticated
+using (auth.uid() = customer_id);
+`}>
+ตารางถูกสร้าง RLS ถูกเปิด และ policy ก็ถูกต้อง — แต่ไม่มีตรงไหนใน migration นี้เลยที่รัน `alter publication supabase_realtime add table public.orders;` โค้ดฝั่ง client `channel.on('postgres_changes', { table: 'orders', ... }, callback)` ที่ AI ตัวเดียวกันเขียนต่อมาจะเชื่อมต่อสำเร็จ รายงาน `SUBSCRIBED` แล้วก็ไม่เคยทำงานเลย — เหมือนที่พิสูจน์ไว้ตอนต้นบทนี้เป๊ะ เงียบสนิทห้าวินาทีเต็มโดยไม่มี error ที่ไหนใน stack เลย ไม่มี exception ให้ catch และไม่มี log บรรทัดไหนให้ grep เพราะในมุมมองของ Postgres ไม่มีอะไรผิดพลาดเลย — ตารางไม่เคยถูกเชื่อมเข้ากับ replication ตั้งแต่แรก ทางแก้คือคำสั่งเดียว เพิ่มต่อท้าย migration เดียวกัน: `alter publication supabase_realtime add table public.orders;` — และถ้า feed ต้องแสดงว่า total ของแถวเปลี่ยน *จาก* อะไร ให้เพิ่ม `alter table public.orders replica identity full;` ต่อท้ายด้วย
+</SpotTheBug>
+
+## Mental Model
+
+Postgres Changes คือ Realtime ที่ tail write-ahead log ของ Postgres เอง ไม่ใช่ event bus แบบพิเศษที่ต่อเสริมเข้ากับ schema — และนั่นคือเหตุผลที่มันสืบทอดคุณสมบัติสองอย่างของ Postgres มาแทนที่จะประดิษฐ์ของใหม่ ข้อแรก WAL มีแค่สิ่งที่ Postgres ตัดสินใจเขียนลงไปเท่านั้น: ไม่มีอะไรสตรีมสำหรับตารางหนึ่งจนกว่า `alter publication ... add table` จะบอกให้ logical replication เริ่มรวมมันเข้าไป และแถวเก่าใน record ของ `UPDATE`/`DELETE` ก็ถูกจำกัดแค่ replica identity (primary key โดย default) เว้นแต่คุณจะขยายมันด้วย `replica identity full` ข้อสอง เพราะผู้ subscribe แต่ละคนเชื่อมต่อด้วย session ของตัวเอง Realtime จึงรัน policy `select` ของ RLS บนตารางของคุณซ้ำได้ต่อ event ต่อผู้ subscribe — policy เดียวกับที่ PostgREST จะรันสำหรับ `select` ธรรมดา เพียงแต่ถูกเรียกครั้งละหนึ่งคนที่กำลังเฝ้าดู แทนที่จะเป็นครั้งละหนึ่ง query `filter` คือการจำกัดขอบเขตแบบถูก ๆ ที่ใช้ก่อนการเช็ค RLS นั้น ไม่ใช่ตัวแทนของมัน: filter ลดจำนวนผู้ฟังของ event ได้ แต่มีแค่ RLS เท่านั้นที่ตัดสินว่าผู้ subscribe คนหนึ่งได้รับอนุญาตให้เห็นมันหรือไม่
+
+## Trade-offs
+
+- **Postgres Changes ไม่ต้องมี infrastructure เพิ่มเลยในการเริ่มใช้** — แค่คำสั่ง `alter publication` เดียว และทุกตารางที่คุณมี RLS policy อยู่แล้วก็สตรีมได้ทันที — **แลกมาด้วยการเช็ค authorization ต่อผู้ subscribe ในทุก ๆ event** ซึ่งเป็นสิ่งที่จำกัดมันไว้ที่ประมาณไม่กี่พันผู้ subscribe พร้อมกันสำหรับการเปลี่ยนแปลงเดียวกัน (เอกสาร อ้างอิงด้านบน)
+- **`replica identity full` ให้แถวเก่าเต็มรูปแบบใน `payload.old`** — มีประโยชน์สำหรับการ diff หรือ undo — **แลกมาด้วย WAL record ที่ใหญ่ขึ้นสำหรับทุกการเขียนบนตารางนั้น** แม้จะไม่มีผู้ subscribe คนไหนสนใจเลยก็ตาม เพราะ Postgres ไม่มีทางรู้ล่วงหน้าว่าการเปลี่ยนแปลงไหนจะถูกเฝ้าดู
+- **`filter` ให้คุณจำกัดการ subscribe ให้เหลือเฉพาะแถวที่ client ต้องการจริง ๆ** ลดทั้ง network traffic และจำนวนครั้งที่ RLS ต้องถูกประเมินซ้ำสำหรับ client นั้น — **แลกมาด้วย filter expression หนึ่งอันต่อความสนใจหนึ่งเรื่อง**: client ที่เฝ้าดูหลายส่วนของตารางเดียวกันต้องลงทะเบียน `.on('postgres_changes', ...)` หลายตัว หนึ่งตัวต่อหนึ่ง filter ไม่ใช่ subscription กว้าง ๆ ตัวเดียวแล้วกรองฝั่ง client
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"ตารางใหม่สตรีม changes ให้อัตโนมัติ"** พิสูจน์แล้วด้านบน: ตารางที่เพิ่งสร้างจะไม่มี event เลยไม่มีกำหนด จนกว่าจะถูกเพิ่มเข้า publication `supabase_realtime` อย่างชัดเจน — ไม่มี opt-in โดยนัย และไม่มี error บอกว่ามันขาดไป
+- **"`payload.old` มีแถวเก่าเต็มรูปแบบเสมอ"** มีเฉพาะเมื่อตั้ง `replica identity full` บนตารางนั้นโดยเฉพาะ โดย default มันมีแค่ primary key — พิสูจน์แล้วด้านบนด้วยทั้ง `UPDATE` และ `DELETE` บนตารางเดียวกันก่อนที่จะตั้งค่านั้น
+- **"RLS มีผลแค่กับ query ตรง ๆ เท่านั้น Realtime สตรีมทุกอย่างที่เปลี่ยนไปเฉย ๆ"** พิสูจน์แล้วด้านบนด้วยผู้ใช้จริงสองคน: การ insert ของ bob ไม่เคยไปถึงการ subscribe แบบไม่มี filter ของ alice เลย เพราะ Realtime ประเมิน policy `select` ของเธอกับทุก event ก่อนจะส่งให้ — policy เดียวกันเป๊ะกับที่จะ gate `select * from rt_notes` ธรรมดา
+- **"`filter` คือขอบเขตความปลอดภัย ใช้แทน RLS ได้เลย"** `filter` แค่ตัดสินว่าแถวไหนคุ้มค่าที่จะเช็คกับ RLS เท่านั้น มันไม่เคยให้สิทธิ์เข้าถึงที่ RLS จะปฏิเสธอยู่แล้ว ผู้ subscribe ที่ policy RLS ของเขาไม่อนุญาตแถวหนึ่ง จะไม่ได้รับแถวนั้นไม่ว่า `filter` จะเขียนว่าอะไรก็ตาม และตารางที่มี policy กว้างเกินไปก็ไม่ได้ปลอดภัยขึ้นแค่เพราะเพิ่ม `filter` แคบ ๆ เข้าไป
 
 export const quizPostgresChanges = [
   {
-    q: 'Postgres Changes ทำงานบน table ที่เพิ่งสร้างใหม่โดย default หรือไม่',
+    q: 'ตารางที่เพิ่งสร้างใหม่ Postgres Changes ทำงานให้โดย default หรือไม่',
     options: [
-      'ทำงานเลย ทุก table สตรีม change ให้อัตโนมัติทันทีที่สร้าง',
-      'ไม่ทำงาน ต้องเพิ่ม table นั้นเข้า supabase_realtime publication ก่อนอย่างชัดเจน',
-      'สตรีมเฉพาะ SELECT query เท่านั้น ไม่ใช่ write โดย default',
-      'ทำงาน แต่เฉพาะ schema public เท่านั้น schema อื่นไม่ได้',
+      'ใช่ ทุกตารางสตรีม changes อัตโนมัติทันทีที่ถูกสร้าง',
+      'ไม่ ต้องเพิ่มตารางเข้า publication supabase_realtime ก่อนอย่างชัดเจน',
+      'มีแค่ query SELECT เท่านั้นที่ถูกสตรีมโดย default ไม่ใช่การเขียน',
+      'ใช่ แต่เฉพาะ schema public เท่านั้น ไม่ใช่ schema อื่น',
     ],
     answer: 1,
+    explain: 'พิสูจน์แล้วด้านบน: ตารางใหม่ไม่มี event เลยตลอดหน้าต่างห้าวินาทีเต็ม ทั้งที่สถานะเป็น SUBSCRIBED และไม่มี error ใด ๆ จนกว่า alter publication supabase_realtime add table จะถูกรัน',
   },
   {
-    q: 'คำสั่ง SQL ไหนใช้เปิด Postgres Changes ให้กับ table หนึ่งตัว',
+    q: 'คำสั่ง SQL ไหนที่เปิดใช้งาน Postgres Changes สำหรับตารางหนึ่ง',
     options: [
       'create trigger supabase_realtime on your_table;',
       'alter publication supabase_realtime add table your_table;',
       'grant realtime on your_table to authenticated;',
-      'select enable_realtime(\'your_table\');',
+      "select enable_realtime('your_table');",
     ],
     answer: 1,
+    explain: 'นี่คือคำสั่งที่ใช้ด้านบนเพื่อเปลี่ยน rt_items จากเงียบสนิทให้กลายเป็นสตรีมได้ — สวิตช์เดียวกับที่ Database > Replication ใน Studio ใช้ภายใน',
   },
   {
-    q: 'ทำไมต้องตั้ง replica identity full ให้ table ที่ใช้กับ Postgres Changes',
+    q: 'ทำไมถึงต้องตั้ง replica identity full บนตารางที่ใช้กับ Postgres Changes',
     options: [
-      'เพราะต้องตั้งก่อนถึงจะเพิ่ม table เข้า publication ใด ๆ ได้เลย',
-      'เพื่อให้ event INSERT ยิงสองครั้งเป็นการสำรอง',
-      'เพื่อให้ payload ของ row เก่าใน event UPDATE/DELETE มีทุก column ไม่ใช่แค่ primary key',
-      'เพื่อปิด logical replication ของ table นั้น',
+      'จำเป็นก่อนที่ตารางจะถูกเพิ่มเข้า publication ใด ๆ ได้เลย',
+      'มันทำให้ event INSERT ยิงสองครั้งเพื่อความซ้ำซ้อน',
+      'มันทำให้ payload ของแถวเก่าใน event UPDATE/DELETE มีทุกคอลัมน์ ไม่ใช่แค่ primary key',
+      'มันปิด logical replication สำหรับตารางนั้น',
     ],
     answer: 2,
+    explain: 'พิสูจน์แล้วด้านบน: ถ้าไม่ตั้งค่านี้ payload.old ทั้ง UPDATE และ DELETE จะมีแค่ {"id": N}; พอตั้งค่าแล้ว payload.old ของ UPDATE เดียวกันมีทุกคอลัมน์ รวมถึงค่า label ก่อนอัปเดตด้วย',
   },
   {
-    q: 'subscription แบบ channel.on(\'postgres_changes\', ...) ใช้ field ไหนกำหนดขอบเขตว่าจะฟังอะไร',
+    q: "การ subscribe ด้วย channel.on('postgres_changes', ...) ใช้ field ไหนบ้างในการจำกัดขอบเขตสิ่งที่จะฟัง",
     options: [
-      'ใช้แค่ string SQL where clause แบบ free-text',
-      'event, schema และ table',
-      'ใช้แค่ชื่อ channel อย่างเดียว ไม่มีอย่างอื่น',
-      'ใช้ GraphQL query document',
+      'มีแค่ string WHERE clause แบบ SQL อิสระเท่านั้น',
+      'event, schema, table และ filter ที่เป็น optional',
+      'มีแค่ชื่อ channel เท่านั้น ไม่มีอย่างอื่น',
+      'เอกสาร query แบบ GraphQL',
     ],
     answer: 1,
+    explain: 'event/schema/table เลือก stream; filter (column=operator.value เช่น id=eq.1) จำกัดให้เหลือแถวที่ตรงเงื่อนไข พิสูจน์แล้วด้านบนว่าระงับ event ของแถวที่ไม่ตรงเงื่อนไขได้สนิท',
+  },
+  {
+    q: 'Alice และ bob ต่างมี RLS policy จำกัด rt_notes ให้เหลือแค่ user_id ของตัวเอง Alice subscribe postgres_changes แบบไม่มี filter เกิดอะไรขึ้นเมื่อ bob insert แถวของตัวเอง',
+    options: [
+      'การ subscribe ของ alice ยิงสำหรับแถวของ bob ด้วย เพราะ postgres_changes ไม่สนใจ RLS',
+      'การ subscribe ของ alice ไม่ได้รับอะไรเลยสำหรับแถวของ bob เพราะ Realtime เช็ค select policy ของเธอซ้ำต่อผู้ subscribe ก่อนส่ง event ทุกครั้ง',
+      'การ insert ของ bob ถูกปฏิเสธทันทีเพราะ alice ก็ subscribe อยู่ด้วย',
+      'ทั้ง alice และ bob หยุดรับ event ทั้งหมดจนกว่าจะ subscribe ใหม่',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วด้านบนด้วยผู้ใช้จริงสองคนที่สมัครไว้: การ subscribe แบบไม่มี filter ของ alice ได้รับ event แค่หนึ่งครั้ง (การ insert ของเธอเอง) ไม่ใช่ของ bob แม้ทั้งคู่จะเขียนลงตารางเดียวกันบน channel type เดียวกัน',
+  },
+  {
+    q: 'ตามเอกสารทางการ ควรเปลี่ยนจาก Postgres Changes ไปใช้ Broadcast (หรือ Broadcast from database) เมื่อไหร่',
+    options: [
+      'ไม่ต้องเปลี่ยนเลย — Postgres Changes scale เท่ากันไม่ว่าจะมีผู้ subscribe เท่าไหร่',
+      'เมื่อคาดว่าจะมีผู้ subscribe พร้อมกันเกินประมาณ 3,000 คนสำหรับการเปลี่ยนแปลงเดียวกัน เพราะ Postgres Changes authorize ทุก event ต่อผู้ subscribe แต่ละคนแยกกัน',
+      'เฉพาะตอนใช้ Supabase แบบ self-hosted เท่านั้น',
+      'ทันทีที่ตารางหนึ่งมี RLS policy มากกว่าหนึ่งอัน',
+    ],
+    answer: 1,
+    explain: 'อ้างอิงด้านบนจาก supabase.com/docs/guides/realtime/postgres-changes: throughput scale ตามจำนวนผู้ subscribe ไม่ใช่อัตราการเขียน เพราะ authorization check ต่อผู้ subscribe — เอกสารระบุ ~3,000 ผู้ subscribe พร้อมกันเป็นเกณฑ์ให้เปลี่ยนไปใช้ Broadcast',
   },
 ];
 
