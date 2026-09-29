@@ -1,0 +1,328 @@
+---
+title: เครื่องมือ verification
+description: '`supabase db lint`, query ตรวจ coverage ของ RLS, `pg_policies`, `explain analyze` ภายใต้ JWT จริง, `supabase test db` (pgTAP), `supabase gen types` + `tsc`, `deno check`, `curl` ด้วย anon เทียบ service key, MCP server, Studio, และ harness ของคอร์สนี้เอง แต่ละตัวพิสูจน์อะไรได้บ้างจริง ๆ -- พร้อม output จริง'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+ไม่มีเครื่องมือไหนด้านล่างที่ทับซ้อนกันสมบูรณ์แบบ และไม่มีตัวไหนใกล้เคียงกับความสมบูรณ์ด้วยตัวเอง -- บรรทัด "วิธีสังเกตตอน review" ของแต่ละ entry ทั้ง 27 ตัวใน **[AI Bug Catalog](/supabase/th/reading-supabase/ai-bug-catalog/)** ระบุตรง ๆ ว่าเครื่องมือไหนด้านล่าง (ถ้ามี) ที่จะจับมันได้ และส่วนใหญ่ไม่มีตัวไหนเลยตอนที่บั๊กถูกใส่เข้ามา ทุก output ด้านล่างจริง จับสดสำหรับโมดูลนี้กับ local stack ที่คอร์สนี้แชร์กันเองและ namespace `rd_` ของโมดูลนี้เอง
+
+<Mermaid title="แต่ละ tool ตรวจชั้นไหนจริง ๆ" code={toolLadderDiagram} />
+
+export const toolLadderDiagram = `flowchart TD
+  A["supabase db lint<br/>plpgsql type-checking, NOT RLS/security advisories"] --> B["RLS-coverage query + pg_policies<br/>which tables/commands actually have a policy"]
+  B --> C["explain analyze under a real JWT<br/>does the policy also perform?"]
+  C --> D["supabase test db (pgTAP)<br/>a real, repeatable, role-scoped assertion"]
+  D --> E["supabase gen types + tsc / deno check<br/>types and module resolution, never intent"]
+  E --> F["curl anon vs service_role<br/>the one comparison that actually reveals an RLS gap"]
+  F --> G["MCP server<br/>a real schema inspector -- and a real superuser risk"]
+  G --> H["Studio + this course's harness<br/>visual inspection, and CI-grade fence verification"]
+`;
+
+## `supabase db lint` -- ตรวจ type ของ plpgsql ไม่ใช่ advisor ของ RLS หรือความปลอดภัย
+
+ความเข้าใจผิดที่พบบ่อยที่สุดเกี่ยวกับ tool นี้: ชื่อของมันชวนให้คิดว่ามันจับช่องว่าง RLS, policy column ที่ไม่มี index หรือ `search_path` ที่หายไปได้ -- มันไม่ทำ ตาม `--help` ของมันเอง มัน "checks local database for typing error[s]" -- เจาะจงคือ type mismatch ข้างในตัวฟังก์ชัน `plpgsql` ที่ Postgres เองไม่ validate ตอน `create function` (function body จะถูก parse และ type-check ครั้งแรกตอนมันรันจริงเท่านั้น เว้นแต่ tool แบบนี้จะทำล่วงหน้าให้)
+
+```text
+$ psql -c "create or replace function public.rd_lint_demo()
+returns text language plpgsql as \$\$
+declare v integer;
+begin
+  select display_name into v from public.rd_profiles limit 1;  -- text into integer
+  return v;
+end;
+\$\$;"
+CREATE FUNCTION
+
+$ supabase db lint --level warning
+Linting schema: extensions
+Linting schema: public
+{"results":[{"function":"public.rd_lint_demo","issues":[{"level":"warning","message":"target type is different type than source type","statement":{"lineNumber":"4"},"query":{"text":"select display_name from public.rd_profiles limit 1"},"hint":"The input expression type does not have an assignment cast to the target type.","detail":"cast \"text\" value to \"integer\" type","sqlState":"42804"}]}],"message":"db lint"}
+```
+
+คำเตือน `42804` ประเภทไม่ตรงกันจริงและเฉพาะเจาะจง จับได้**ก่อน**ที่ฟังก์ชันจะถูกเรียกเลยด้วยซ้ำ -- มีประโยชน์จริง แค่แคบกว่าที่คำว่า "lint" ชวนให้คิดมาก ไม่มี catalog entry ไหนใน 4-8 (กลุ่ม RLS) ที่กระตุ้นอะไรที่นี่เลย `db lint` กับ schema ในเครื่องนี้เป๊ะ ที่มีบั๊ก RLS ของ catalog นี้ทุกตัวอยู่จริงในบางช่วง คืน `"No schema errors found"` ทุกครั้ง -- ช่องว่าง RLS ต้องใช้สอง tool ถัดไปแทน
+
+## RLS-coverage query -- table ไหนมี policy สำหรับคำสั่งไหนจริง ๆ
+
+query เดียวที่จับ catalog entry 4 กับ 8 ได้ตรง ๆ: เช็คไขว้ `pg_class.relrowsecurity` กับ `pg_policies` ต่อ table
+
+```text
+select c.relname as table_name, c.relrowsecurity as rls_enabled, count(p.policyname) as policy_count
+from pg_class c
+join pg_namespace n on n.oid = c.relnamespace
+left join pg_policies p on p.schemaname = n.nspname and p.tablename = c.relname
+where n.nspname = 'public' and c.relkind = 'r' and c.relname like 'rd_%'
+group by c.relname, c.relrowsecurity
+order by 1;
+
+  table_name   | rls_enabled | policy_count
+---------------+-------------+--------------
+ rd_notes      | t           |            0   <- RLS เปิด, 0 policy: บั๊กของ entry 8 เป๊ะ
+ rd_posts      | t           |            2
+ rd_posts_perf | f           |            0   <- ไม่เคยเปิด RLS บน table นี้เลย
+ rd_profiles   | f           |            0
+ rd_rt_items   | t           |            2
+ rd_secrets    | t           |            1
+ rd_settings   | f           |            0
+ rd_widgets    | f           |            0
+```
+
+query เดียว สองผลจริงที่ต่างกันบน namespace ของโมดูลนี้เอง: `rd_notes` เปิด RLS แล้วไม่มี policy เลย (สถานะจริง สด และว่างเปล่าแบบเงียบของ catalog entry 8 เป๊ะ) และอีกสี่ table ไม่เคยเปิด RLS เลยตั้งแต่แรก -- คำถามการตรวจสอบแยกต่างหาก ("table นี้ควรมี RLS ไหม?") ที่ query เดียวกันนี้เผยให้เห็นฟรี ๆ
+
+## `pg_policies` -- อ่าน `using`/`with check` ตรง ๆ ไม่ใช่เดาจากพฤติกรรม
+
+เมื่อยืนยันแล้วว่า table มี policy ให้อ่านว่ามันพูดอะไรจริง ๆ -- `qual` คือ expression `using`, `with_check` คือสิ่งที่มันบอกตรงตัว และ `with_check` ที่ว่างเปล่าบน policy `update`/`all` คือสัญญาณสดของการขโมยใน catalog entry 5:
+
+```text
+select tablename, policyname, cmd, qual, with_check from pg_policies
+where schemaname='public' and tablename like 'rd_%' order by 1,2;
+
+  tablename  |     policyname     |  cmd   |                  qual                   |               with_check
+-------------+--------------------+--------+-----------------------------------------+-----------------------------------------
+ rd_posts    | rd_posts_select    | SELECT | true                                    |
+ rd_posts    | rd_posts_update    | UPDATE | (user_id = ( SELECT auth.uid() AS uid)) | (user_id = ( SELECT auth.uid() AS uid))
+ rd_rt_items | rd_rt_items_insert | INSERT |                                         | true
+ rd_rt_items | rd_rt_items_select | SELECT | true                                    |
+ rd_secrets  | rd_secrets_select  | SELECT | (user_id = ( SELECT auth.uid() AS uid)) |
+```
+
+`with_check` ของ `rd_posts_update` สะท้อน `qual` ของมันเห็นชัด -- ฉบับแก้จาก catalog entry 5 ทั้งสอง column มีอยู่และเหมือนกันโดยตั้งใจ policy ที่มี `qual` เต็มแต่ `with_check` **ว่างเปล่า** บน `for update`/`for all` คือรูปร่างที่ต้อง flag ตรง ๆ
+
+## `explain analyze` ภายใต้ JWT จริง -- policy ทำงานได้ดีด้วยหรือเปล่า?
+
+policy อาจถูกต้องสมบูรณ์แบบแล้วยังช้าอยู่ได้ -- `set request.jwt.claims` ข้างใน transaction จำลอง JWT ของผู้เรียกจริงสำหรับ `explain analyze` โดยไม่ต้องมี HTTP round trip จริง:
+
+```text
+begin;
+set local request.jwt.claims to '{"sub":"f8cd7f9e-6dd4-482a-888b-b92184c98d07","role":"authenticated"}';
+explain analyze select * from public.rd_posts_perf where user_id = auth.uid();          -- unwrapped
+-- Execution Time: 32.899 ms
+
+explain analyze select * from public.rd_posts_perf where user_id = (select auth.uid());  -- wrapped
+-- Execution Time: 3.296 ms
+commit;
+```
+
+ตัวเลขจริงเป๊ะที่พิสูจน์ไว้ใน catalog entry 6 -- `set local request.jwt.claims` **ต้อง** รันข้างใน `begin`/`commit` ชัดเจน (`SET LOCAL` นอก transaction block จะ revert เงียบ ๆ ก่อน statement ถัดไปจะรัน เป็นปัญหาจริงที่พบระหว่างสร้าง proof นี้เป๊ะ)
+
+## `supabase test db` (pgTAP) -- assertion จริง ที่ทำซ้ำได้ scope ตาม role
+
+ทุกอย่างข้างบนคือ query แบบครั้งเดียวด้วยมือ -- pgTAP เปลี่ยน check เดียวกันให้เป็น test suite จริงที่ทำซ้ำได้ รวมถึงการสลับ role กลาง test เพื่อยืนยันว่าผู้เรียกที่เจาะจง (ไม่ใช่แค่ `postgres`) เห็นอะไรจริง:
+
+```sql
+-- supabase/tests/database/rd_rls_test.sql
+begin;
+select plan(2);
+
+select ok(
+  (select count(*)::int from pg_policies where schemaname = 'public' and tablename = 'rd_posts') = 2,
+  'rd_posts has exactly 2 RLS policies (select + update)'
+);
+
+set local role anon;
+select is(
+  (select count(*)::int from public.rd_notes),
+  0,
+  'anon sees 0 rows on rd_notes -- RLS enabled, zero policies, silently empty'
+);
+
+select * from finish();
+rollback;
+```
+
+```text
+$ supabase test db
+tests/database/rd_rls_test.sql .. ok
+All tests successful.
+Files=1, Tests=2, 0 wallclock secs
+Result: PASS
+```
+
+TAP output จริงต่อ assertion (`ok 1 - ...`, `ok 2 - ...`) หาได้จากการรันไฟล์เดียวกันตรงผ่าน `psql -f`; `supabase test db` ห่อผลนั้นด้วยสรุป pass/fail ที่เหมาะกับ CI `pgtap` ไม่ได้ติดตั้งมา default บนโปรเจกต์ที่เพิ่ง `supabase init` -- ต้อง `create extension pgtap with schema extensions;` ก่อน
+
+## `supabase gen types` + `tsc` -- type เท่านั้น ไม่ใช่ schema สด
+
+ครอบคลุมเต็มใน catalog entry 3: `tsc --noEmit` กับไฟล์ `database.types.ts` เป็นปัจจุบันแค่เท่าที่ครั้งล่าสุดที่ไฟล์นั้นถูก regenerate การรันทั้งสองครั้งด้านล่างรายงาน `exit=0` -- ครั้งที่สองรันกับ database ที่มี column ถูก rename ไปแล้วโดยที่มันไม่รู้:
+
+```text
+$ tsc --noEmit -p tsconfig.json && echo exit=0     # type ตรงกับ schema จริง
+exit=0
+$ psql -c "alter table public.rd_widgets rename column qty to quantity;"
+$ tsc --noEmit -p tsconfig.json && echo exit=0     # type เดิมที่ยังไม่ regenerate, schema เปลี่ยนไปแล้ว
+exit=0
+$ curl "$API_URL/rest/v1/rd_widgets?select=id,qty" ...
+{"code":"42703","message":"column rd_widgets.qty does not exist"}
+```
+
+`tsc` ผ่านคือหลักฐานว่าโค้ดตรงกับ `database.types.ts` -- ไม่เคยเป็นหลักฐานว่า `database.types.ts` ตรงกับ database ตอนนี้ รัน `supabase gen types typescript --local` ซ้ำหลัง migration ที่แก้ชื่อ column ทุกครั้ง ก่อนจะเชื่อว่า `tsc` เขียวมีความหมายอะไร
+
+## `deno check` -- tool เดียวที่ verify import จริงของ edge function
+
+harness ของคอร์สนี้เองไม่เคยรัน `tsc` กับไฟล์ใต้ `supabase/functions/**/index.ts` เลย -- `tsc` กับ `deno check` resolve module ด้วยกติกาคนละชุดกันเลย มีแค่ตัวเดียวเท่านั้นที่ตรงกับสิ่งที่เกิดขึ้นจริงตอน `supabase functions serve`/deploy:
+
+```text
+$ curl "$FUNCTIONS_URL/rd-bare-import" -H "Authorization: Bearer $ANON_KEY" -H "apikey: $ANON_KEY"
+{"code":"BOOT_ERROR","message":"Worker failed to boot (please check logs)"}
+HTTP=503
+
+worker boot error: failed to bootstrap runtime: failed to create the graph:
+Relative import path "@supabase/supabase-js" not prefixed with / or ./ or ../
+```
+
+bare specifier แบบนี้ type-check ผ่านสบายภายใต้ `tsc` สไตล์ Node ธรรมดา (ไม่มีอะไรใน `tsc` เองที่รู้ว่าไฟล์นี้จะไปอยู่บน Deno) -- มีแค่ `deno check` หรือการ deploy จริงด้วย `supabase functions serve` เท่านั้นที่จับได้ ตรงกับ catalog entry 16 เป๊ะ
+
+## `curl` ด้วย `anon` เทียบ `service_role` -- การเทียบที่เผยช่องว่าง RLS ได้จริง
+
+วิธีที่เร็วที่สุดที่แยก "ยังไม่มีข้อมูล" ออกจาก "policy กำลังปฏิเสธทุกคนแบบเงียบ ๆ": ยิง request เดียวกันเป๊ะด้วยทั้งสอง key แล้ว diff ผลลัพธ์
+
+```text
+# anon key -- RLS บังคับใช้:
+$ curl "$API_URL/rest/v1/rd_secrets?select=*" -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY"
+[]
+HTTP=200
+
+# service_role key -- ข้าม RLS ทั้งหมด table เดียวกัน row เดียวกัน:
+$ curl "$API_URL/rest/v1/rd_secrets?select=*" -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY"
+[{"user_id":"f8cd7f9e-6dd4-482a-888b-b92184c98d07","secret":"alice-only-secret"}]
+HTTP=200
+```
+
+ถ้า `service_role` คืน row จริงและ `anon` คืน `[]` table นั้นมีข้อมูลและมีช่องว่าง policy -- ไม่ใช่ "ยังไม่มีข้อมูล" ตรงกับประเด็นของ catalog entry 25 เกี่ยวกับ key คู่นี้เป๊ะ
+
+## MCP server -- schema inspector จริง และความเสี่ยง superuser จริง
+
+`supabase start` print `MCP_URL` จริงที่ใช้งานได้ (`http://127.0.0.1:55321/mcp` บน stack นี้) -- endpoint แบบ JSON-RPC ที่ AI agent ที่รู้จัก MCP ตัวไหนก็ได้ (รวมถึงตัวนี้) เชื่อมต่อตรงได้ เปิดเผย tool อย่าง `list_tables`, `list_extensions`, `get_advisors`, และ `execute_sql`:
+
+```text
+$ curl -X POST "$MCP_URL" -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize", ...}'
+{"result":{"protocolVersion":"2024-11-05", ..., "serverInfo":{"name":"supabase", ...,"version":"0.11.0"}, ...}}
+
+$ curl -X POST "$MCP_URL" ... -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+tools: search_docs, list_tables, list_extensions, list_migrations, apply_migration,
+       execute_sql, query_logs, get_advisors, get_project_url, get_publishable_keys,
+       generate_typescript_types
+```
+
+อันตราย พิสูจน์ตรง ๆ แทนที่จะแค่กล่าวอ้าง -- `execute_sql` เรียกโดยไม่มี credential ของตัวเองเลยนอกจาก connection ของ MCP เอง:
+
+```text
+$ curl -X POST "$MCP_URL" ... -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"execute_sql","arguments":{"query":"select current_user, session_user, (select count(*) from public.rd_secrets) as rd_secrets_rows_visible;"}}}'
+[{"current_user":"postgres","session_user":"postgres","rd_secrets_rows_visible":1}]
+```
+
+`execute_sql` รันในฐานะ `postgres` -- database superuser จริง ที่ข้าม RLS เหมือนกับ `service_role` ทุกประการ -- ไม่ใช่ `anon` หรือ `authenticated` AI coding agent ที่เชื่อมต่อกับ MCP server นี้อ่าน (และเขียน) อะไรใน database ก็ได้โดยไม่สนใจ RLS เลย เหมือนความเสี่ยงของ `service_role` ใน catalog entry 25 เป๊ะ แค่ไปถึงผ่านประตูคนละบาน มีประโยชน์ในฐานะ schema inspector ระหว่างพัฒนาบนโปรเจกต์ในเครื่องหรือโปรเจกต์ที่ทิ้งได้ -- เป็นเหตุผลจริงที่ต้องคิดให้รอบคอบก่อนจะเอา MCP connection แบบนี้ไปชี้ที่ database production
+
+## Studio -- สำหรับการดูแบบ visual สำรวจ
+
+Studio (`http://127.0.0.1:55323` บน stack นี้ ยืนยันแล้วว่าเข้าถึงได้ -- `curl` คืน `307` redirect เข้าแอปจริง) คือ tool เดียวใน list นี้ที่ไม่ได้ตั้งใจให้ script -- Table Editor, ตัวแก้ policy ของ RLS (ที่เขียน SQL `create policy` เดียวกันเป๊ะกับที่โมดูลนี้แสดงตลอด แค่มาจากฟอร์ม), SQL Editor, และแผง Advisors มีไว้สำหรับการสำรวจด้วยมนุษย์ -- เห็น table ที่ไม่มี policy ได้ด้วยสายตาเดียว หรืออ่าน clause `using` ของ policy โดยไม่ต้องเขียน query `pg_policies` ข้างบนเอง มันเสริมมากกว่าแทนที่ทุก tool แบบ script ในหน้านี้
+
+## harness ของคอร์สนี้เอง -- ชั้นระดับ CI ที่อยู่ข้างใต้ทุกอย่าง
+
+`tools/verify-snippets.mjs` (อ่าน header comment ของไฟล์เองสำหรับ design เต็ม) คือคำตอบของคอร์สนี้ต่อคำถาม "ใครตรวจว่าทุกอย่างข้างบนเกิดขึ้นจริง ในทุกบท อัตโนมัติ" มีรายละเอียดที่ต้องระบุตรง ๆ อยู่บ้าง:
+
+- **local stack ที่แชร์กันตัวเดียว ไม่ใช่ตัวใหม่ต่อ test** ต่างจาก CI ทั่วไปที่ tear down แล้วสร้าง database ใหม่ต่อการรัน stack `tools/probe` ของ harness นี้ถูก start ครั้งเดียวแล้วนำมาใช้ซ้ำข้ามทุกโมดูลและทุก session การเขียนบท -- รวมถึงบทนี้ด้วย นั่นแหละคือเหตุผลที่ object SQL ทุกตัวใน catalog นี้อยู่ใต้ prefix `rd_`: ทางเลือกอื่น (object ของผู้เขียนแต่ละคนชนกันใน schema `public` ที่แชร์กัน) ไม่ใช่สมมติฐาน มันคือข้อจำกัดจริงที่ design นี้ทำงานรอบ ๆ มัน
+- **`npm run verify`** เก็บทุก fence `sql`/`ts`/`bash` ที่มี path comment จริงแล้วตรวจ: fence sql รันรวมกัน ตามลำดับในเอกสาร ข้างใน `BEGIN … ROLLBACK` (พิสูจน์ syntax กับ semantics โดยไม่ persist อะไรเลย); fence ts ใต้ `src/**` ผ่าน `tsc`, fence ts ใต้ `supabase/functions/**` ผ่าน `deno check`; fence bash ได้ `bash -n` (syntax เท่านั้น ไม่เคยถูกรันจริง)
+- **`--apply <module>/<lesson>`** ถอด wrapper `ROLLBACK` สำหรับ fence sql ของบทเฉพาะบทหนึ่ง -- `COMMIT` จริง และ fence migration จริงใด ๆ ถูก persist ไปที่ `tools/probe/supabase/migrations/` เพื่อให้ `supabase db reset` ครั้งถัดไป replay มันได้ นี่ทำลายล้างจริงถ้าชี้ไปที่บทผิด นั่นคือเหตุผลตรง ๆ ที่ harness scope มันไว้แค่บทเดียวต่อการเรียก
+- **`--run <module>/<lesson>`** `tsx`-execute fence ts ที่ติด `// @run` ของบทนั้นกับ stack ที่รันอยู่จริง -- โหมดเดียวที่พิสูจน์จริงว่า call ของ `supabase-js` ทำงานตามที่อ้าง ไม่ใช่แค่ type-check ผ่าน
+- **สิ่งที่มันทำไม่ได้:** ไม่มีโหมดไหนในนี้แทนที่มนุษย์ที่ใช้ **[Review Checklist](/supabase/th/reading-supabase/review-checklist/)** ได้ -- `verify` พิสูจน์ว่า fence ถูกต้องตาม syntax และ (สำหรับ fence `--run`) ถูกต้องตามพฤติกรรมแบบแยกส่วน มันไม่รู้ว่า `using(true)` ของ policy คือบั๊กความปลอดภัย รู้แค่ว่ามันเป็น SQL ที่ valid
+
+## Mental Model
+
+```text
+The verification ladder, roughly cheapest/narrowest to most expensive/broadest:
+
+supabase db lint        -> plpgsql type errors only, NOT RLS/security (common misconception)
+RLS-coverage query        -> which tables/commands have zero policies, in one query
+pg_policies              -> read using/with check directly, don't guess from behavior
+explain analyze + JWT    -> does the (correct) policy also perform?
+supabase test db (pgTAP) -> the same checks, repeatable, role-scoped, CI-ready
+gen types + tsc          -> types only, only as current as the last regeneration
+deno check                -> the ONLY tool that validates an edge function's real imports
+curl anon vs service_role -> the fastest real/no-data-yet vs RLS-gap distinguisher
+MCP server                -> a real schema inspector, and a real postgres-superuser risk
+Studio                    -> the human, exploratory pass -- not scripted, not replaced by one
+this course's harness     -> ties every fence above to a real, shared, CI-grade local stack
+
+No single tool on this ladder covers more than a few of the AI Bug Catalog's 27 entries --
+reading the catalog's own "how to spot it in review" line per entry is what tells you
+which rung actually catches a specific pattern.
+```
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"`supabase db lint` จับช่องว่าง RLS ได้"** พิสูจน์แล้วว่าไม่จริง: รันกับ schema ในเครื่องนี้เป๊ะ ที่มีบั๊กของ catalog entry 4/5/8 อยู่จริง มันรายงาน `"No schema errors found"` -- มันคือ type-checker ของ `plpgsql` ไม่ใช่ linter ของความปลอดภัยหรือ RLS
+- **"ถ้า `explain analyze` ดูโอเคโดยไม่ต้องตั้ง JWT policy ก็ทำงานได้ดีสำหรับ user จริงเหมือนกัน"** `auth.uid()` อ่าน `request.jwt.claims` ซึ่งว่างเปล่าสำหรับ session `psql` ธรรมดาที่ไม่มี `set request.jwt.claims` -- ต้นทุนต่อ row จริงของ policy `auth.uid()` ที่ไม่ wrap มองไม่เห็นเลยเว้นแต่จะมี identity ของผู้เรียกจริง (หรือจำลองผ่าน `set local request.jwt.claims`) อยู่ใน session
+- **"MCP server เป็นแค่ inspector แบบอ่านอย่างเดียว"** `execute_sql` รัน SQL อะไรก็ได้จริงในฐานะ `postgres` -- พิสูจน์ตรง ๆ ข้างบน ความเสี่ยง superuser/RLS-bypass เดียวกันเป๊ะกับ `service_role` key ที่รั่วไหล ไปถึงผ่าน connection คนละแบบเลย
+- **"harness ของคอร์สนี้พิสูจน์ว่าบทถูกต้อง"** มันพิสูจน์ว่า fence ถูกต้องตาม syntax และ (สำหรับ fence `--run`) ทำงานตามที่อ้างแบบแยกส่วน -- มันไม่มีความเห็นว่า `using (true)` เป็นความคิดที่ดีหรือไม่ นั่นคือสิ่งที่ **[Review Checklist](/supabase/th/reading-supabase/review-checklist/)** มีไว้เพื่อสิ่งนั้นโดยเฉพาะ
+
+<Callout title="สรุปในบรรทัดเดียว">
+ไม่มี tool ไหนในหน้านี้ validate เจตนาเลย -- `db lint` เช็ค type ของ plpgsql, `pg_policies`/coverage query เช็คว่า policy อะไรมีอยู่ (ไม่ใช่ว่ามันถูกต้องหรือไม่), `explain analyze` เช็ค performance, `tsc`/`deno check` เช็ค type กับ import และ MCP server คือ schema inspector จริงที่มีความเสี่ยง superuser จริงติดมาด้วย -- การอ่านบรรทัด "วิธีสังเกตตอน review" ของแต่ละ entry ใน AI Bug Catalog เองต่างหากที่บอกว่าบั๊กไหนแมปกับ tool ไหน (ถ้ามี) ที่จะจับมันได้
+</Callout>
+
+export const quizVerificationTools = [
+  {
+    q: "```text\n$ supabase db lint --level warning\n{\"results\":[],\"message\":\"db lint\"}\n```\nจาก output จริงนี้ที่จับได้ในขณะที่บั๊กของ catalog entry 8 (RLS เปิดแล้วไม่มี policy บน rd_notes) มีอยู่จริงบน database เดียวกัน มันพิสูจน์อะไรเกี่ยวกับสิ่งที่ supabase db lint ตรวจจริง ๆ?",
+    options: [
+      "That the RLS bug was already fixed before this ran",
+      "That supabase db lint is a plpgsql type-checker, not an RLS or security advisor -- it returned zero results despite a real, live, silently-empty-table bug being present on the exact schema it just linted",
+      "That db lint only works on tables with the rd_ prefix",
+      "That the tool is broken",
+    ],
+    answer: 1,
+    explain: "ยืนยันโดย --help text ของมันเอง (\"Checks local database for typing error\") และโดยคำเตือนจริงแยกต่างหากที่มันสร้างขึ้นจริงสำหรับ type mismatch ของ plpgsql จริง -- มัน scope ไว้กับบั๊กคนละประเภทที่แคบกว่า RLS coverage ทั้งหมด",
+  },
+  {
+    q: "ทำไม proof ของ explain analyze ถึงต้อง wrap `set local request.jwt.claims` ไว้ข้างใน `begin`/`commit` ชัดเจน แทนที่จะรันเป็น statement เดี่ยว ๆ?",
+    options: [
+      "It doesn't matter, SET LOCAL works identically either way",
+      "SET LOCAL outside a transaction block silently reverts before the next statement runs (psql reports a real warning: \"SET LOCAL can only be used in transaction blocks\") -- without begin/commit, the following explain analyze runs with auth.uid() reading an empty claims setting, producing a misleading 0-row result instead of the real comparison",
+      "begin/commit is required by explain analyze specifically, unrelated to SET LOCAL",
+      "This is only a requirement in Deno, not plain psql",
+    ],
+    answer: 1,
+    explain: "ปัญหาจริงที่พบระหว่างสร้าง proof นี้เป๊ะ: SET LOCAL ที่รันเป็น implicit transaction ของตัวเองนอก BEGIN ชัดเจนจะ revert ก่อนที่ statement ถัดไปจะรัน ทำให้ได้ rows=0 แบบเข้าใจผิดทั้งสอง filter (wrap และไม่ wrap) แทนที่จะเป็นความต่างของเวลาจริง 32.9ms เทียบ 3.3ms",
+  },
+  {
+    q: "```text\n[{\"current_user\":\"postgres\",\"session_user\":\"postgres\",\"rd_secrets_rows_visible\":1}]\n```\nจากผลลัพธ์จริงของ tool `execute_sql` ของ MCP server ที่เรียกกับ table ที่มี row เดียวถูก scope ด้วย RLS ให้ user เฉพาะคนหนึ่ง มันพิสูจน์อะไร?",
+    options: [
+      "That the MCP server correctly enforces RLS for whichever user is connected",
+      "That execute_sql runs as postgres, the real database superuser, which bypasses Row Level Security exactly like service_role does -- an AI agent connected to this MCP server can read (and write) any row regardless of RLS policy",
+      "That rd_secrets has no RLS policy at all",
+      "That the MCP server requires a service_role key to connect",
+    ],
+    answer: 1,
+    explain: "พิสูจน์ตรง ๆ: current_user กับ session_user ทั้งคู่รายงาน postgres และจำนวน row ตรงกับยอดจริง (1) ไม่ใช่จำนวนที่ถูกกรองด้วย RLS ที่ผู้เรียกแบบ anon หรือ authenticated จะเห็น (0) -- ระดับสิทธิ์ของ execute_sql คือการข้าม superuser เดียวกันกับที่ service_role ให้ แค่ไปถึงผ่าน MCP connection แทนที่จะเป็น API key",
+  },
+  {
+    q: "ทำไมบทนี้ถึงบอกว่าการที่ harness ของคอร์สนี้พิสูจน์ว่า fence ถูกต้อง ไม่ใช่สิ่งเดียวกับ fence นั้นเป็นความคิดที่ดี?",
+    options: [
+      "The harness has bugs that make its results unreliable",
+      "verify/--run prove a fence is syntactically valid and, for @run fences, behaves as claimed in isolation -- they have no opinion on whether e.g. a using(true) policy is a security bug, since it is perfectly valid SQL that runs exactly as written",
+      "The harness only checks TypeScript, never SQL",
+      "This course's harness does not actually run against the real stack",
+    ],
+    answer: 1,
+    explain: "ระบุตรง ๆ: policy update แบบ using(true) ที่ไม่มี with check คือ SQL ที่ถูกต้องตามไวยากรณ์เป๊ะ ที่ check โหมด rollback ของ harness นี้จะผ่านสะอาด -- นี่คือช่องว่างประเภทที่ Review Checklist ออกแบบมาให้จับ ไม่ใช่ harness",
+  },
+  {
+    q: "ทำไม harness ของคอร์สนี้ถึงใช้ local stack ที่แชร์กันตัวเดียวซ้ำข้ามทุก session การเขียนบท แทนที่จะเป็น database ใหม่ต่อ test และมันสร้างข้อจำกัดจริงอะไรบ้าง?",
+    options: [
+      "A fresh stack per test would be strictly better with no downside",
+      "A fresh-per-test stack was ruled out for cost/speed reasons, and reusing one shared stack across every author means every SQL object must live under a unique namespace prefix (rd_ for this module) to avoid colliding with objects other lessons or modules already created on the same database",
+      "Supabase CLI does not support tearing down and recreating a local stack",
+      "The shared stack has no real consequence for how lessons are authored",
+    ],
+    answer: 1,
+    explain: "ระบุตรง ๆ ในบทนี้: object SQL ทุกตัวใน AI Bug Catalog อยู่ใต้ prefix rd_ เพราะข้อจำกัดนี้โดยเฉพาะ -- ยืนยันสดด้วย RLS-coverage query ข้างบนที่ต้อง filter ด้วย relname like 'rd_%' เพื่อไม่ให้แสดง table ที่ไม่เกี่ยวข้องของโมดูลอื่นบน database ที่แชร์กันเดียวกันนี้ด้วย",
+  },
+];
+
+<Quiz client:visible id="reading-supabase/verification-tools" questions={quizVerificationTools} />
+
+<ProgressTracker client:visible id="reading-supabase/verification-tools" />

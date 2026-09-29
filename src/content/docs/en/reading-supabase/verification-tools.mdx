@@ -1,0 +1,328 @@
+---
+title: Verification tools
+description: 'What supabase db lint, the RLS-coverage query, pg_policies, explain analyze under a real JWT, supabase test db (pgTAP), supabase gen types + tsc, deno check, curl with anon vs service keys, the MCP server, Studio, and this course''s own harness each actually prove — with real output.'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+None of the tools below overlap perfectly, and none is close to complete on its own — the **[AI Bug Catalog](/supabase/en/reading-supabase/ai-bug-catalog/)**'s "how to spot it in review" line for each of its 27 entries names exactly which of the tools below (if any) would have caught it, and most of them name none at the point the bug is introduced. Every output below is real, freshly captured for this module against this course's own shared local stack and this module's own `rd_` namespace.
+
+<Mermaid title="Which layer each tool actually checks" code={toolLadderDiagram} />
+
+export const toolLadderDiagram = `flowchart TD
+  A["supabase db lint<br/>plpgsql type-checking, NOT RLS/security advisories"] --> B["RLS-coverage query + pg_policies<br/>which tables/commands actually have a policy"]
+  B --> C["explain analyze under a real JWT<br/>does the policy also perform?"]
+  C --> D["supabase test db (pgTAP)<br/>a real, repeatable, role-scoped assertion"]
+  D --> E["supabase gen types + tsc / deno check<br/>types and module resolution, never intent"]
+  E --> F["curl anon vs service_role<br/>the one comparison that actually reveals an RLS gap"]
+  F --> G["MCP server<br/>a real schema inspector -- and a real superuser risk"]
+  G --> H["Studio + this course's harness<br/>visual inspection, and CI-grade fence verification"]
+`;
+
+## `supabase db lint` — plpgsql type-checking, not an RLS or security advisor
+
+The single most common misconception about this tool: its name suggests it catches RLS gaps, unindexed policy columns, or missing `search_path` — it does not. Per its own `--help` text, it "checks local database for typing error[s]" — specifically, type mismatches inside `plpgsql` function bodies that Postgres itself does not validate at `create function` time (a function body is only parsed and type-checked the first time it actually runs, unless a tool like this one does it ahead of time).
+
+```text
+$ psql -c "create or replace function public.rd_lint_demo()
+returns text language plpgsql as \$\$
+declare v integer;
+begin
+  select display_name into v from public.rd_profiles limit 1;  -- text into integer
+  return v;
+end;
+\$\$;"
+CREATE FUNCTION
+
+$ supabase db lint --level warning
+Linting schema: extensions
+Linting schema: public
+{"results":[{"function":"public.rd_lint_demo","issues":[{"level":"warning","message":"target type is different type than source type","statement":{"lineNumber":"4"},"query":{"text":"select display_name from public.rd_profiles limit 1"},"hint":"The input expression type does not have an assignment cast to the target type.","detail":"cast \"text\" value to \"integer\" type","sqlState":"42804"}]}],"message":"db lint"}
+```
+
+A real, specific `42804` type-mismatch warning, caught **before** the function was ever called — this is genuinely useful, just for a narrower class of bug than "lint" implies. None of catalog entries 4–8 (the RLS group) trigger anything here; `db lint` against this exact local schema, with every one of this catalog's RLS bugs live on it at various points, returned `"No schema errors found"` every time — RLS gaps need the next two tools instead.
+
+## The RLS-coverage query — which tables actually have a policy for which command
+
+The single query that catches catalog entries 4 and 8 directly: cross-reference `pg_class.relrowsecurity` against `pg_policies`, per table.
+
+```text
+select c.relname as table_name, c.relrowsecurity as rls_enabled, count(p.policyname) as policy_count
+from pg_class c
+join pg_namespace n on n.oid = c.relnamespace
+left join pg_policies p on p.schemaname = n.nspname and p.tablename = c.relname
+where n.nspname = 'public' and c.relkind = 'r' and c.relname like 'rd_%'
+group by c.relname, c.relrowsecurity
+order by 1;
+
+  table_name   | rls_enabled | policy_count
+---------------+-------------+--------------
+ rd_notes      | t           |            0   <- RLS on, ZERO policies: entry 8's exact bug
+ rd_posts      | t           |            2
+ rd_posts_perf | f           |            0   <- RLS never enabled at all on this table
+ rd_profiles   | f           |            0
+ rd_rt_items   | t           |            2
+ rd_secrets    | t           |            1
+ rd_settings   | f           |            0
+ rd_widgets    | f           |            0
+```
+
+One query, two distinct real findings on this module's own namespace: `rd_notes` has RLS enabled with zero policies (the exact, live, silently-empty-table state from catalog entry 8), and four other tables never had RLS enabled at all — a separate audit question ("should this table have RLS?") this same query surfaces for free.
+
+## `pg_policies` — reading `using`/`with check` directly, not guessing from behavior
+
+Once a table is confirmed to have policies, read what they actually say — `qual` is the `using` expression, `with_check` is exactly what it says, and an empty `with_check` on an `update`/`all` policy is the live signal for catalog entry 5's hijack:
+
+```text
+select tablename, policyname, cmd, qual, with_check from pg_policies
+where schemaname='public' and tablename like 'rd_%' order by 1,2;
+
+  tablename  |     policyname     |  cmd   |                  qual                   |               with_check
+-------------+--------------------+--------+-----------------------------------------+-----------------------------------------
+ rd_posts    | rd_posts_select    | SELECT | true                                    |
+ rd_posts    | rd_posts_update    | UPDATE | (user_id = ( SELECT auth.uid() AS uid)) | (user_id = ( SELECT auth.uid() AS uid))
+ rd_rt_items | rd_rt_items_insert | INSERT |                                         | true
+ rd_rt_items | rd_rt_items_select | SELECT | true                                    |
+ rd_secrets  | rd_secrets_select  | SELECT | (user_id = ( SELECT auth.uid() AS uid)) |
+```
+
+`rd_posts_update`'s `with_check` visibly mirrors its `qual` — the fixed version from catalog entry 5, both columns present and identical on purpose. A policy with a populated `qual` and a **blank** `with_check` on `for update`/`for all` is the exact shape to flag.
+
+## `explain analyze` under a real JWT — does the policy also perform?
+
+A policy can be perfectly correct and still slow — `set request.jwt.claims` inside a transaction simulates a real caller's JWT for `explain analyze`, without needing an actual HTTP round trip:
+
+```text
+begin;
+set local request.jwt.claims to '{"sub":"f8cd7f9e-6dd4-482a-888b-b92184c98d07","role":"authenticated"}';
+explain analyze select * from public.rd_posts_perf where user_id = auth.uid();          -- unwrapped
+-- Execution Time: 32.899 ms
+
+explain analyze select * from public.rd_posts_perf where user_id = (select auth.uid());  -- wrapped
+-- Execution Time: 3.296 ms
+commit;
+```
+
+The exact same real numbers proven in catalog entry 6 — `set local request.jwt.claims` **must** run inside an explicit `begin`/`commit` (`SET LOCAL` outside a transaction block silently reverts before the next statement runs, a real gotcha discovered while building this exact proof).
+
+## `supabase test db` (pgTAP) — a real, repeatable, role-scoped assertion
+
+Everything above is a manual, one-off query — pgTAP turns the same checks into a real, repeatable test suite, including switching role mid-test to assert what a specific caller (not just `postgres`) actually sees:
+
+```sql
+-- supabase/tests/database/rd_rls_test.sql
+begin;
+select plan(2);
+
+select ok(
+  (select count(*)::int from pg_policies where schemaname = 'public' and tablename = 'rd_posts') = 2,
+  'rd_posts has exactly 2 RLS policies (select + update)'
+);
+
+set local role anon;
+select is(
+  (select count(*)::int from public.rd_notes),
+  0,
+  'anon sees 0 rows on rd_notes -- RLS enabled, zero policies, silently empty'
+);
+
+select * from finish();
+rollback;
+```
+
+```text
+$ supabase test db
+tests/database/rd_rls_test.sql .. ok
+All tests successful.
+Files=1, Tests=2, 0 wallclock secs
+Result: PASS
+```
+
+Real, per-assertion TAP output (`ok 1 - ...`, `ok 2 - ...`) is available by running the same file directly through `psql -f`; `supabase test db` wraps that in a pass/fail summary suited for CI. `pgtap` is not installed by default on a fresh `supabase init` project — `create extension pgtap with schema extensions;` first.
+
+## `supabase gen types` + `tsc` — types, not the live schema
+
+Covered in full in catalog entry 3: `tsc --noEmit` against a `database.types.ts` file is only as current as the last time that file was regenerated. Both runs below report `exit=0` — the second one is against a database that had already had a column renamed out from under it:
+
+```text
+$ tsc --noEmit -p tsconfig.json && echo exit=0     # types match the live schema
+exit=0
+$ psql -c "alter table public.rd_widgets rename column qty to quantity;"
+$ tsc --noEmit -p tsconfig.json && echo exit=0     # SAME stale types, schema already changed
+exit=0
+$ curl "$API_URL/rest/v1/rd_widgets?select=id,qty" ...
+{"code":"42703","message":"column rd_widgets.qty does not exist"}
+```
+
+`tsc` passing is evidence the code matches `database.types.ts` — never evidence `database.types.ts` matches the database right now. Re-run `supabase gen types typescript --local` after every migration that touches a column name, before trusting a green `tsc` run means anything.
+
+## `deno check` — the only tool that actually validates an edge function's imports
+
+This course's own harness never runs `tsc` against a file under `supabase/functions/**/index.ts` at all — `tsc` and `deno check` resolve modules under completely different rules, and only one of them matches what actually happens at `supabase functions serve`/deploy time:
+
+```text
+$ curl "$FUNCTIONS_URL/rd-bare-import" -H "Authorization: Bearer $ANON_KEY" -H "apikey: $ANON_KEY"
+{"code":"BOOT_ERROR","message":"Worker failed to boot (please check logs)"}
+HTTP=503
+
+worker boot error: failed to bootstrap runtime: failed to create the graph:
+Relative import path "@supabase/supabase-js" not prefixed with / or ./ or ../
+```
+
+A bare specifier like this type-checks fine under a plain, Node-oriented `tsc` pass (nothing about `tsc` alone knows this file is destined for Deno) — only `deno check`, or an actual `supabase functions serve` deploy, catches it, matching catalog entry 16 exactly.
+
+## `curl` with `anon` vs `service_role` — the one comparison that actually reveals an RLS gap
+
+The single fastest way to tell "no data yet" from "a policy is silently denying everyone": run the identical request with both keys and diff the result.
+
+```text
+# anon key -- RLS enforced:
+$ curl "$API_URL/rest/v1/rd_secrets?select=*" -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY"
+[]
+HTTP=200
+
+# service_role key -- bypasses RLS entirely, same table, same row:
+$ curl "$API_URL/rest/v1/rd_secrets?select=*" -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY"
+[{"user_id":"f8cd7f9e-6dd4-482a-888b-b92184c98d07","secret":"alice-only-secret"}]
+HTTP=200
+```
+
+If `service_role` returns real rows and `anon` returns `[]`, the table has data and a policy gap — not "no data yet." Matches catalog entry 25's own point about this exact key pair directly.
+
+## The MCP server — a real schema inspector, and a real superuser risk
+
+`supabase start` prints a real, live `MCP_URL` (`http://127.0.0.1:55321/mcp` on this stack) — a JSON-RPC endpoint any MCP-aware AI agent (this one included) can connect to directly, exposing tools like `list_tables`, `list_extensions`, `get_advisors`, and `execute_sql`:
+
+```text
+$ curl -X POST "$MCP_URL" -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize", ...}'
+{"result":{"protocolVersion":"2024-11-05", ..., "serverInfo":{"name":"supabase", ...,"version":"0.11.0"}, ...}}
+
+$ curl -X POST "$MCP_URL" ... -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+tools: search_docs, list_tables, list_extensions, list_migrations, apply_migration,
+       execute_sql, query_logs, get_advisors, get_project_url, get_publishable_keys,
+       generate_typescript_types
+```
+
+The danger, proven directly rather than just asserted — `execute_sql`, called with no credentials of its own beyond the MCP connection itself:
+
+```text
+$ curl -X POST "$MCP_URL" ... -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"execute_sql","arguments":{"query":"select current_user, session_user, (select count(*) from public.rd_secrets) as rd_secrets_rows_visible;"}}}'
+[{"current_user":"postgres","session_user":"postgres","rd_secrets_rows_visible":1}]
+```
+
+`execute_sql` runs as `postgres` — the real database superuser, which bypasses RLS exactly like `service_role` does — not as `anon` or `authenticated`. An AI coding agent connected to this MCP server can read (and write) anything in the database, RLS notwithstanding, exactly like catalog entry 25's `service_role` risk, just reached through a different door. Useful as a schema inspector during development on a local or disposable project; a real reason to think carefully before pointing an MCP connection like this at a production database.
+
+## Studio — for the visual, exploratory pass
+
+Studio (`http://127.0.0.1:55323` on this stack, confirmed reachable — `curl` returns a real `307` redirect into the app) is the one tool in this list not meant to be scripted: the Table Editor, the RLS policy editor (which writes the exact same `create policy` SQL shown throughout this module, just from a form), the SQL Editor, and the Advisors panel are for a human's exploratory pass — spotting a table with no policies at a glance, or reading a policy's `using` clause without hand-writing the `pg_policies` query above. It complements, rather than replaces, every scripted tool on this page.
+
+## This course's own harness — the CI-grade layer underneath all of it
+
+`tools/verify-snippets.mjs` (read the file's own header comment for the full design) is this course's answer to "who checks all of the above happened, on every lesson, automatically." A few honest specifics worth stating plainly:
+
+- **One shared local stack, not a fresh one per test.** Unlike a typical CI setup that tears down and rebuilds a database per run, this harness's `tools/probe` stack is started once and reused across every module and every lesson-writing session — including this one. That is exactly why every SQL object in this catalog lives under the `rd_` prefix: the alternative (every author's objects colliding in a shared `public` schema) is not hypothetical, it is the actual constraint this design works around.
+- **`npm run verify`** collects every `sql`/`ts`/`bash` fence with a real path comment and checks it: sql fences run together, in document order, inside `BEGIN … ROLLBACK` (proves syntax and semantics without persisting anything); ts fences under `src/**` go through `tsc`, ts fences under `supabase/functions/**` go through `deno check`; bash fences get `bash -n` (syntax only, never executed).
+- **`--apply <module>/<lesson>`** drops the `ROLLBACK` wrapper for one specific lesson's sql fences — a real `COMMIT`, and any real migration fence is persisted to `tools/probe/supabase/migrations/` so a later `supabase db reset` replays it. This is genuinely destructive if pointed at the wrong lesson, which is exactly why the harness scopes it to one lesson per invocation.
+- **`--run <module>/<lesson>`** `tsx`-executes that lesson's `// @run`-tagged ts fences against the live stack for real — the only mode that actually proves a `supabase-js` call behaves as claimed, as opposed to merely type-checking.
+- **What it cannot do:** none of these modes replace a human applying the **[Review Checklist](/supabase/en/reading-supabase/review-checklist/)** — `verify` proves a fence is syntactically and (for `--run` fences) behaviorally correct in isolation; it does not know that a policy's `using(true)` is a security bug, only that it is valid SQL.
+
+## Mental Model
+
+```text
+The verification ladder, roughly cheapest/narrowest to most expensive/broadest:
+
+supabase db lint        -> plpgsql type errors only, NOT RLS/security (common misconception)
+RLS-coverage query        -> which tables/commands have zero policies, in one query
+pg_policies              -> read using/with check directly, don't guess from behavior
+explain analyze + JWT    -> does the (correct) policy also perform?
+supabase test db (pgTAP) -> the same checks, repeatable, role-scoped, CI-ready
+gen types + tsc          -> types only, only as current as the last regeneration
+deno check                -> the ONLY tool that validates an edge function's real imports
+curl anon vs service_role -> the fastest real/no-data-yet vs RLS-gap distinguisher
+MCP server                -> a real schema inspector, and a real postgres-superuser risk
+Studio                    -> the human, exploratory pass -- not scripted, not replaced by one
+this course's harness     -> ties every fence above to a real, shared, CI-grade local stack
+
+No single tool on this ladder covers more than a few of the AI Bug Catalog's 27 entries --
+reading the catalog's own "how to spot it in review" line per entry is what tells you
+which rung actually catches a specific pattern.
+```
+
+## Common Misconceptions
+
+- **"`supabase db lint` catches RLS gaps."** Disproven directly: run against this exact local schema, with catalog entries 4/5/8's bugs live on it, it reported `"No schema errors found"` — it is a `plpgsql` type-checker, not a security or RLS linter.
+- **"If `explain analyze` looks fine without setting a JWT, the policy performs fine for real users too."** `auth.uid()` reads `request.jwt.claims`, which is empty for a plain `psql` session with no `set request.jwt.claims` — an unwrapped `auth.uid()` policy's real per-row cost is invisible unless a real (or simulated, via `set local request.jwt.claims`) caller identity is present in the session.
+- **"The MCP server is just a read-only inspector."** `execute_sql` genuinely executes arbitrary SQL as `postgres` — proven directly above, the identical superuser/RLS-bypass risk as a leaked `service_role` key, reached through a different connection entirely.
+- **"This course's harness proves a lesson is correct."** It proves a fence is syntactically valid and (for `--run` fences) behaves as claimed in isolation — it has no opinion on whether `using (true)` is a good idea. That judgment is exactly what the **[Review Checklist](/supabase/en/reading-supabase/review-checklist/)** is for.
+
+<Callout title="The one-line takeaway">
+No single tool on this page validates intent — `db lint` checks plpgsql types, `pg_policies`/the coverage query check which policies exist (not whether they're right), `explain analyze` checks performance, `tsc`/`deno check` check types and imports, and the MCP server is a real schema inspector with a real superuser risk attached — reading the AI Bug Catalog's own "how to spot it in review" line per entry is what actually maps a bug to the tool (if any) that would have caught it.
+</Callout>
+
+export const quizVerificationTools = [
+  {
+    q: "```text\n$ supabase db lint --level warning\n{\"results\":[],\"message\":\"db lint\"}\n```\nGiven this real output was captured while catalog entry 8's exact bug (RLS enabled, zero policies on rd_notes) was live on the same database, what does this prove about what supabase db lint actually checks?",
+    options: [
+      "That the RLS bug was already fixed before this ran",
+      "That supabase db lint is a plpgsql type-checker, not an RLS or security advisor -- it returned zero results despite a real, live, silently-empty-table bug being present on the exact schema it just linted",
+      "That db lint only works on tables with the rd_ prefix",
+      "That the tool is broken",
+    ],
+    answer: 1,
+    explain: "Confirmed by its own --help text (\"Checks local database for typing error\") and by a separate, real captured warning it DID produce for a genuine plpgsql type mismatch -- it is scoped to a different, narrower class of bug than RLS coverage entirely.",
+  },
+  {
+    q: "Why does the explain analyze proof require wrapping `set local request.jwt.claims` inside an explicit `begin`/`commit`, rather than running it as a standalone statement?",
+    options: [
+      "It doesn't matter, SET LOCAL works identically either way",
+      "SET LOCAL outside a transaction block silently reverts before the next statement runs (psql reports a real warning: \"SET LOCAL can only be used in transaction blocks\") -- without begin/commit, the following explain analyze runs with auth.uid() reading an empty claims setting, producing a misleading 0-row result instead of the real comparison",
+      "begin/commit is required by explain analyze specifically, unrelated to SET LOCAL",
+      "This is only a requirement in Deno, not plain psql",
+    ],
+    answer: 1,
+    explain: "A real gotcha discovered while building this exact proof: SET LOCAL run as its own implicit transaction outside an explicit BEGIN reverts by the time the next statement runs, silently producing rows=0 for both the wrapped and unwrapped filter instead of the real 32.9ms vs 3.3ms timing difference.",
+  },
+  {
+    q: "```text\n[{\"current_user\":\"postgres\",\"session_user\":\"postgres\",\"rd_secrets_rows_visible\":1}]\n```\nGiven this real result from the MCP server's execute_sql tool, called against a table whose only row is RLS-scoped to one specific user, what does it prove?",
+    options: [
+      "That the MCP server correctly enforces RLS for whichever user is connected",
+      "That execute_sql runs as postgres, the real database superuser, which bypasses Row Level Security exactly like service_role does -- an AI agent connected to this MCP server can read (and write) any row regardless of RLS policy",
+      "That rd_secrets has no RLS policy at all",
+      "That the MCP server requires a service_role key to connect",
+    ],
+    answer: 1,
+    explain: "Proved directly: current_user and session_user both report postgres, and the row count matches the REAL total (1), not the RLS-filtered count an anon or authenticated caller would see (0) -- execute_sql's privilege level is the same superuser bypass service_role provides, reached through the MCP connection instead of an API key.",
+  },
+  {
+    q: "Why does this lesson say this course's harness proving a fence is correct is not the same as the fence being a GOOD idea?",
+    options: [
+      "The harness has bugs that make its results unreliable",
+      "verify/--run prove a fence is syntactically valid and, for @run fences, behaves as claimed in isolation -- they have no opinion on whether e.g. a using(true) policy is a security bug, since it is perfectly valid SQL that runs exactly as written",
+      "The harness only checks TypeScript, never SQL",
+      "This course's harness does not actually run against the real stack",
+    ],
+    answer: 1,
+    explain: "Stated directly: a using(true) update policy with no with check is syntactically perfect SQL that this harness's rollback-mode check would pass cleanly -- exactly the kind of gap the Review Checklist, not the harness, is designed to catch.",
+  },
+  {
+    q: "Why does this course's harness reuse ONE shared local stack across every lesson-writing session instead of a fresh database per test, and what real constraint does that create?",
+    options: [
+      "A fresh stack per test would be strictly better with no downside",
+      "A fresh-per-test stack was ruled out for cost/speed reasons, and reusing one shared stack across every author means every SQL object must live under a unique namespace prefix (rd_ for this module) to avoid colliding with objects other lessons or modules already created on the same database",
+      "Supabase CLI does not support tearing down and recreating a local stack",
+      "The shared stack has no real consequence for how lessons are authored",
+    ],
+    answer: 1,
+    explain: "Stated directly in this lesson: every SQL object in the AI Bug Catalog lives under the rd_ prefix specifically because of this constraint -- confirmed live by the RLS-coverage query above, which had to filter to relname like 'rd_%' to avoid also listing other modules' unrelated tables on the same shared database.",
+  },
+];
+
+<Quiz client:visible id="reading-supabase/verification-tools" questions={quizVerificationTools} />
+
+<ProgressTracker client:visible id="reading-supabase/verification-tools" />
