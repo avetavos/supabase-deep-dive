@@ -1,6 +1,6 @@
 ---
 title: 'Storage: Buckets and Policies'
-description: 'Supabase Storage จัดไฟล์เข้า bucket แบบ public และ private ยังไง และ access ของทุก object จริง ๆ แล้วถูกบังคับด้วย Row Level Security policy บน table storage.objects'
+description: 'Supabase Storage จัดระเบียบไฟล์เป็น public/private bucket ได้อย่างไร storage.objects RLS บังคับการเข้าถึงจริงอย่างไร resumable TUS upload, signed URL, และข้อจำกัดไฟล์กับ upsert semantics'
 sidebar:
   order: 3
 ---
@@ -8,123 +8,484 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
-## ไอเดียในหนึ่งประโยค
+## แนวคิดในประโยคเดียว
 
-Supabase Storage คือ object storage แบบ S3-compatible จัดเป็น **bucket** และ access ของทุก object ถูกบังคับด้วย **Row Level Security** policy ธรรมดาบน table Postgres — mechanism เดียวกับที่คุณรู้จักแล้วจาก module RLS ไม่ใช่ระบบสิทธิ์แยกต่างหากอีกชุด
+Supabase Storage คือ object storage แบบ S3-compatible ที่จัดระเบียบเป็น **bucket** และการเข้าถึงทุกอ็อบเจกต์ถูกบังคับโดย **Row Level Security** policy ธรรมดาบนตาราง Postgres — กลไกเดียวกับที่คุณรู้จักอยู่แล้วจากโมดูล RLS ไม่ใช่ระบบสิทธิ์แยกต่างหาก
 
-## Bucket: container แบบ public และ private
+## Bucket: public กับ private สร้างผ่าน SQL หรือ API
 
-**bucket** คือ container ระดับบนสุดสำหรับไฟล์ คล้าย S3 bucket เช่นคุณอาจมี bucket `avatars` สำหรับรูปโปรไฟล์ และ bucket `public-assets` สำหรับรูป marketing bucket หนึ่งตั้งเป็น **public** ได้ หมายความว่าใครก็ตามที่มี URL ของ object อ่านได้เลยโดยไม่ต้อง authenticate หรือตั้งเป็น **private** หมายความว่า access ถูกเช็คทุก request
+**bucket** คือ container ระดับบนสุดสำหรับไฟล์ คล้าย S3 bucket bucket หนึ่งตั้งเป็น **public** ได้ หมายความว่าใครก็ตามที่มี URL ของอ็อบเจกต์นั้นอ่านได้โดยไม่ต้อง authenticate หรือตั้งเป็น **private** หมายความว่าการเข้าถึงถูกเช็คต่อ request bucket ก็แค่แถวหนึ่งใน `storage.buckets` ดังนั้นสร้างได้ทั้งด้วย SQL ตรง ๆ หรือผ่าน `supabase-js`:
 
-การ upload, download และอ่านไฟล์จาก `supabase-js` ทำงานผ่านชื่อ bucket ทั้งหมด
+```sql
+-- supabase/migrations/6004_rt_storage_buckets.sql
+insert into storage.buckets (id, name, public)
+values ('rt-avatars', 'rt-avatars', false);
+```
 
-```typescript
+```ts
+// src/rt-create-bucket.ts
+import { createClient } from '@supabase/supabase-js';
+
+declare const process: { env: Record<string, string | undefined> };
+
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+
+const { data, error } = await supabase.storage.createBucket('rt-avatars', {
+  public: false,
+});
+```
+
+ทั้งสองแบบสร้างแถวเดียวกันเป๊ะใน `storage.buckets` — `createBucket` เป็นแค่ wrapper บาง ๆ รอบ insert เดียวกัน การ upload, download, และอ่านไฟล์จาก `supabase-js` ทั้งหมดทำงานบน bucket ที่ระบุชื่อ:
+
+```ts
+// src/rt-storage-basic-ops.ts
+import { createClient } from '@supabase/supabase-js';
+
+declare const process: { env: Record<string, string | undefined> };
+
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!);
+
 // Upload a file into a path inside the bucket
 const { data, error } = await supabase.storage
-  .from('avatars')
-  .upload('user123/photo.png', file);
+  .from('rt-avatars')
+  .upload('user123/photo.png', new Blob());
 
 // Download the raw file bytes
 const { data: fileData } = await supabase.storage
-  .from('avatars')
+  .from('rt-avatars')
   .download('user123/photo.png');
 
 // Get a public URL — only meaningful for a public bucket
 const { data: publicUrlData } = supabase.storage
-  .from('avatars')
+  .from('rt-avatars')
   .getPublicUrl('user123/photo.png');
 
 // Get a time-limited signed URL — for a private bucket
 const { data: signedUrlData } = await supabase.storage
-  .from('avatars')
+  .from('rt-avatars')
   .createSignedUrl('user123/photo.png', 60);
 ```
 
-`getPublicUrl` แค่สร้าง URL string ขึ้นมาเฉย ๆ ไม่ได้เช็คอะไรเลย ดังนั้นเรียกกับ object ใน private bucket ก็ยังได้ URL กลับมา แต่ URL นั้นจะถูก reject อยู่ดี `createSignedUrl` คือตัวที่ต้องใช้จริงสำหรับ private content โดยจะสร้าง URL ที่ valid ตามจำนวนวินาทีที่คุณส่งเข้าไป (`60` ในตัวอย่างข้างบน) โดยฝัง signed token ที่ให้ access ชั่วคราวกับ object ตัวนั้นตัวเดียว
+`getPublicUrl` แค่สร้าง URL string เท่านั้น — ไม่เช็คอะไรเลย ดังนั้นเรียกกับอ็อบเจกต์ของ private bucket ก็ได้ URL ที่ยังถูกปฏิเสธอยู่ดี `createSignedUrl` คือสิ่งที่คุณต้องการจริง ๆ สำหรับเนื้อหา private: มันสร้าง URL ที่ใช้ได้ตามจำนวนวินาทีที่คุณระบุ โดยฝัง signed token ที่ให้สิทธิ์เข้าถึงชั่วคราวสำหรับอ็อบเจกต์นั้นอันเดียว
 
-## สิ่งที่บังคับ access จริง ๆ คือ Row Level Security
+## สิ่งที่บังคับการเข้าถึงจริง ๆ: Row Level Security บน `storage.objects` จำกัดขอบเขตด้วย `bucket_id`
 
-นี่คือข้อเท็จจริงที่ควรจำไว้ Storage ไม่มีภาษาสิทธิ์เฉพาะของตัวเองเลย metadata ของทุก object ที่ upload ไป — bucket, path, owner, content type — ถูกเก็บเป็น row จริงใน table Postgres ชื่อ `storage.objects` access control ก็คือแค่ **Row Level Security policy บน table นั้น** เขียนด้วย syntax `using` กับ `with check` เดียวกันเป๊ะกับที่คุณใช้กับ table อื่นในคอร์สนี้
-
-pattern ที่พบบ่อยคือให้ user จัดการได้แค่ไฟล์ใต้ folder prefix ของตัวเอง โดย key ด้วย `auth.uid()` ของเขา
+metadata ของทุกอ็อบเจกต์ที่ upload ไว้ — bucket, path, owner, content type — อยู่เป็นแถวจริงในตาราง Postgres คือ `storage.objects` การควบคุมการเข้าถึงก็แค่ **Row Level Security policy บนตารางนั้น** เขียนด้วย syntax `using` และ `with check` เดียวกับที่คุณใช้กับตารางอื่น ๆ อยู่แล้ว และทุก policy ที่สำคัญจะถูกจำกัดขอบเขตด้วย `bucket_id` เพื่อไม่ให้ policy ที่เขียนสำหรับ bucket หนึ่งรั่วไปยังอีก bucket:
 
 ```sql
-create policy "Users can upload their own avatar"
+-- supabase/migrations/6004_rt_storage_buckets.sql
+create policy "rt_avatars_insert_own_folder"
 on storage.objects
 for insert
 to authenticated
 with check (
-  bucket_id = 'avatars'
+  bucket_id = 'rt-avatars'
   and (storage.foldername(name))[1] = auth.uid()::text
 );
 
-create policy "Users can read their own avatar"
+create policy "rt_avatars_select_own_folder"
 on storage.objects
 for select
 to authenticated
 using (
-  bucket_id = 'avatars'
+  bucket_id = 'rt-avatars'
+  and (storage.foldername(name))[1] = auth.uid()::text
+);
+
+create policy "rt_avatars_update_own_folder"
+on storage.objects
+for update
+to authenticated
+using (
+  bucket_id = 'rt-avatars'
   and (storage.foldername(name))[1] = auth.uid()::text
 );
 ```
 
-ด้วย policy แบบนี้ ไฟล์ที่ upload ไปที่ `avatars/user123/photo.png` จะเขียนได้และอ่านได้เฉพาะ user ที่ id เป็น `user123` เท่านั้น — เพราะ `name` (path เต็มของ object) ถูกเช็คกับ `auth.uid()` ทุก request เหมือนกับที่ RLS บน table อื่นกรอง row ตาม user ที่ request เข้ามาเป๊ะ ๆ
+`storage.foldername(name)` แยก path เต็มของอ็อบเจกต์ (เช่น `b41ba47f-.../photo.png`) ให้เป็น array ของส่วนต่าง ๆ ของ path และ `[1]` เอาส่วนแรก — ธรรมเนียมคือให้ส่วนแรกนั้นเป็น `auth.uid()` ของผู้ upload เอง ดังนั้น policy ที่เทียบมันกับ `auth.uid()::text` จะจำกัดขอบเขตให้ผู้ใช้แต่ละคนอยู่ในโฟลเดอร์ของตัวเอง พิสูจน์ด้วยผู้ใช้จริงที่สมัครไว้สองคน — bob พยายามเขียนเข้าโฟลเดอร์ของ alice จากนั้นเข้าโฟลเดอร์ของตัวเอง:
 
-<Mermaid title="ทุก request ของ Storage ถูกกรองด้วย RLS บน storage.objects mechanism เดียวกับ table RLS" code={storagePoliciesDiagram} />
+```bash
+# scripts/rt-storage-cross-user-write.sh
+curl -X POST "$API_URL/storage/v1/object/rt-avatars/$ALICE_ID/bob-intrusion.txt" \
+  -H "Authorization: Bearer $BOB_TOKEN" -H "apikey: $ANON_KEY" -H "Content-Type: text/plain" \
+  --data-binary @bob-intrusion.txt
+
+curl -X POST "$API_URL/storage/v1/object/rt-avatars/$BOB_ID/bob-note.txt" \
+  -H "Authorization: Bearer $BOB_TOKEN" -H "apikey: $ANON_KEY" -H "Content-Type: text/plain" \
+  --data-binary @bob-intrusion.txt
+```
+
+```text
+--- bob tries to write into alice's folder ---
+{"statusCode":"403","error":"Unauthorized","message":"new row violates row-level security policy","code":"AccessDenied"}
+HTTP_STATUS:400
+
+--- bob writes into his OWN folder ---
+{"Key":"rt-avatars/d2ef5bb4-f15d-447f-80f2-a0833f80c4e7/bob-note.txt","Id":"d0f79e7c-bb40-4c03-b46b-7f8d881e78f7"}
+HTTP_STATUS:200
+```
+
+body `403`/`AccessDenied` จริง — `"new row violates row-level security policy"` — error family เดียวกันเป๊ะกับที่โมดูล RLS สอนไว้แล้วสำหรับตารางธรรมดา เพราะ `storage.objects` ก็คือตารางธรรมดา request แบบเดียวกันเป๊ะที่ยิงเข้าโฟลเดอร์ของตัวเองสำเร็จและได้ object key จริงกลับมา
+
+```ts
+// src/rt-storage-folder-rls.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+declare const process: { env: Record<string, string | undefined>; exit: (code?: number) => never };
+
+const API_URL = process.env.SUPABASE_URL!;
+const ANON_KEY = process.env.SUPABASE_ANON_KEY!;
+const admin = createClient(API_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+
+async function ensureUser(email: string, password: string) {
+  const { data, error } = await admin.auth.admin.createUser({ email, password, email_confirm: true });
+  if (!error) return data.user;
+  const { data: list } = await admin.auth.admin.listUsers();
+  const existing = list.users.find((u) => u.email === email);
+  if (!existing) throw error;
+  return existing;
+}
+
+const alice = await ensureUser('rt-alice@example.com', 'rt-pw-alice-12345');
+const bob = await ensureUser('rt-bob@example.com', 'rt-pw-bob-12345');
+
+const bobClient = createClient(API_URL, ANON_KEY);
+await bobClient.auth.signInWithPassword({ email: 'rt-bob@example.com', password: 'rt-pw-bob-12345' });
+
+const intoAlicesFolder = await bobClient.storage
+  .from('rt-avatars')
+  .upload(`${alice.id}/bob-was-here.txt`, new Blob(['nope']));
+console.log('bob -> alice folder: error =', intoAlicesFolder.error?.message ?? null);
+
+const intoOwnFolder = await bobClient.storage
+  .from('rt-avatars')
+  .upload(`${bob.id}/bob-own-file.txt`, new Blob(['fine']));
+console.log('bob -> own folder: error =', intoOwnFolder.error?.message ?? null, 'path =', intoOwnFolder.data?.path);
+
+process.exit(intoAlicesFolder.error && !intoOwnFolder.error ? 0 : 1);
+```
+
+## Signed URL การหมดอายุ และ signed upload URL
+
+signed URL ฝัง JWT ที่มี claim `url` กับ `exp` — พิสูจน์จริงว่าการหมดอายุถูกบังคับฝั่ง server ไม่ใช่ฝั่ง client ด้วยการสร้างอันหนึ่งที่อายุ 2 วินาที แล้ว fetch ทั้งก่อนและหลัง:
+
+```bash
+# scripts/rt-signed-url-expiry.sh
+curl -X POST "$API_URL/storage/v1/object/sign/rt-avatars/$ALICE_ID/tus-test.txt" \
+  -H "Authorization: Bearer $TOKEN" -H "apikey: $ANON_KEY" -H "Content-Type: application/json" \
+  -d '{"expiresIn": 2}'
+```
+
+```text
+--- fetch immediately (should succeed) ---
+0123456789ABCDEFGHIJ
+HTTP_STATUS:200
+
+--- wait 4s for expiry ---
+
+--- fetch after expiry (should fail) ---
+{"statusCode":"400","error":"InvalidJWT","message":"\"exp\" claim timestamp check failed","code":"InvalidJWT"}
+HTTP_STATUS:400
+```
+
+`InvalidJWT`/`"exp" claim timestamp check failed` จริง — การเช็คการหมดอายุ JWT เดียวกับที่โมดูล Auth สอนไว้แล้ว เพียงแต่ใช้กับ access token ของ Storage แทน session token **signed upload URL** คือด้านตรงข้าม: แทนที่จะให้สิทธิ์อ่านชั่วคราวกับอ็อบเจกต์ที่มีอยู่แล้ว มันให้สิทธิ์ *เขียน* ชั่วคราวกับ path ที่ยังไม่ต้องมีอยู่เลยก็ได้ โดยไม่ต้องมี header `Authorization` เลยตอน upload — มีประโยชน์สำหรับให้ client ที่ไม่น่าเชื่อถือ (หรือเบราว์เซอร์ที่ไม่มี session) upload ตรงได้ เมื่อ server ของคุณสร้าง token ไว้แล้ว:
+
+```ts
+// src/rt-signed-upload-url.ts
+import { createClient } from '@supabase/supabase-js';
+
+declare const process: { env: Record<string, string | undefined> };
+
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+
+const { data, error } = await supabase.storage
+  .from('rt-avatars')
+  .createSignedUploadUrl('user123/upload-later.txt');
+
+// data.token is then handed to the untrusted client, which uploads with:
+// await supabase.storage.from('rt-avatars').uploadToSignedUrl('user123/upload-later.txt', data.token, file);
+```
+
+```text
+--- PUT using ONLY the signed upload token, no Authorization header at all ---
+{"Key":"rt-avatars/b41ba47f-4b83-4945-8dd6-637df563e1d3/signed-upload-demo.txt"}
+HTTP_STATUS:200
+```
+
+## TUS resumable upload — พิสูจน์ทีละ chunk กับ local stack จริง
+
+Supabase Storage ทำ [TUS protocol](https://tus.io/) ที่ `/storage/v1/upload/resumable` แนะนำสำหรับไฟล์ที่ใหญ่กว่าประมาณ 6MB หรือบน connection ที่ไม่เสถียร ([supabase.com/docs/guides/storage/uploads/resumable-uploads](https://supabase.com/docs/guides/storage/uploads/resumable-uploads)) container `supabase_storage_probe` ในเครื่อง (storage-api `1.72.1`) รองรับเต็มรูปแบบ — พิสูจน์ด้านล่างด้วย `curl` ดิบ ๆ ที่คุยกับ TUS protocol โดยตรง (ไม่ต้องใช้ client library เพื่อพิสูจน์กลไก แม้ `tus-js-client` — แสดงต่อจากนี้ — จะเป็นสิ่งที่คุณใช้จริงในแอป) การ upload 20 byte แบ่งเป็นสอง chunk ละ 10 byte พร้อมการเช็ค `HEAD` คั่นกลางเพื่อจำลองการ resume หลังการขัดจังหวะ:
+
+```bash
+# scripts/rt-tus-resumable.sh
+curl -X POST "$API_URL/storage/v1/upload/resumable" \
+  -H "Authorization: Bearer $TOKEN" -H "apikey: $ANON_KEY" \
+  -H "Tus-Resumable: 1.0.0" -H "Upload-Length: 20" \
+  -H "Upload-Metadata: bucketName $META_BUCKET,objectName $META_OBJECT,contentType $META_CT"
+# -> 201 Created, Location: http://127.0.0.1:55321/storage/v1/upload/resumable/<upload-id>
+
+curl -X HEAD "$LOCATION" -H "Authorization: Bearer $TOKEN" -H "apikey: $ANON_KEY" -H "Tus-Resumable: 1.0.0"
+# -> Upload-Offset: 0, Upload-Length: 20
+
+curl -X PATCH "$LOCATION" -H "Authorization: Bearer $TOKEN" -H "apikey: $ANON_KEY" \
+  -H "Tus-Resumable: 1.0.0" -H "Upload-Offset: 0" -H "Content-Type: application/offset+octet-stream" \
+  --data-binary "0123456789"
+# -> 204, Upload-Offset: 10
+
+# ...connection drops here in a real client; on reconnect, a HEAD confirms where to resume from...
+
+curl -X HEAD "$LOCATION" -H "Authorization: Bearer $TOKEN" -H "apikey: $ANON_KEY" -H "Tus-Resumable: 1.0.0"
+# -> Upload-Offset: 10 (the server remembers exactly how many bytes it already has)
+
+curl -X PATCH "$LOCATION" -H "Authorization: Bearer $TOKEN" -H "apikey: $ANON_KEY" \
+  -H "Tus-Resumable: 1.0.0" -H "Upload-Offset: 10" -H "Content-Type: application/offset+octet-stream" \
+  --data-binary "ABCDEFGHIJ"
+# -> 204, Upload-Offset: 20
+```
+
+```text
+--- HEAD before any bytes uploaded ---
+HTTP/1.1 200
+upload-length: 20
+upload-offset: 0
+
+--- PATCH first 10 bytes (chunk 1) ---
+HTTP/1.1 204
+upload-offset: 10
+
+--- HEAD after chunk 1 (simulating resume check) ---
+HTTP/1.1 200
+upload-length: 20
+upload-offset: 10
+
+--- PATCH chunk 2, resuming from offset 10 ---
+HTTP/1.1 204
+upload-offset: 20
+
+--- final downloaded object content ---
+0123456789ABCDEFGHIJ
+```
+
+สอง chunk — `0123456789` และ `ABCDEFGHIJ` — ต่อกันได้ 20 byte เดิมพอดี และ `HEAD` ที่คั่นกลางพิสูจน์ว่า server ติดตามความคืบหน้าแยกจาก client จริง: client จริงที่ crash หลัง chunk 1 เชื่อมต่อใหม่ได้ `HEAD` เพื่อพบ `Upload-Offset: 10` แล้ว resume จากตรงนั้นพอดีแทนที่จะ upload ใหม่จากศูนย์ โค้ดฝั่ง client ที่เทียบเท่ากัน โดยใช้ library ที่คุณจะใช้จริงในแอป:
+
+```ts
+// src/rt-tus-upload.ts
+// tus-js-client is not a dependency of this course's probe project. In a
+// real app: `npm install tus-js-client`, then
+// `import * as tus from 'tus-js-client';` — the `tus` const below stands
+// in for that import purely so this snippet type-checks in isolation.
+declare const tus: {
+  Upload: new (
+    file: File,
+    options: Record<string, unknown>
+  ) => {
+    findPreviousUploads(): Promise<unknown[]>;
+    resumeFromPreviousUpload(previous: unknown): void;
+    start(): void;
+  };
+};
+
+declare const process: { env: Record<string, string | undefined> };
+
+async function uploadFile(bucketName: string, fileName: string, file: File, accessToken: string) {
+  return new Promise<void>((resolve, reject) => {
+    const upload = new tus.Upload(file, {
+      endpoint: `${process.env.SUPABASE_URL}/storage/v1/upload/resumable`,
+      retryDelays: [0, 3000, 5000, 10000, 20000],
+      headers: { authorization: `Bearer ${accessToken}` },
+      uploadDataDuringCreation: true,
+      metadata: { bucketName, objectName: fileName, contentType: file.type },
+      chunkSize: 6 * 1024 * 1024,
+      onError: reject,
+      onSuccess: () => resolve(),
+    });
+    upload.findPreviousUploads().then((previous: unknown[]) => {
+      if (previous.length) upload.resumeFromPreviousUpload(previous[0]);
+      upload.start();
+    });
+  });
+}
+```
+
+## ขีดจำกัดขนาดไฟล์, allowed MIME type, และ upsert semantics
+
+bucket หนึ่งจำกัดสิ่งที่มันรับได้ตั้งแต่ตอนสร้าง `file_size_limit` (byte) และ `allowed_mime_types` บังคับโดยตัว Storage API เอง ไม่ใช่ RLS:
+
+```sql
+-- supabase/migrations/6004_rt_storage_buckets.sql
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values ('rt-restricted', 'rt-restricted', false, 100, array['image/png']);
+
+create policy "rt_restricted_insert_own_folder"
+on storage.objects for insert to authenticated
+with check (bucket_id = 'rt-restricted' and (storage.foldername(name))[1] = auth.uid()::text);
+
+create policy "rt_restricted_select_own_folder"
+on storage.objects for select to authenticated
+using (bucket_id = 'rt-restricted' and (storage.foldername(name))[1] = auth.uid()::text);
+
+create policy "rt_restricted_update_own_folder"
+on storage.objects for update to authenticated
+using (bucket_id = 'rt-restricted' and (storage.foldername(name))[1] = auth.uid()::text);
+```
+
+พิสูจน์ด้วย bucket 100 byte / `image/png` เท่านั้นด้านบน:
+
+```text
+--- wrong mime type (text/plain into image/png-only bucket) ---
+{"statusCode":"415","error":"invalid_mime_type","message":"mime type text/plain is not supported","code":"InvalidMimeType"}
+
+--- file too large (bucket limit is 100 bytes, file is 500) ---
+{"statusCode":"413","error":"Payload too large","message":"The object exceeded the maximum allowed size","code":"EntityTooLarge"}
+
+--- valid: 50-byte png, correct mime type ---
+{"Key":"rt-restricted/.../small.png","Id":"411d477e-..."}   HTTP 200
+```
+
+HTTP status code จริงที่ต่างกันชัดเจนสำหรับแต่ละความล้มเหลว — `415` สำหรับ MIME ผิด `413` สำหรับขนาดเกิน ทั้งคู่ถูกจับก่อนที่ RLS จะถูกประเมินด้วยซ้ำ `upsert` (การ upload ซ้ำ path เดิม) มีข้อกำหนดที่แหลมคมกว่าที่เห็น:
+
+```text
+--- re-upload same path WITHOUT x-upsert (already exists) ---
+{"statusCode":"409","error":"Duplicate","message":"The resource already exists","code":"KeyAlreadyExists"}
+
+--- re-upload same path WITH x-upsert: true, but only insert+update policies (no select) ---
+{"statusCode":"403","error":"Unauthorized","message":"new row violates row-level security policy","code":"AccessDenied"}
+
+--- same request, WITH a select policy added ---
+{"Key":"rt-restricted/.../small.png","Id":"411d477e-..."}   HTTP 200
+```
+
+<Callout title="upsert ต้องการ select policy ด้วย ไม่ใช่แค่ insert กับ update">
+header `x-upsert: true` ทำให้ Storage ยิง `INSERT ... ON CONFLICT (name, bucket_id) DO UPDATE ... RETURNING *` ครั้งเดียวเข้า `storage.objects` — ยืนยันจาก request log ของ container `supabase_storage_probe` เอง (`"queryName":"UpsertObject"`) Postgres ต้องประเมินว่าแถวที่ conflict นั้นมองเห็นได้หรือไม่เพื่อตัดสินใจว่าจะไปทางไหน ซึ่งหมายความว่า role ของผู้เรียกก็ต้องมี `select` policy ที่ยอมรับแถวนั้นด้วย แม้แนวคิดของ request จะเป็น "แค่ insert" ก็ตาม ด้วยแค่ policy `insert` กับ `update` (ที่ถูกต้องแต่ละอันแล้ว) upsert ล้มเหลวด้วยรูปแบบ `42501`/`AccessDenied` เดียวกันเป๊ะกับตอนขาด insert policy — การเพิ่ม `select` policy ด้านบนคือทางแก้ทั้งหมด นี่ไม่ได้ถูกบันทึกไว้เป็น gotcha ที่ชัดเจนที่ไหนเลย มันแค่ออกมาจากวิธีที่ `ON CONFLICT DO UPDATE` ทำงานภายใต้ RLS
+</Callout>
+
+<Mermaid title="ทุก Storage request ถูกกั้นด้วย RLS บน storage.objects จำกัดขอบเขตด้วย bucket_id" code={storagePoliciesDiagram} />
 
 export const storagePoliciesDiagram = `flowchart LR
-  client["Client upload/download request"] --> api["Storage API"]
-  api --> objects[("storage.objects metadata row: bucket_id, name, owner")]
-  objects --> rls{"RLS policy: using / with check against auth.uid()"}
-  rls -->|allowed| data["Underlying object data returned or written"]
-  rls -->|denied| reject["403 rejected"]`;
+  client["Client upload/download/upsert request"] --> api["Storage API"]
+  api --> restrict{"file_size_limit / allowed_mime_types check (bucket config, not RLS)"}
+  restrict -->|fails| reject413["413 / 415, before RLS runs"]
+  restrict -->|passes| objects[("storage.objects row: bucket_id, name, owner")]
+  objects --> rls{"RLS: insert/update with check, select using, scoped by bucket_id"}
+  rls -->|allowed| data["Object written or returned"]
+  rls -->|denied| reject403["403 AccessDenied"]`;
 
-<Callout title="สรุปหนึ่งบรรทัด">
-Supabase Storage จัดไฟล์เป็น **bucket** ที่เป็นได้ทั้ง **public** (อ่านได้ทุกคนที่มี URL ผ่าน `getPublicUrl`) หรือ **private** (ถูกกรอง access ให้ผ่าน `createSignedUrl` ที่ time-limited) และเบื้องหลัง metadata ของทุก object ก็คือ row หนึ่งใน table **`storage.objects`** — access ถูกบังคับด้วย **Row Level Security policy** บน table นั้นล้วน ๆ ใช้ syntax `using`/`with check`/`auth.uid()` เดียวกับ table ที่ป้องกันด้วย RLS ตัวอื่น ๆ ทั่วไป มักจับคู่ path prefix แบบ `avatars/{user_id}/...` กับ user ที่ request เข้ามา
+<Callout title="สรุปในบรรทัดเดียว">
+Supabase Storage จัดกลุ่มไฟล์เป็น **bucket** ที่สร้างผ่าน SQL หรือ `createBucket` ไม่ว่าจะ **public** (`getPublicUrl`) หรือ **private** (`createSignedUrl` แบบจำกัดเวลา พิสูจน์แล้วด้านบนว่าปฏิเสธจริงหลังหมดอายุด้วย error `InvalidJWT` จริง) — และ metadata ของทุกอ็อบเจกต์ก็แค่แถวหนึ่งใน **`storage.objects`** ควบคุมการเข้าถึงทั้งหมดโดย **Row Level Security** ที่จำกัดขอบเขตด้วย `bucket_id` พิสูจน์แล้วด้านบนว่าปฏิเสธการเขียนข้ามผู้ใช้เข้าโฟลเดอร์คนอื่นด้วย `403`/`AccessDenied` จริง และอนุญาตให้ผู้ใช้คนเดียวกันเข้าโฟลเดอร์ของตัวเอง การ upload ไฟล์ใหญ่หรือไม่เสถียรใช้ **TUS protocol** ที่ `/storage/v1/upload/resumable` (พิสูจน์แล้วด้านบนเป็น resumable upload สอง chunk จริงพร้อมการเช็ค offset จริงคั่นกลาง) `file_size_limit`/`allowed_mime_types` ปฏิเสธการ upload ที่ไม่ถูกต้องด้วย `413`/`415` ก่อนที่ RLS จะรันด้วยซ้ำ และ `upsert` ต้องการ policy **`select`** เพิ่มจาก `insert`/`update` เพราะมันคอมไพล์เป็น `INSERT ... ON CONFLICT DO UPDATE` เดียว
 </Callout>
+
+## อ่านโค้ดที่ AI สร้าง
+
+AI assistant ถูกขอให้ "ให้ผู้ใช้ upload avatar ของตัวเอง และเขียนทับได้ถ้า upload อีกครั้ง" แล้วเขียนโค้ดนี้มา:
+
+<SpotTheBug lang="sql" code={`create policy "avatars_write"
+on storage.objects
+for insert
+to authenticated
+with check (
+  bucket_id = 'rt-avatars'
+  and (storage.foldername(name))[1] = auth.uid()::text
+);
+
+create policy "avatars_update"
+on storage.objects
+for update
+to authenticated
+using (
+  bucket_id = 'rt-avatars'
+  and (storage.foldername(name))[1] = auth.uid()::text
+);
+`}>
+ดูสมบูรณ์แล้ว — มี policy insert กับ update ทั้งคู่จำกัดขอบเขตถูกต้องไปที่โฟลเดอร์ของผู้ใช้เอง — แต่การ upload ซ้ำ path เดิมด้วย `upsert: true` ล้มเหลวด้วย `403`/`AccessDenied` จริง พิสูจน์แล้วก่อนหน้านี้ในบทนี้ด้วยรูปแบบ error เดียวกันเป๊ะ `upsert` คอมไพล์เป็น `INSERT ... ON CONFLICT DO UPDATE ... RETURNING *` และ Postgres ต้องการ `select` policy เพื่อประเมินด้วยซ้ำว่าแถวที่ conflict มองเห็นได้กับผู้เรียกคนนี้หรือไม่ ไม่ใช่แค่ policy insert กับ update ทางแก้คือ policy ที่สาม: `create policy "avatars_read" on storage.objects for select to authenticated using (bucket_id = 'rt-avatars' and (storage.foldername(name))[1] = auth.uid()::text);` — ถ้าไม่มี `upload(path, file, { upsert: true })` บน path ที่มีอยู่แล้วจะล้มเหลวทุกครั้ง และข้อความ error ("row-level security policy") ก็ไม่ได้บอกใบ้เลยว่า policy ที่ขาดคือ `select` ไม่ใช่ `insert` หรือ `update`
+</SpotTheBug>
+
+## Mental Model
+
+Storage ไม่ใช่ระบบสิทธิ์แยกต่างหากที่สวมชุดของ Postgres — มันคือ API บาง ๆ ที่อยู่หน้าสองสิ่งจริง: blob store แบบ S3-compatible สำหรับ byte และตาราง Postgres จริง `storage.objects` สำหรับทุกอย่างเกี่ยวกับ byte เหล่านั้น (owner, path, bucket, content type) ทุกการตัดสินใจเรื่องการเข้าถึงที่ Storage ทำเกี่ยวกับ *แถว* (ใครเห็น metadata ของอ็อบเจกต์นี้ได้ ใครสร้างหรือเขียนทับได้) คือ RLS เต็ม ๆ เอนจิ้นเดียวกันและ policy syntax เดียวกับตารางไหนก็ตามที่คุณเคยเขียน policy ไว้แล้ว — พิสูจน์แล้วด้านบนด้วยรูปแบบ `403`/`AccessDenied`/`42501` เดียวกันเป๊ะกับตัวอย่างตารางของโมดูล RLS เอง ทุกอย่างที่ *ไม่ใช่* การตัดสินใจของ RLS — `413`/`415` จาก `file_size_limit`/`allowed_mime_types` ระดับ bucket, `409` จาก unique-constraint conflict ธรรมดาบน `(name, bucket_id)`, การหมดอายุของ JWT ของ signed URL เอง — ถูกบังคับที่จุดอื่นใน stack ก่อนหรือควบคู่กับ RLS ซึ่งเป็นเหตุผลที่แต่ละความล้มเหลวด้านบนกลับมาเป็น HTTP status กับ error code ที่ต่างกันจริง ๆ แทนที่จะเป็น "storage error" แบบเดียวกันหมด
+
+## Trade-offs
+
+- **RLS ของ `storage.objects` ใช้ทุกอย่างที่คุณรู้จักอยู่แล้วเกี่ยวกับ Postgres RLS ซ้ำ** — ไม่มี policy language ใหม่ ไม่มี mental model ใหม่ — **แลกมาด้วยความละเอียดอ่อนที่ไม่มีใน table RLS ธรรมดา** เช่น `upsert` ที่ต้องการ `select` policy แบบเงียบ ๆ เพราะวิธีที่ `ON CONFLICT DO UPDATE` ถูกคอมไพล์ พิสูจน์แล้วด้านบน
+- **Signed URL ให้คุณให้สิทธิ์เข้าถึงแบบจำกัดเวลาที่แม่นยำกับอ็อบเจกต์หนึ่งโดยไม่ต้องทำให้ bucket เป็น public** — **แลกมาด้วยการหมดอายุที่ถูกกำหนดตายตัวตอนสร้าง** (2 ชั่วโมงโดย default สำหรับ signed upload URL ตามเอกสาร และเท่าไหร่ก็ได้ที่คุณส่งให้ `createSignedUrl`) โดยไม่มีทางเพิกถอน token เดียวก่อนกำหนดได้ นอกจากหมุนเวียน signing key ทั้ง bucket
+- **TUS resumable upload รอดจาก connection ที่หลุดโดยไม่ต้อง upload ใหม่จากศูนย์** — **แลกมาด้วยข้อกำหนด chunk size คงที่ 6MB** และความซับซ้อนฝั่ง client ที่มากกว่าเยอะ (สร้าง session, ติดตาม offset, logic การ resume) กว่าการเรียก `.upload()` ครั้งเดียว ซึ่งเป็นเหตุผลที่เอกสารแนะนำมันเฉพาะสำหรับกรณีไฟล์ใหญ่หรือ network ไม่เสถียร ไม่ใช่ default แบบครอบคลุมทุกกรณี
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"การเข้าถึง Storage ถูกควบคุมด้วย flag public/private ของ bucket ไม่ใช่ RLS"** พิสูจน์แล้วด้านบน: แม้ flag `public: false`/`true` ระดับ bucket ก็แค่เปลี่ยนพฤติกรรมการอ่านแบบไม่ authenticate *เริ่มต้น* เท่านั้น — ทุกการเขียนที่ authenticated และทุกการอ่านบน private bucket ยังถูกกั้นด้วย policy จริงของ `storage.objects` รูปแบบเหมือน table RLS เป๊ะ
+- **"ถ้า policy insert กับ update ถูกต้อง upsert จะทำงาน"** พิสูจน์แล้วด้านบน: `403` จริงบน `upsert: true` แม้ policy ทั้งสองจะมีอยู่และถูกต้อง เพราะ query เบื้องหลังยังต้องการ `select` policy เพื่อ resolve `ON CONFLICT` ด้วย
+- **"การหมดอายุของ signed URL เป็นแค่คำแนะนำฝั่ง client เหมือน URL parameter ธรรมดา"** พิสูจน์แล้วด้านบน: การหมดอายุคือ claim `exp` จริงใน JWT ที่เซ็นไว้ เช็คฝั่ง server — request หลังหมดอายุได้ error `InvalidJWT` จริง ไม่ใช่ URL ที่ยังทำงานได้เงียบ ๆ
+- **"TUS resumable upload ต้องมี client library พิเศษถึงจะทำงานได้"** พิสูจน์แล้วด้านบนด้วยการขับเคลื่อน protocol ทั้งหมดด้วย `curl` ดิบ ๆ — `POST` เพื่อสร้าง `PATCH` เพื่อส่ง byte พร้อม `Upload-Offset` `HEAD` เพื่อเช็คความคืบหน้า library อย่าง `tus-js-client` ทำให้สะดวก (retry logic, chunking, resume detection) แต่ตัว protocol เองเป็นแค่ HTTP header ธรรมดา
 
 export const quizStoragePolicies = [
   {
-    q: 'bucket แบบ public กับ private ใน Storage ต่างกันยังไง',
+    q: 'ความต่างระหว่าง public กับ private Storage bucket คืออะไร',
     options: [
-      'ไม่ต่างกันเลย ทั้งคู่ต้อง authenticate เหมือนกัน',
-      'object ใน bucket แบบ public อ่านได้ทุกคนที่มี URL ส่วน private ต้องเช็ค access ทุก request',
-      'bucket แบบ private อัปโหลดได้อย่างเดียว ดาวน์โหลดไม่ได้เลย',
-      'bucket แบบ public เก็บได้แค่ text file เก็บรูปไม่ได้',
+      'ไม่มีความต่างเลย ทั้งคู่ต้องการ authentication เหมือนกัน',
+      'อ็อบเจกต์ของ public bucket อ่านได้โดยใครก็ตามที่มี URL; private bucket ต้องเช็คการเข้าถึงทุก request',
+      'private bucket อนุญาตแค่ upload เท่านั้น ไม่มี download',
+      'public bucket เก็บรูปภาพไม่ได้ เก็บได้แค่ไฟล์ text',
     ],
     answer: 1,
+    explain: 'getPublicUrl สร้าง URL โดยไม่เช็คอะไรเลย; private bucket ต้องการ signed URL จริงหรือ request ที่ authenticated ที่ผ่าน storage.objects RLS',
   },
   {
-    q: 'สิ่งที่บังคับจริง ๆ ว่าใคร upload, read หรือ delete object ใน Storage ได้คืออะไร',
+    q: 'อะไรที่บังคับจริง ๆ ว่าใคร upload, อ่าน, หรือลบ Storage object หนึ่งได้',
     options: [
-      'permission list แบบ proprietary ที่เก็บนอก Postgres ทั้งหมด',
-      'Row Level Security policy บน table storage.objects mechanism เดียวกับ table อื่น ๆ',
-      'กฎตายตัวว่าคนอัปโหลดเท่านั้นที่ access ไฟล์ได้ ไม่มี policy เกี่ยวข้อง',
-      'Storage ไม่มี access control โดย default ทุก object เป็น public หมด',
+      'permission list เฉพาะที่เก็บไว้นอก Postgres ทั้งหมด',
+      'Row Level Security policy บนตาราง storage.objects กลไกเดียวกับที่ใช้กับตารางอื่น ๆ',
+      'กฎตายตัวที่ผู้ upload เท่านั้นที่เข้าถึงไฟล์ได้เสมอ โดยไม่มี policy เกี่ยวข้อง',
+      'Storage ไม่มีการควบคุมการเข้าถึงโดย default และทุกอ็อบเจกต์เป็น public เสมอ',
     ],
     answer: 1,
+    explain: 'พิสูจน์แล้วด้านบน: การเขียนข้ามผู้ใช้เข้าโฟลเดอร์คนอื่นได้รูปแบบ 403/AccessDenied/42501 เดียวกันเป๊ะกับตารางที่มี RLS ป้องกันไว้อื่น ๆ ในคอร์สนี้',
   },
   {
-    q: 'signed URL มีไว้ทำอะไร',
+    q: 'bucket หนึ่งมี file_size_limit: 100 และ allowed_mime_types: [image/png] เกิดอะไรขึ้นเมื่อ upload ไฟล์ text/plain ขนาด 500 byte',
     options: [
-      'ทำให้ private bucket กลายเป็น public แบบถาวร',
-      'URL ที่ time-limited ให้ access ชั่วคราวกับ object หนึ่งตัวใน private bucket',
-      'เข้ารหัสไฟล์ก่อน upload',
-      'เปลี่ยนชื่อไฟล์ใน bucket',
+      'สำเร็จ ขีดจำกัดเป็นแค่คำแนะนำเท่านั้น',
+      'ถูกปฏิเสธเพราะ MIME type ผิดก่อนที่จะเช็คขนาดด้วยซ้ำ และไฟล์ที่ type ถูกต้องแต่ขนาดเกินก็ถูกปฏิเสธแยกด้วย 413',
+      'ถูกตัดให้เหลือ 100 byte แบบเงียบ ๆ',
+      'ถูกปฏิเสธด้วย RLS เท่านั้น ด้วย 403',
     ],
     answer: 1,
+    explain: 'พิสูจน์แล้วด้านบนด้วย error จริงสองแบบที่ต่างกัน: 415/InvalidMimeType สำหรับ content type ผิด และ 413/EntityTooLarge สำหรับไฟล์ type ถูกต้องแต่เกินขนาด — ทั้งคู่ถูกบังคับโดยตัว Storage API เอง ไม่ใช่ RLS',
   },
   {
-    q: 'policy ที่จำกัดให้ user จัดการได้แค่ folder avatar ของตัวเอง มักเทียบค่าอะไรกับ auth.uid()',
+    q: 'การ upload ด้วย upsert: true ไปยัง path ที่มีอยู่แล้วล้มเหลวด้วย 403/AccessDenied แม้ policy insert กับ update จะจำกัดขอบเขตให้ผู้เรียกถูกต้องทั้งคู่ ขาดอะไรไป',
     options: [
-      'flag public/private ของ bucket',
-      'ส่วนแรกของ path ของ object เช่นผ่าน storage.foldername(name)',
-      'HTTP method ของ request',
-      'ขนาดไฟล์เป็น byte',
+      'policy delete เพราะ upsert ลบแถวเก่าก่อน',
+      'policy select เพราะ upsert คอมไพล์เป็น INSERT ... ON CONFLICT DO UPDATE ซึ่งต้องประเมินว่าแถวที่ conflict มองเห็นได้หรือไม่',
+      'ไม่มีอะไรขาด นี่คือบั๊กใน Postgres',
+      'ต้องตั้ง bucket เป็น public ก่อน upsert ถึงจะทำงาน',
     ],
     answer: 1,
+    explain: 'พิสูจน์แล้วด้านบน: การเพิ่ม select policy ที่จำกัดขอบเขตแบบเดียวกับ policy insert/update คือทางแก้ทั้งหมด ยืนยันจาก storage-api log ที่ตั้งชื่อ query ว่า "UpsertObject" — คำสั่ง INSERT ... ON CONFLICT DO UPDATE ... RETURNING *',
+  },
+  {
+    q: 'signed URL ที่สร้างด้วย createSignedUrl(path, 2) บังคับอะไรจริง ๆ หลังผ่านไป 2 วินาที',
+    options: [
+      'ไม่มีอะไรเลย — การหมดอายุเป็นแค่ธรรมเนียมฝั่ง client',
+      'การเช็คฝั่ง server จริงบน claim exp ที่ฝังอยู่ใน signed URL เอง คืน error InvalidJWT จริงสำหรับ request หลังหมดอายุ',
+      'อ็อบเจกต์ถูกลบถาวรหลัง signed URL หมดอายุ',
+      'bucket กลายเป็น private อัตโนมัติหลัง URL หมดอายุ',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วด้านบน: request 4 วินาทีหลัง signed URL อายุ 2 วินาทีคืน {"code":"InvalidJWT","message":"\\"exp\\" claim timestamp check failed"} — การเช็คการหมดอายุ JWT จริง ไม่ใช่ธรรมเนียมฝั่ง client',
+  },
+  {
+    q: 'อะไรพิสูจน์ว่า TUS resumable upload ไม่ต้องการ client library เฉพาะถึงจะทำงานได้',
+    options: [
+      'พิสูจน์ไม่ได้ TUS ทำงานผ่าน tus-js-client เท่านั้น',
+      'การ upload ทั้งหมด (POST เพื่อสร้าง, PATCH เพื่อส่ง byte ที่ Upload-Offset หนึ่ง, HEAD เพื่อเช็คความคืบหน้า) ถูกขับเคลื่อนด้วย curl ดิบ ๆ กับ local stack จริง โดยสอง chunk ที่ upload ต่อกันได้ byte เดิมพอดี',
+      'TUS เป็น extension เฉพาะของ Supabase ไม่มี protocol spec สาธารณะ',
+      'local stack ไม่รองรับ TUS จริง ๆ รองรับแค่ Supabase แบบ hosted เท่านั้น',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วด้านบนแบบ end-to-end ด้วย curl ธรรมดาและ header Tus-Resumable/Upload-Offset/Upload-Length — protocol เป็นแค่ HTTP ธรรมดา และ client library เป็นแค่ความสะดวก (retry/resume logic) ไม่ใช่ข้อบังคับ',
   },
 ];
 

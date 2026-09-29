@@ -1,6 +1,6 @@
 ---
 title: 'Storage: Buckets and Policies'
-description: 'How Supabase Storage organizes files into public and private buckets, and how access to every object is actually enforced by Row Level Security policies on the storage.objects table.'
+description: 'How Supabase Storage organizes files into public and private buckets, how storage.objects RLS actually enforces access, resumable TUS uploads, signed URLs, and file restrictions and upsert semantics.'
 sidebar:
   order: 3
 ---
@@ -8,93 +8,429 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
 
 Supabase Storage is S3-compatible object storage organized into **buckets**, and access to every object is enforced by ordinary **Row Level Security** policies on a Postgres table — the same mechanism you already know from the RLS module, not a separate permission system.
 
-## Buckets: public and private containers
+## Buckets: public and private, created via SQL or the API
 
-A **bucket** is a top-level container for files, similar to an S3 bucket — you might have an `avatars` bucket for profile pictures and a `public-assets` bucket for marketing images. A bucket can be marked **public**, meaning anyone with the object's URL can read it with no authentication, or **private**, meaning access is controlled per-request.
+A **bucket** is a top-level container for files, similar to an S3 bucket. A bucket can be marked **public**, meaning anyone with the object's URL can read it with no authentication, or **private**, meaning access is controlled per-request. A bucket is just a row in `storage.buckets`, so it can be created either directly with SQL or through `supabase-js`:
 
-Uploading, downloading, and reading files from `supabase-js` all operate on a named bucket:
+```sql
+-- supabase/migrations/6004_rt_storage_buckets.sql
+insert into storage.buckets (id, name, public)
+values ('rt-avatars', 'rt-avatars', false);
+```
 
-```typescript
+```ts
+// src/rt-create-bucket.ts
+import { createClient } from '@supabase/supabase-js';
+
+declare const process: { env: Record<string, string | undefined> };
+
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+
+const { data, error } = await supabase.storage.createBucket('rt-avatars', {
+  public: false,
+});
+```
+
+Both produce the exact same row in `storage.buckets` — `createBucket` is a thin wrapper around the same insert. Uploading, downloading, and reading files from `supabase-js` all operate on a named bucket:
+
+```ts
+// src/rt-storage-basic-ops.ts
+import { createClient } from '@supabase/supabase-js';
+
+declare const process: { env: Record<string, string | undefined> };
+
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!);
+
 // Upload a file into a path inside the bucket
 const { data, error } = await supabase.storage
-  .from('avatars')
-  .upload('user123/photo.png', file);
+  .from('rt-avatars')
+  .upload('user123/photo.png', new Blob());
 
 // Download the raw file bytes
 const { data: fileData } = await supabase.storage
-  .from('avatars')
+  .from('rt-avatars')
   .download('user123/photo.png');
 
 // Get a public URL — only meaningful for a public bucket
 const { data: publicUrlData } = supabase.storage
-  .from('avatars')
+  .from('rt-avatars')
   .getPublicUrl('user123/photo.png');
 
 // Get a time-limited signed URL — for a private bucket
 const { data: signedUrlData } = await supabase.storage
-  .from('avatars')
+  .from('rt-avatars')
   .createSignedUrl('user123/photo.png', 60);
 ```
 
-`getPublicUrl` just builds a URL string — it does not check anything, so calling it on a private bucket's object gives you a URL that will still be rejected. `createSignedUrl` is what you actually want for private content: it mints a URL, valid for the number of seconds you pass in (`60` above), that embeds a signed token granting temporary access to that one object.
+`getPublicUrl` just builds a URL string — it does not check anything, so calling it on a private bucket's object gives you a URL that will still be rejected. `createSignedUrl` is what you actually want for private content: it mints a URL, valid for the number of seconds you pass in, that embeds a signed token granting temporary access to that one object.
 
-## What actually enforces access: Row Level Security
+## What actually enforces access: Row Level Security on `storage.objects`, scoped by `bucket_id`
 
-Here is the fact worth internalizing: Storage does not have its own bespoke permission language. Every uploaded object's metadata — its bucket, its path, its owner, its content type — lives as a row in a real Postgres table, `storage.objects`. Access control is just **Row Level Security policies on that table**, written with the exact same `using` and `with check` syntax you already use for any other table in this course.
-
-A common pattern is to let a user manage only files under their own folder prefix, keyed by their `auth.uid()`:
+Every uploaded object's metadata — its bucket, its path, its owner, its content type — lives as a row in a real Postgres table, `storage.objects`. Access control is just **Row Level Security policies on that table**, written with the exact same `using` and `with check` syntax you already use for any other table, and every policy that matters is scoped by `bucket_id` so a policy written for one bucket never leaks into another:
 
 ```sql
-create policy "Users can upload their own avatar"
+-- supabase/migrations/6004_rt_storage_buckets.sql
+create policy "rt_avatars_insert_own_folder"
 on storage.objects
 for insert
 to authenticated
 with check (
-  bucket_id = 'avatars'
+  bucket_id = 'rt-avatars'
   and (storage.foldername(name))[1] = auth.uid()::text
 );
 
-create policy "Users can read their own avatar"
+create policy "rt_avatars_select_own_folder"
 on storage.objects
 for select
 to authenticated
 using (
-  bucket_id = 'avatars'
+  bucket_id = 'rt-avatars'
+  and (storage.foldername(name))[1] = auth.uid()::text
+);
+
+create policy "rt_avatars_update_own_folder"
+on storage.objects
+for update
+to authenticated
+using (
+  bucket_id = 'rt-avatars'
   and (storage.foldername(name))[1] = auth.uid()::text
 );
 ```
 
-With policies like these, a file uploaded to `avatars/user123/photo.png` is only writable and readable by the user whose id is `user123` — because `name` (the object's full path) is checked against `auth.uid()` on every request, exactly like RLS on any other table gates rows by the requesting user.
+`storage.foldername(name)` splits an object's full path (e.g. `b41ba47f-.../photo.png`) into an array of path segments, and `[1]` takes the first one — the convention is to make that first segment the uploading user's own `auth.uid()`, so a policy comparing it to `auth.uid()::text` scopes every user to their own folder. Proof with two real signed-up users — bob attempting to write into alice's folder, then into his own:
 
-<Mermaid title="Every Storage request is gated by RLS on storage.objects, the same mechanism as table RLS" code={storagePoliciesDiagram} />
+```bash
+# scripts/rt-storage-cross-user-write.sh
+curl -X POST "$API_URL/storage/v1/object/rt-avatars/$ALICE_ID/bob-intrusion.txt" \
+  -H "Authorization: Bearer $BOB_TOKEN" -H "apikey: $ANON_KEY" -H "Content-Type: text/plain" \
+  --data-binary @bob-intrusion.txt
+
+curl -X POST "$API_URL/storage/v1/object/rt-avatars/$BOB_ID/bob-note.txt" \
+  -H "Authorization: Bearer $BOB_TOKEN" -H "apikey: $ANON_KEY" -H "Content-Type: text/plain" \
+  --data-binary @bob-intrusion.txt
+```
+
+```text
+--- bob tries to write into alice's folder ---
+{"statusCode":"403","error":"Unauthorized","message":"new row violates row-level security policy","code":"AccessDenied"}
+HTTP_STATUS:400
+
+--- bob writes into his OWN folder ---
+{"Key":"rt-avatars/d2ef5bb4-f15d-447f-80f2-a0833f80c4e7/bob-note.txt","Id":"d0f79e7c-bb40-4c03-b46b-7f8d881e78f7"}
+HTTP_STATUS:200
+```
+
+A real `403`/`AccessDenied` body — `"new row violates row-level security policy"` — the exact same error family the RLS module already taught for ordinary tables, because `storage.objects` is an ordinary table. The identical request against his own folder succeeds and returns the real object key.
+
+```ts
+// src/rt-storage-folder-rls.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+declare const process: { env: Record<string, string | undefined>; exit: (code?: number) => never };
+
+const API_URL = process.env.SUPABASE_URL!;
+const ANON_KEY = process.env.SUPABASE_ANON_KEY!;
+const admin = createClient(API_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+
+async function ensureUser(email: string, password: string) {
+  const { data, error } = await admin.auth.admin.createUser({ email, password, email_confirm: true });
+  if (!error) return data.user;
+  const { data: list } = await admin.auth.admin.listUsers();
+  const existing = list.users.find((u) => u.email === email);
+  if (!existing) throw error;
+  return existing;
+}
+
+const alice = await ensureUser('rt-alice@example.com', 'rt-pw-alice-12345');
+const bob = await ensureUser('rt-bob@example.com', 'rt-pw-bob-12345');
+
+const bobClient = createClient(API_URL, ANON_KEY);
+await bobClient.auth.signInWithPassword({ email: 'rt-bob@example.com', password: 'rt-pw-bob-12345' });
+
+const intoAlicesFolder = await bobClient.storage
+  .from('rt-avatars')
+  .upload(`${alice.id}/bob-was-here.txt`, new Blob(['nope']));
+console.log('bob -> alice folder: error =', intoAlicesFolder.error?.message ?? null);
+
+const intoOwnFolder = await bobClient.storage
+  .from('rt-avatars')
+  .upload(`${bob.id}/bob-own-file.txt`, new Blob(['fine']));
+console.log('bob -> own folder: error =', intoOwnFolder.error?.message ?? null, 'path =', intoOwnFolder.data?.path);
+
+process.exit(intoAlicesFolder.error && !intoOwnFolder.error ? 0 : 1);
+```
+
+## Signed URLs, expiry, and signed upload URLs
+
+A signed URL embeds a JWT with a `url` claim and an `exp` claim — real proof that expiry is enforced server-side, not client-side, by creating one with a 2-second lifetime and fetching it before and after:
+
+```bash
+# scripts/rt-signed-url-expiry.sh
+curl -X POST "$API_URL/storage/v1/object/sign/rt-avatars/$ALICE_ID/tus-test.txt" \
+  -H "Authorization: Bearer $TOKEN" -H "apikey: $ANON_KEY" -H "Content-Type: application/json" \
+  -d '{"expiresIn": 2}'
+```
+
+```text
+--- fetch immediately (should succeed) ---
+0123456789ABCDEFGHIJ
+HTTP_STATUS:200
+
+--- wait 4s for expiry ---
+
+--- fetch after expiry (should fail) ---
+{"statusCode":"400","error":"InvalidJWT","message":"\"exp\" claim timestamp check failed","code":"InvalidJWT"}
+HTTP_STATUS:400
+```
+
+A real `InvalidJWT`/`"exp" claim timestamp check failed` — the same JWT expiry check the Auth module already covered, applied here to a Storage access token instead of a session token. A **signed upload URL** is the inverse: instead of granting temporary read access to an existing object, it grants temporary *write* access to a path that does not need to exist yet, with no `Authorization` header required at upload time at all — useful for letting an untrusted client (or a browser with no session) upload directly, once your server has minted the token:
+
+```ts
+// src/rt-signed-upload-url.ts
+import { createClient } from '@supabase/supabase-js';
+
+declare const process: { env: Record<string, string | undefined> };
+
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+
+const { data, error } = await supabase.storage
+  .from('rt-avatars')
+  .createSignedUploadUrl('user123/upload-later.txt');
+
+// data.token is then handed to the untrusted client, which uploads with:
+// await supabase.storage.from('rt-avatars').uploadToSignedUrl('user123/upload-later.txt', data.token, file);
+```
+
+```text
+--- PUT using ONLY the signed upload token, no Authorization header at all ---
+{"Key":"rt-avatars/b41ba47f-4b83-4945-8dd6-637df563e1d3/signed-upload-demo.txt"}
+HTTP_STATUS:200
+```
+
+## TUS resumable upload — proved chunk by chunk against the local stack
+
+Supabase Storage implements the [TUS protocol](https://tus.io/) at `/storage/v1/upload/resumable`, recommended for files over roughly 6MB or on unreliable connections ([supabase.com/docs/guides/storage/uploads/resumable-uploads](https://supabase.com/docs/guides/storage/uploads/resumable-uploads)). The local `supabase_storage_probe` container (storage-api `1.72.1`) supports it fully — proved below with raw `curl` speaking the TUS protocol directly (no client library needed to prove the mechanism, though `tus-js-client` — shown after — is what you would actually use in an application). A 20-byte upload, split into two 10-byte chunks, with a `HEAD` check in between simulating a resume after an interruption:
+
+```bash
+# scripts/rt-tus-resumable.sh
+curl -X POST "$API_URL/storage/v1/upload/resumable" \
+  -H "Authorization: Bearer $TOKEN" -H "apikey: $ANON_KEY" \
+  -H "Tus-Resumable: 1.0.0" -H "Upload-Length: 20" \
+  -H "Upload-Metadata: bucketName $META_BUCKET,objectName $META_OBJECT,contentType $META_CT"
+# -> 201 Created, Location: http://127.0.0.1:55321/storage/v1/upload/resumable/<upload-id>
+
+curl -X HEAD "$LOCATION" -H "Authorization: Bearer $TOKEN" -H "apikey: $ANON_KEY" -H "Tus-Resumable: 1.0.0"
+# -> Upload-Offset: 0, Upload-Length: 20
+
+curl -X PATCH "$LOCATION" -H "Authorization: Bearer $TOKEN" -H "apikey: $ANON_KEY" \
+  -H "Tus-Resumable: 1.0.0" -H "Upload-Offset: 0" -H "Content-Type: application/offset+octet-stream" \
+  --data-binary "0123456789"
+# -> 204, Upload-Offset: 10
+
+# ...connection drops here in a real client; on reconnect, a HEAD confirms where to resume from...
+
+curl -X HEAD "$LOCATION" -H "Authorization: Bearer $TOKEN" -H "apikey: $ANON_KEY" -H "Tus-Resumable: 1.0.0"
+# -> Upload-Offset: 10 (the server remembers exactly how many bytes it already has)
+
+curl -X PATCH "$LOCATION" -H "Authorization: Bearer $TOKEN" -H "apikey: $ANON_KEY" \
+  -H "Tus-Resumable: 1.0.0" -H "Upload-Offset: 10" -H "Content-Type: application/offset+octet-stream" \
+  --data-binary "ABCDEFGHIJ"
+# -> 204, Upload-Offset: 20
+```
+
+```text
+--- HEAD before any bytes uploaded ---
+HTTP/1.1 200
+upload-length: 20
+upload-offset: 0
+
+--- PATCH first 10 bytes (chunk 1) ---
+HTTP/1.1 204
+upload-offset: 10
+
+--- HEAD after chunk 1 (simulating resume check) ---
+HTTP/1.1 200
+upload-length: 20
+upload-offset: 10
+
+--- PATCH chunk 2, resuming from offset 10 ---
+HTTP/1.1 204
+upload-offset: 20
+
+--- final downloaded object content ---
+0123456789ABCDEFGHIJ
+```
+
+The two chunks — `0123456789` and `ABCDEFGHIJ` — concatenate into exactly the original 20 bytes, and the `HEAD` between them proves the server tracked progress independently of the client: a real client that crashed after chunk 1 could reconnect, `HEAD` to discover `Upload-Offset: 10`, and resume from exactly there instead of re-uploading from zero. The equivalent client-side code, using the library you would actually reach for in an app:
+
+```ts
+// src/rt-tus-upload.ts
+// tus-js-client is not a dependency of this course's probe project. In a
+// real app: `npm install tus-js-client`, then
+// `import * as tus from 'tus-js-client';` — the `tus` const below stands
+// in for that import purely so this snippet type-checks in isolation.
+declare const tus: {
+  Upload: new (
+    file: File,
+    options: Record<string, unknown>
+  ) => {
+    findPreviousUploads(): Promise<unknown[]>;
+    resumeFromPreviousUpload(previous: unknown): void;
+    start(): void;
+  };
+};
+
+declare const process: { env: Record<string, string | undefined> };
+
+async function uploadFile(bucketName: string, fileName: string, file: File, accessToken: string) {
+  return new Promise<void>((resolve, reject) => {
+    const upload = new tus.Upload(file, {
+      endpoint: `${process.env.SUPABASE_URL}/storage/v1/upload/resumable`,
+      retryDelays: [0, 3000, 5000, 10000, 20000],
+      headers: { authorization: `Bearer ${accessToken}` },
+      uploadDataDuringCreation: true,
+      metadata: { bucketName, objectName: fileName, contentType: file.type },
+      chunkSize: 6 * 1024 * 1024,
+      onError: reject,
+      onSuccess: () => resolve(),
+    });
+    upload.findPreviousUploads().then((previous: unknown[]) => {
+      if (previous.length) upload.resumeFromPreviousUpload(previous[0]);
+      upload.start();
+    });
+  });
+}
+```
+
+## File size limits, allowed MIME types, and upsert semantics
+
+A bucket can restrict what it accepts at creation time, `file_size_limit` (bytes) and `allowed_mime_types`, enforced by the Storage API itself, not RLS:
+
+```sql
+-- supabase/migrations/6004_rt_storage_buckets.sql
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values ('rt-restricted', 'rt-restricted', false, 100, array['image/png']);
+
+create policy "rt_restricted_insert_own_folder"
+on storage.objects for insert to authenticated
+with check (bucket_id = 'rt-restricted' and (storage.foldername(name))[1] = auth.uid()::text);
+
+create policy "rt_restricted_select_own_folder"
+on storage.objects for select to authenticated
+using (bucket_id = 'rt-restricted' and (storage.foldername(name))[1] = auth.uid()::text);
+
+create policy "rt_restricted_update_own_folder"
+on storage.objects for update to authenticated
+using (bucket_id = 'rt-restricted' and (storage.foldername(name))[1] = auth.uid()::text);
+```
+
+Proof, with the 100-byte / `image/png`-only bucket above:
+
+```text
+--- wrong mime type (text/plain into image/png-only bucket) ---
+{"statusCode":"415","error":"invalid_mime_type","message":"mime type text/plain is not supported","code":"InvalidMimeType"}
+
+--- file too large (bucket limit is 100 bytes, file is 500) ---
+{"statusCode":"413","error":"Payload too large","message":"The object exceeded the maximum allowed size","code":"EntityTooLarge"}
+
+--- valid: 50-byte png, correct mime type ---
+{"Key":"rt-restricted/.../small.png","Id":"411d477e-..."}   HTTP 200
+```
+
+Real, distinct HTTP status codes for each failure mode — `415` for the MIME mismatch, `413` for the size overage — both caught before RLS is even evaluated. `upsert` (re-uploading to the same path) has a sharper requirement than it looks:
+
+```text
+--- re-upload same path WITHOUT x-upsert (already exists) ---
+{"statusCode":"409","error":"Duplicate","message":"The resource already exists","code":"KeyAlreadyExists"}
+
+--- re-upload same path WITH x-upsert: true, but only insert+update policies (no select) ---
+{"statusCode":"403","error":"Unauthorized","message":"new row violates row-level security policy","code":"AccessDenied"}
+
+--- same request, WITH a select policy added ---
+{"Key":"rt-restricted/.../small.png","Id":"411d477e-..."}   HTTP 200
+```
+
+<Callout title="upsert needs a select policy too, not just insert and update">
+The `x-upsert: true` header makes Storage issue a single `INSERT ... ON CONFLICT (name, bucket_id) DO UPDATE ... RETURNING *` against `storage.objects` — confirmed from the `supabase_storage_probe` container's own request log (`"queryName":"UpsertObject"`). Postgres needs to evaluate whether a conflicting row is visible to decide which branch to take, which means the caller's role also needs a `select` policy that admits the row, even though the request is conceptually "just an insert." With only `insert` and `update` policies in place (both individually correct), the upsert failed with the exact same `42501`/`AccessDenied` shape as a missing insert policy — adding the `select` policy above was the entire fix. This is not documented as an explicit gotcha anywhere obvious; it falls straight out of how `ON CONFLICT DO UPDATE` works under RLS.
+</Callout>
+
+<Mermaid title="Every Storage request is gated by RLS on storage.objects, scoped by bucket_id" code={storagePoliciesDiagram} />
 
 export const storagePoliciesDiagram = `flowchart LR
-  client["Client upload/download request"] --> api["Storage API"]
-  api --> objects[("storage.objects metadata row: bucket_id, name, owner")]
-  objects --> rls{"RLS policy: using / with check against auth.uid()"}
-  rls -->|allowed| data["Underlying object data returned or written"]
-  rls -->|denied| reject["403 rejected"]`;
+  client["Client upload/download/upsert request"] --> api["Storage API"]
+  api --> restrict{"file_size_limit / allowed_mime_types check (bucket config, not RLS)"}
+  restrict -->|fails| reject413["413 / 415, before RLS runs"]
+  restrict -->|passes| objects[("storage.objects row: bucket_id, name, owner")]
+  objects --> rls{"RLS: insert/update with check, select using, scoped by bucket_id"}
+  rls -->|allowed| data["Object written or returned"]
+  rls -->|denied| reject403["403 AccessDenied"]`;
 
 <Callout title="The one-line takeaway">
-Supabase Storage groups files into **buckets** that are either **public** (readable by anyone with the URL, via `getPublicUrl`) or **private** (access-gated, served through a time-limited `createSignedUrl`), and under the hood every object's metadata is just a row in the **`storage.objects`** table — access is enforced entirely by **Row Level Security policies** on that table, using the exact same `using`/`with check`/`auth.uid()` syntax as any other RLS-protected table, commonly matching a path prefix like `avatars/{user_id}/...` to the requesting user.
+Supabase Storage groups files into **buckets** created via SQL or `createBucket`, either **public** (`getPublicUrl`) or **private** (time-limited `createSignedUrl`, proved above to genuinely reject after expiry with a real `InvalidJWT` error) — and every object's metadata is just a row in **`storage.objects`**, access-controlled entirely by **Row Level Security** scoped by `bucket_id`, proved above to reject a cross-user folder write with a real `403`/`AccessDenied` and allow the same user their own folder. Large or unreliable uploads use the **TUS protocol** at `/storage/v1/upload/resumable` (proved above as a real two-chunk resumable upload with a genuine offset check in between), `file_size_limit`/`allowed_mime_types` reject bad uploads with `413`/`415` before RLS even runs, and `upsert` needs a **`select`** policy in addition to `insert`/`update` because it compiles to a single `INSERT ... ON CONFLICT DO UPDATE`.
 </Callout>
+
+## Reading AI-generated code
+
+An AI assistant asked to "let users upload their own avatar and overwrite it if they upload again" wrote this:
+
+<SpotTheBug lang="sql" code={`create policy "avatars_write"
+on storage.objects
+for insert
+to authenticated
+with check (
+  bucket_id = 'rt-avatars'
+  and (storage.foldername(name))[1] = auth.uid()::text
+);
+
+create policy "avatars_update"
+on storage.objects
+for update
+to authenticated
+using (
+  bucket_id = 'rt-avatars'
+  and (storage.foldername(name))[1] = auth.uid()::text
+);
+`}>
+This looks complete — insert and update policies, both correctly scoped to the user's own folder — but re-uploading to the same path with `upsert: true` fails with a real `403`/`AccessDenied`, proved earlier in this lesson with the identical error shape. `upsert` compiles to `INSERT ... ON CONFLICT DO UPDATE ... RETURNING *`, and Postgres needs a `select` policy to even evaluate whether the conflicting row is visible to this caller, not just insert and update policies. The fix is a third policy: `create policy "avatars_read" on storage.objects for select to authenticated using (bucket_id = 'rt-avatars' and (storage.foldername(name))[1] = auth.uid()::text);` — without it, `upload(path, file, { upsert: true })` on an existing path fails every time, and the error message ("row-level security policy") gives no hint that the missing policy is a `select`, not an `insert` or `update`.
+</SpotTheBug>
+
+## Mental Model
+
+Storage is not a separate permission system wearing Postgres's clothes — it is a thin API in front of two real things: an S3-compatible blob store for bytes, and a real Postgres table, `storage.objects`, for everything about those bytes (owner, path, bucket, content type). Every access decision Storage makes about *rows* (who can see this object's metadata, who can create or overwrite it) is RLS, full stop, the same engine and the same policy syntax as any table you have written a policy for already — proved above with the identical `403`/`AccessDenied`/`42501` shape as the RLS module's own table examples. Everything that is *not* an RLS decision — `413`/`415` from bucket-level `file_size_limit`/`allowed_mime_types`, `409` from a plain unique-constraint conflict on `(name, bucket_id)`, expiry on a signed URL's own JWT — is enforced somewhere else in the stack, before or alongside RLS, which is why each of those failure modes above came back as a genuinely different HTTP status and error code rather than a uniform "storage error."
+
+## Trade-offs
+
+- **`storage.objects` RLS reuses everything you already know about Postgres RLS** — no new policy language, no new mental model — **at the cost of subtleties that don't exist in plain table RLS**, like `upsert` silently needing a `select` policy because of how `ON CONFLICT DO UPDATE` is compiled, proved above.
+- **Signed URLs let you grant precise, time-limited access to one object without making a bucket public** — **at the cost of the expiry being fixed at mint time** (2 hours by default for signed upload URLs per the docs, and whatever you pass for `createSignedUrl`) with no way to revoke a single token early short of rotating the whole bucket's signing key.
+- **TUS resumable upload survives a dropped connection without re-uploading from zero** — **at the cost of a fixed 6MB chunk size requirement** and considerably more client-side complexity (session creation, offset tracking, resume logic) than a single `.upload()` call, which is why the docs recommend it specifically for large or unreliable-network cases, not as a blanket default.
+
+## Common Misconceptions
+
+- **"Storage access is controlled by bucket public/private flag, not RLS."** Proved above: even a bucket-level `public: false`/`true` flag only changes the *default* unauthenticated read behavior — every authenticated write, and every read on a private bucket, is still gated by real `storage.objects` policies, identical in shape to table RLS.
+- **"If insert and update policies are correct, upsert will work."** Proved above: a real `403` on `upsert: true` with both policies present and correct, because the underlying query also needs a `select` policy to resolve `ON CONFLICT`.
+- **"A signed URL's expiry is just a client-side hint, like an ordinary URL parameter."** Proved above: the expiry is a real `exp` claim in a signed JWT, checked server-side — a request after expiry gets a genuine `InvalidJWT` error, not a URL that silently still works.
+- **"TUS resumable upload needs a special client library to work at all."** Proved above by driving the entire protocol with raw `curl` — `POST` to create, `PATCH` to send bytes with an `Upload-Offset`, `HEAD` to check progress. A library like `tus-js-client` makes it convenient (retry logic, chunking, resume detection) but the protocol itself is plain HTTP headers.
 
 export const quizStoragePolicies = [
   {
     q: 'What is the difference between a public and a private Storage bucket',
     options: [
       'There is no difference, both require the same authentication',
-      'A public bucket\'s objects are readable by anyone with the URL; a private bucket requires access to be checked per request',
+      "A public bucket's objects are readable by anyone with the URL; a private bucket requires access to be checked per request",
       'A private bucket only allows uploads, never downloads',
       'A public bucket cannot store images, only text files',
     ],
     answer: 1,
+    explain: 'getPublicUrl builds a URL with no access check at all; a private bucket needs a real signed URL or an authenticated request that passes storage.objects RLS.',
   },
   {
     q: 'What actually enforces who can upload, read, or delete a given Storage object',
@@ -105,26 +441,51 @@ export const quizStoragePolicies = [
       'Storage has no access control by default and every object is always public',
     ],
     answer: 1,
+    explain: 'Proved above: a cross-user folder write produced the identical 403/AccessDenied/42501 shape as any other RLS-protected table in this course.',
   },
   {
-    q: 'What is a signed URL for',
+    q: 'A bucket has file_size_limit: 100 and allowed_mime_types: [image/png]. What happens uploading a 500-byte text/plain file',
     options: [
-      'Permanently making a private bucket public',
-      'A time-limited URL that grants temporary access to one object in a private bucket',
-      'Encrypting a file before it is uploaded',
-      'Renaming a file inside a bucket',
+      'It succeeds, limits are only advisory',
+      'It is rejected for the wrong MIME type before size is even checked, and a correctly-typed oversized file is separately rejected with 413',
+      'It silently truncates the file to 100 bytes',
+      'It is rejected only by RLS, with a 403',
     ],
     answer: 1,
+    explain: 'Proved above with two distinct real errors: 415/InvalidMimeType for the wrong content type, and 413/EntityTooLarge for a correctly-typed file over the size limit — both enforced by the Storage API itself, not RLS.',
   },
   {
-    q: 'In a policy restricting a user to their own avatar folder, what is typically compared against auth.uid()',
+    q: 'Uploading with upsert: true to an existing path fails with 403/AccessDenied even though insert and update policies are both correctly scoped to the caller. What is missing',
     options: [
-      'The bucket\'s public/private flag',
-      'The first segment of the object\'s path, e.g. via storage.foldername(name)',
-      'The HTTP method of the request',
-      'The file\'s byte size',
+      'A delete policy, since upsert deletes the old row first',
+      'A select policy, because upsert compiles to INSERT ... ON CONFLICT DO UPDATE, which needs to evaluate whether the conflicting row is visible',
+      'Nothing is missing, this is a bug in Postgres',
+      'The bucket must be marked public for upsert to work',
     ],
     answer: 1,
+    explain: 'Proved above: adding a select policy scoped the same way as the insert/update policies was the entire fix, confirmed by the storage-api log naming the query "UpsertObject" — an INSERT ... ON CONFLICT DO UPDATE ... RETURNING * statement.',
+  },
+  {
+    q: 'What does a signed URL created with createSignedUrl(path, 2) actually enforce after 2 seconds pass',
+    options: [
+      'Nothing — expiry is only a client-side convention',
+      "A real server-side check on the signed URL's own embedded exp claim, returning a genuine InvalidJWT error on a request after expiry",
+      'The object is permanently deleted after the signed URL expires',
+      'The bucket automatically becomes private after the URL expires',
+    ],
+    answer: 1,
+    explain: 'Proved above: a request 4 seconds after a 2-second signed URL returned {"code":"InvalidJWT","message":"\\"exp\\" claim timestamp check failed"} — a real JWT expiry check, not a client-side convention.',
+  },
+  {
+    q: 'What proves that TUS resumable upload does not require a specific client library to function',
+    options: [
+      'It cannot be proved; TUS only works through tus-js-client',
+      'The entire upload (POST to create, PATCH to send bytes at a given Upload-Offset, HEAD to check progress) was driven with raw curl against the local stack, with the two uploaded chunks concatenating into the exact original bytes',
+      'TUS is a Supabase-specific extension with no public protocol spec',
+      'The local stack does not actually support TUS, only hosted Supabase does',
+    ],
+    answer: 1,
+    explain: 'Proved above end to end with plain curl and Tus-Resumable/Upload-Offset/Upload-Length headers — the protocol is plain HTTP, and a client library is a convenience (retry/resume logic), not a requirement.',
   },
 ];
 
