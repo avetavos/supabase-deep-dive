@@ -1,0 +1,685 @@
+---
+title: 'Worked review 2: a file-sharing app'
+description: 'An AI-generated bucket, storage.objects policies, a resumable-upload client, and a share-link Edge Function — reviewed bug by bug against a real public-bucket leak, a real folder-scoping bypass, a real RLS-blocked signed URL, and a real BOOT_ERROR on a local Supabase Storage 1.72.1 stack.'
+sidebar:
+  order: 5
+---
+
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import Mermaid from '../../../../components/Mermaid.astro';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## The feature
+
+The prompt was: *"Build file sharing: users upload files into their own folder, get a resumable upload for large files, and can generate a share link that works for anyone with the URL."* What follows reads like a genuinely working first draft — the bucket creates, an upload succeeds, a share link opens in a fresh incognito window with no login. That last part is exactly the trap: "opens with no login" is the intended feature for a share link and the accidental behavior for everything else in this review. It has **11 real bugs**, check the **[AI bug catalog](/supabase/en/reading-supabase/ai-bug-catalog/)** for the general shape behind several of them (22, 23, 24, 25, 16, 17 all recur here in a Storage- or Edge-Function-specific form). Every claim below was proven on this course's own local stack — real `curl` against `supabase_storage_probe` (storage-api `1.72.1`) and a real `supabase functions serve` process for this review's own Edge Functions, stopped again once every proof below was captured.
+
+## The generated code
+
+```sql
+-- reading-supabase/worked-review-2/files-migration.sql -- as generated, see review below
+insert into storage.buckets (id, name, public)
+values ('wr-files', 'wr-files', true);
+-- AI comment: "public for simplicity, we'll lock it down later"
+
+create policy wr_files_insert on storage.objects
+  for insert to authenticated
+  with check ( bucket_id = 'wr-files' );
+
+create policy wr_files_select on storage.objects
+  for select to authenticated
+  using ( bucket_id = 'wr-files' );
+```
+
+```typescript
+// reading-supabase/worked-review-2/resumable-upload.ts -- as generated, see review below
+import * as tus from 'tus-js-client';
+
+export function uploadLargeFile(file: File, userId: string) {
+  const upload = new tus.Upload(file, {
+    endpoint: `${process.env.SUPABASE_URL}/storage/v1/upload/resumable`,
+    headers: {
+      authorization: `Bearer ${process.env.SUPABASE_ANON_KEY}`,
+      'x-upsert': 'true',
+    },
+    chunkSize: 4 * 1024 * 1024, // 4MB chunks
+    metadata: {
+      bucketName: 'wr-files',
+      objectName: `${userId}/${file.name}`,
+      contentType: file.type,
+      cacheControl: 3600,
+    },
+    onError: (error) => console.error('upload failed', error),
+    onSuccess: () => console.log('upload complete'),
+  });
+  upload.start();
+}
+```
+
+```typescript
+// reading-supabase/worked-review-2/share-link/index.ts -- as generated, see review below
+import { createClient } from 'jsr:@supabase/supabase-js@2'
+
+// AI comment: "anon key is fine here, createSignedUrl doesn't need service_role"
+Deno.serve(async (req) => {
+  const { path } = await req.json()
+  const client = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_ANON_KEY')!,
+  )
+  const { data, error } = await client.storage
+    .from('wr-files')
+    .createSignedUrl(path, 315360000) // "a share link that never expires, basically"
+  return new Response(JSON.stringify({ data, error }), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+})
+```
+
+## The review walk
+
+### A public bucket, "for simplicity"
+
+`storage.buckets` is inserted with `public: true`. Proven: a file uploaded through the normal, policy-checked path is then readable by a request carrying **no credentials at all**:
+
+```bash
+# scripts/reading-supabase/worked-review-2/public-bucket-leak.sh
+curl -s -w "\nHTTP=%{http_code}\n" "$SUPABASE_URL/storage/v1/object/public/wr-files/$DANA_ID/secret-report.txt"
+```
+
+```text
+dana's private-looking file
+
+HTTP=200
+```
+
+No `Authorization`, no `apikey` even — the public object endpoint (`/storage/v1/object/public/...`) is specifically the one PostgREST-equivalent path that **does not evaluate `storage.objects` RLS at all** for a public bucket, by design, since "public" means exactly that.
+
+<SpotTheBug lang="sql" code={`insert into storage.buckets (id, name, public)
+values ('wr-files', 'wr-files', true);
+-- AI comment: "public for simplicity, we'll lock it down later"`}>
+Every RLS policy written for this bucket later in the same migration is genuinely correct and genuinely irrelevant for reads, because `public: true` routes read access around `storage.objects` RLS entirely through a separate endpoint — "we'll lock it down later" describes a step that has to happen on the bucket itself, not a policy that can compensate for it. The fix is `public: false` from the first migration; per-file "share" access is a **signed URL** (below), never bucket-level public.
+</SpotTheBug>
+
+### No folder scoping — the path convention is decoration, not enforcement
+
+The generated `insert`/`select` policies check `bucket_id = 'wr-files'` only. The `$userId/$filename` path shape in the upload client is a **convention**, not something either policy verifies. Proven: Erin, with no relationship to Dana at all, writes directly into what looks like Dana's folder:
+
+```bash
+# scripts/reading-supabase/worked-review-2/no-folder-scoping.sh
+curl -s -w "\nHTTP=%{http_code}\n" -X POST "$SUPABASE_URL/storage/v1/object/wr-files/$DANA_ID/erin-intrusion.txt" \
+  -H "Authorization: Bearer $ERIN_TOKEN" -H "apikey: $SUPABASE_ANON_KEY" -H "Content-Type: text/plain" \
+  --data-binary @erin-intrusion.txt
+```
+
+```text
+{"Key":"wr-files/56d4732b-ab57-4f1b-a6e0-a667455cf4a4/erin-intrusion.txt","Id":"7fbc5a00-51f1-4673-bce8-14cdb596d48f"}
+HTTP=200
+```
+
+<SpotTheBug lang="sql" code={`create policy wr_files_insert on storage.objects
+  for insert to authenticated
+  with check ( bucket_id = 'wr-files' );`}>
+This is the storage twin of [ai-bug-catalog entry 22](/supabase/en/reading-supabase/ai-bug-catalog/): a `bucket_id` check alone scopes to the **bucket**, never to a path inside it. Client code that always uploads to `${userId}/...` creates the *appearance* of per-user isolation with none of the enforcement — any authenticated user can write (and, with the matching `select` policy, read) any path in the bucket. The fix is `(storage.foldername(name))[1] = auth.uid()::text` in every policy's `using`/`with check`, proven below to reject the identical request.
+</SpotTheBug>
+
+### `upsert: true`, insert and update policies, no `select` policy
+
+The TUS client sets `x-upsert: true`, and a later migration (not shown above) adds an `update` policy scoped correctly by folder — but never a `select` policy, on the theory that "they can already insert and update, why would they need to select." Proven with a real re-upload of a path that already exists:
+
+```bash
+# scripts/reading-supabase/worked-review-2/upsert-no-select.sh
+curl -s -w "\nHTTP=%{http_code}\n" -X PUT "$SUPABASE_URL/storage/v1/object/wr-files/$DANA_ID/secret-report.txt" \
+  -H "Authorization: Bearer $DANA_TOKEN" -H "apikey: $SUPABASE_ANON_KEY" -H "Content-Type: text/plain" -H "x-upsert: true" \
+  --data-binary @dana-secret-v2.txt
+```
+
+```text
+{"statusCode":"403","error":"Unauthorized","message":"new row violates row-level security policy","code":"AccessDenied"}
+HTTP=400
+```
+
+<SpotTheBug lang="sql" code={`create policy wr_files_insert_own_folder on storage.objects for insert to authenticated with check (...);
+create policy wr_files_update_own_folder on storage.objects for update to authenticated using (...);
+-- no select policy -- "they can already insert and update"`}>
+Exactly [ai-bug-catalog entry 23](/supabase/en/reading-supabase/ai-bug-catalog/): `upsert` compiles to `INSERT ... ON CONFLICT DO UPDATE`, and Postgres needs a **`select`**-policy-visible existing row to even evaluate the conflict path — without one, the exact same call that succeeds on a brand-new path (pure insert) fails the moment the same path is re-uploaded, with no message anywhere mentioning "select" to explain why. The fix, proven below, is adding the `select` policy: the identical request then succeeds.
+</SpotTheBug>
+
+### A signed URL with a 10-year expiry
+
+`createSignedUrl(path, 315360000)` — 315,360,000 seconds. Proven: the API accepts it with no validation at all, and the token it issues really does carry that span:
+
+```bash
+# scripts/reading-supabase/worked-review-2/ten-year-signed-url.sh
+curl -s -X POST "$SUPABASE_URL/storage/v1/object/sign/wr-files/$DANA_ID/secret-report.txt" \
+  -H "Authorization: Bearer $DANA_TOKEN" -H "apikey: $SUPABASE_ANON_KEY" -H "Content-Type: application/json" \
+  -d '{"expiresIn": 315360000}'
+```
+
+```text
+{"signedURL":"/object/sign/wr-files/56d4732b-.../secret-report.txt?token=eyJhbGc..."}
+HTTP=200
+```
+
+Decoding the returned token's own `iat`/`exp` claims confirms it, in seconds:
+
+```text
+{'url': 'wr-files/56d4732b-.../secret-report.txt', 'scope': 'download', 'iat': 1790671228, 'exp': 2106031228}
+years: 9.99315537303217
+```
+
+<SpotTheBug lang="ts" code={`.createSignedUrl(path, 315360000) // "a share link that never expires, basically"`}>
+There is no server-side cap on `expiresIn` to catch this — confirmed above with a real, accepted request. A "share link" is meant to expire; a signed URL that outlives almost every session, password rotation, and offboarding process at a real company is functionally a second, un-revocable password for that one file, since Supabase Storage signed URLs cannot be individually invalidated before their `exp` — the only way to cut one off early is rotating the bucket/project-level signing mechanism, which invalidates every other outstanding signed URL too. The fix is a short, deliberate expiry (minutes to low hours for a share link, chosen per feature, never a number that reads as "basically forever").
+</SpotTheBug>
+
+### `cacheControl: 3600` as a number, and as a raw seconds count either way
+
+Two separate mistakes stacked on one field. First, the TUS metadata sets `cacheControl: 3600` — a **number** — where the type is `string`:
+
+```ts
+// @expect-error Type 'number' is not assignable to type 'string'.
+import { createClient } from '@supabase/supabase-js';
+const supabase = createClient('http://x', 'x');
+await supabase.storage.from('wr-files').upload('x/y.txt', new Blob(), {
+  cacheControl: 3600,
+});
+```
+
+```text
+error TS2322: Type 'number' is not assignable to type 'string'.
+```
+
+Second, even fixed to the string `'3600'`, that value is taken **completely literally** as the header's contents, not converted into a valid `Cache-Control` directive:
+
+```bash
+# scripts/reading-supabase/worked-review-2/cachecontrol-literal.sh
+curl -s -X POST "$SUPABASE_URL/storage/v1/object/wr-files/$DANA_ID/cache-test.txt" \
+  -H "Authorization: Bearer $DANA_TOKEN" -H "apikey: $SUPABASE_ANON_KEY" -H "cache-control: 3600" \
+  --data-binary @dana-secret.txt
+curl -sI "$SUPABASE_URL/storage/v1/object/wr-files/$DANA_ID/cache-test.txt" -H "Authorization: Bearer $DANA_TOKEN" -H "apikey: $SUPABASE_ANON_KEY" | grep -i cache-control
+```
+
+```text
+cache-control: 3600
+```
+
+<SpotTheBug lang="ts" code={`metadata: {
+  ...
+  cacheControl: 3600,
+},`}>
+`Cache-Control: 3600` (bare, no directive name) is not valid HTTP — a spec-compliant cache has no obligation to honor it, and confirmed above, the storage API stores and serves back exactly the literal string it was given, with zero validation that it forms a real directive. Whatever browsers or CDNs do with an invalid header value is undefined behavior, not a guarantee. The fix is `cacheControl: '3600'` (a string, satisfying `tsc`) formatted as an actual directive — `'max-age=3600'` — which is what every other real example in this course's Storage lesson uses.
+</SpotTheBug>
+
+### TUS chunk size not 6MB — and a local/hosted gap worth saying out loud
+
+Docs are explicit and narrow here, quoted directly from [supabase.com/docs/guides/storage/resumable-uploads](https://supabase.com/docs/guides/storage/resumable-uploads) (fetched fresh for this review): *"chunkSize: 6 * 1024 * 1024, // NOTE: it must be set to 6MB (for now) do not change it."* The generated client sets `chunkSize: 4 * 1024 * 1024`. Proven directly against this review's own bucket — a real 10,000,000-byte upload, first chunk exactly 4,000,000 bytes (not 6MB):
+
+```bash
+# scripts/reading-supabase/worked-review-2/tus-wrong-chunk.sh
+curl -s -w "\nHTTP=%{http_code}\n" -X PATCH "$LOCATION" \
+  -H "Authorization: Bearer $DANA_TOKEN" -H "apikey: $SUPABASE_ANON_KEY" \
+  -H "Tus-Resumable: 1.0.0" -H "Upload-Offset: 0" -H "Content-Type: application/offset+octet-stream" \
+  --data-binary @wr-chunk1-4mb.bin
+```
+
+```text
+HTTP=204
+```
+
+...and the full 10,000,000-byte upload completed with no error at any point:
+
+```text
+{"id":"...","bucket_id":"wr-files","size":10000000,...}
+```
+
+<SpotTheBug lang="ts" code={`chunkSize: 4 * 1024 * 1024, // 4MB chunks`}>
+On **this local stack specifically**, `docker exec supabase_storage_probe env` shows `STORAGE_BACKEND=file` — a filesystem backend, not the S3 multipart backend hosted Supabase uses, which is exactly why the 6MB requirement (an S3 multipart minimum-part-size constraint the docs pass straight through, not an arbitrary Supabase limit) never triggers a real error here, proven above. Shipping this exact client against **hosted** Supabase (S3-backed) is expected to fail differently and for real, per the docs' own explicit warning — this is a genuine local-vs-hosted gap this review is saying out loud rather than papering over: a passing local test here would be false confidence. The fix is simply following the docs literally: `chunkSize: 6 * 1024 * 1024`, unchanged.
+</SpotTheBug>
+
+### Edge Function signs URLs with the anon key — RLS blocks everyone, including the file's own owner
+
+`share-link`'s function body creates its Supabase client with `SUPABASE_ANON_KEY` and never forwards the caller's own `Authorization` header, so every request the function makes runs as genuinely anonymous — no `auth.uid()` at all. Proven: Dana, the real, authenticated owner of the file, asks the function for a link to her own file:
+
+```bash
+# scripts/reading-supabase/worked-review-2/edge-anon-blocks-owner.sh
+curl -s -w "\nHTTP=%{http_code}\n" -X POST "$FUNCTIONS_URL/wr-share-link-anon" \
+  -H "Authorization: Bearer $DANA_TOKEN" -H "apikey: $ANON_KEY" -H "Content-Type: application/json" \
+  -d '{"path":"'"$DANA_ID"'/secret-report.txt"}'
+```
+
+```text
+{"data":null,"error":{"name":"StorageApiError","message":"Object not found","status":400,"statusCode":"404","code":"NoSuchKey"}}
+HTTP=200
+```
+
+The function itself returns `HTTP 200` — the *request* to the function succeeded — while the *storage call inside it* failed for everyone, with an error message ("Object not found") that gives no hint the real cause is RLS denying a request with no identity at all, not a missing file.
+
+<SpotTheBug lang="ts" code={`const client = createClient(
+  Deno.env.get('SUPABASE_URL')!,
+  Deno.env.get('SUPABASE_ANON_KEY')!,
+)
+const { data, error } = await client.storage.from('wr-files').createSignedUrl(path, ...)`}>
+This is the inverse failure mode of [ai-bug-catalog entry 25](/supabase/en/reading-supabase/ai-bug-catalog/) (which ships `service_role` too broadly): here the function is scoped too narrowly, and RLS — correctly protecting every other caller — also blocks the one caller who is supposed to succeed, because the function never identifies who is actually calling. The fix is not "switch to `service_role`" by itself (that alone would recreate the `service_role`-in-the-wrong-place bug from the previous review, letting anyone request anyone's file) — it is `service_role`, used **only after** the function has verified the real caller's identity itself and checked that the requested path belongs to them, proven below.
+</SpotTheBug>
+
+### The fixed function, and what "scoped correctly" actually requires
+
+The corrected function identifies the caller with the **anon** key plus their own forwarded token (`anon.auth.getUser(token)`), checks the requested path's folder against that verified id, and only then uses **`service_role`** — deliberately, for exactly that one already-checked path — to mint the signed URL. Proven twice: Dana's own file succeeds, and Dana requesting Erin's file by path is rejected by the function's own check, not by RLS:
+
+```bash
+# scripts/reading-supabase/worked-review-2/edge-fixed-own-and-forbidden.sh
+curl -s -w "\nHTTP=%{http_code}\n" -X POST "$FUNCTIONS_URL/wr-share-link" \
+  -H "Authorization: Bearer $DANA_TOKEN" -H "apikey: $ANON_KEY" -H "Content-Type: application/json" \
+  -d '{"path":"'"$DANA_ID"'/secret-report.txt"}'
+
+curl -s -w "\nHTTP=%{http_code}\n" -X POST "$FUNCTIONS_URL/wr-share-link" \
+  -H "Authorization: Bearer $DANA_TOKEN" -H "apikey: $ANON_KEY" -H "Content-Type: application/json" \
+  -d '{"path":"'"$ERIN_ID"'/erin-own.txt"}'
+```
+
+```text
+--- dana's own file ---
+{"data":{"signedUrl":"http://kong:8000/storage/v1/object/sign/wr-files/56d4732b-.../secret-report.txt?token=..."},"error":null}
+HTTP=200
+
+--- dana requesting erin's file by path ---
+{"error":"forbidden: not your file"}
+HTTP=403
+```
+
+### A bare specifier import — the same `BOOT_ERROR` a different function gets
+
+A separate small function in this review, meant to reuse the project's client the same way another lesson's `deno.json` import map does, imports `'supabase'` with no import map configured for **this** function. Proven with a real invocation:
+
+```bash
+# scripts/reading-supabase/worked-review-2/bare-import-boot-error.sh
+curl -s -w "\nHTTP=%{http_code}\n" "$FUNCTIONS_URL/wr-bare-import" -H "Authorization: Bearer $ANON_KEY" -H "apikey: $ANON_KEY"
+```
+
+```text
+{"code":"BOOT_ERROR","message":"Worker failed to boot (please check logs)"}
+HTTP=503
+```
+
+<SpotTheBug lang="ts" code={`import { createClient } from 'supabase'`}>
+Exactly [ai-bug-catalog entry 16](/supabase/en/reading-supabase/ai-bug-catalog/): Deno resolves `jsr:`, `npm:`, and full URL specifiers, but a bare package name resolves to nothing unless **this function's own** `deno.json` maps it — copying an import line from a function that has one, into a function that doesn't, is enough to break the whole function at boot, before any request-handling code runs at all. The fix is `import { createClient } from 'jsr:@supabase/supabase-js@2'` (or a matching `imports` entry in this function's own `deno.json`).
+</SpotTheBug>
+
+### Missing CORS headers on the actual response — masked by Kong locally on `OPTIONS`
+
+Neither generated function sets its own CORS headers. On **this local stack**, Kong answers every `OPTIONS` preflight itself before either function ever sees the request (documented already in [Writing and Invoking a Function](/supabase/en/edge-functions/writing-and-invoking-a-function/)) — so an `OPTIONS` probe against both functions looks identical and gives no signal. The real difference only shows up on the actual response:
+
+```bash
+# scripts/reading-supabase/worked-review-2/cors-real-response.sh
+curl -s -i -X POST "$FUNCTIONS_URL/wr-share-link" -H "Authorization: Bearer $DANA_TOKEN" -H "apikey: $ANON_KEY" \
+  -H "Content-Type: application/json" -H "Origin: https://example.com" -d '{"path":"'"$DANA_ID"'/secret-report.txt"}' \
+  | grep -i access-control
+
+curl -s -i -X POST "$FUNCTIONS_URL/wr-share-link-anon" -H "Authorization: Bearer $DANA_TOKEN" -H "apikey: $ANON_KEY" \
+  -H "Content-Type: application/json" -H "Origin: https://example.com" -d '{"path":"'"$DANA_ID"'/secret-report.txt"}' \
+  | grep -i access-control
+```
+
+```text
+--- fixed function's real response headers ---
+access-control-allow-origin: *
+access-control-allow-headers: authorization, apikey, content-type
+access-control-allow-methods: POST, OPTIONS
+
+--- broken function's real response headers ---
+Access-Control-Allow-Origin: *
+(nothing else -- no access-control-allow-headers, no access-control-allow-methods, from the function itself)
+```
+
+<SpotTheBug lang="ts" code={`Deno.serve(async (req) => {
+  const { path } = await req.json()
+  // no OPTIONS handling, no CORS headers set anywhere in this function
+  ...
+})`}>
+Kong injects a bare `Access-Control-Allow-Origin: *` on every response regardless, which is exactly what makes this bug invisible to a `curl` OPTIONS probe and to casual local testing — a real browser's preflight check also needs `Access-Control-Allow-Headers` to explicitly list every non-simple header the actual request sends (here, `authorization` and `apikey`), which only the fixed function sets. The fix is answering `OPTIONS` explicitly and setting the same CORS headers on every response, proven above, not relying on the gateway's default.
+</SpotTheBug>
+
+### `verify_jwt` — and a shared-stack gap worth being honest about
+
+Neither function sets `verify_jwt = false`, so the default (`true`) should gate every request at the gateway before the function's own code runs — exactly as proven for `edge-hello` in [Writing and Invoking a Function](/supabase/en/edge-functions/writing-and-invoking-a-function/). Proven on **that** already-running function, in this exact shared stack, right now:
+
+```bash
+# scripts/reading-supabase/worked-review-2/verify-jwt-existing-function.sh
+curl -s -w "\nHTTP=%{http_code}\n" "$FUNCTIONS_URL/edge-hello"
+```
+
+```text
+{"code":"UNAUTHORIZED_NO_AUTH_HEADER","message":"Missing authorization header","msg":"Missing authorization header"}
+HTTP=401
+```
+
+But the identical missing-header request against **this review's own**, newly-added function does not get that gateway-level rejection at all — it reaches the function's own code, which returns its own `401` instead:
+
+```bash
+# scripts/reading-supabase/worked-review-2/verify-jwt-new-function.sh
+curl -s -w "\nHTTP=%{http_code}\n" -X POST "$FUNCTIONS_URL/wr-share-link" -H "apikey: $ANON_KEY" -H "Content-Type: application/json" -d '{"path":"x"}'
+```
+
+```text
+{"error":"not authenticated"}
+HTTP=401
+```
+
+<Callout title="A shared-stack artifact, not a security property">
+This course's harness never restarts the shared local stack (per this module's own hard rules) — and Kong's declarative gateway configuration, including its per-function `verify_jwt` route, is provisioned when the stack (or `supabase functions serve`) starts from the function list on disk **at that moment**. A function added to the filesystem afterward, on an already-running shared stack, is served by the Edge Runtime but never gets that gateway-level check retroactively wired in without a restart this course deliberately never performs. This is a local/shared-stack development artifact, confirmed above by the identical check succeeding for an *earlier* function (`edge-hello`) and failing for a brand-new one in the *same* running stack — not a statement about hosted Supabase, which provisions `verify_jwt` per function at deploy time. It is exactly why the fixed function in this review re-verifies the caller's identity in its **own code** (`anon.auth.getUser(token)`) rather than trusting `verify_jwt` config alone — the one layer of defense that stays correct regardless of gateway state.
+</Callout>
+
+### Image transformation assumed available
+
+Nothing in the generated code requests a transformed image directly, but the PR description for this feature mentions "thumbnails via the render endpoint, no extra work needed." Proven against this review's own bucket, a real uploaded PNG:
+
+```bash
+# scripts/reading-supabase/worked-review-2/image-transform-404.sh
+curl -s -w "\nHTTP=%{http_code}\n" "$SUPABASE_URL/storage/v1/render/image/authenticated/wr-files/$DANA_ID/photo.png?width=20&height=20" \
+  -H "Authorization: Bearer $DANA_TOKEN" -H "apikey: $SUPABASE_ANON_KEY"
+```
+
+```text
+{"statusCode":"404","error":"Not Found","message":"Route GET:/render/image/authenticated/wr-files/.../photo.png?width=20&height=20 not found","code":"InvalidRequest"}
+HTTP=404
+```
+
+<SpotTheBug lang="ts" code={`// PR description: "thumbnails via the render endpoint, no extra work needed"`}>
+Proven identically in [Image Transformations and CDN](/supabase/en/realtime-and-storage/image-transformations-and-cdn/): the local CLI ships `[storage.image_transformation]` **commented out** by default, so the `/render/image/...` route does not exist locally at all — this is not a transform failing, it is a route genuinely absent, confirmed by the `404`/`InvalidRequest` shape rather than any image-processing error. The fix for this review is the same as that lesson's: uncomment the flag locally to match a hosted project with the add-on enabled, or budget for pre-generating thumbnails at upload time if the target plan doesn't have it.
+</SpotTheBug>
+
+## The corrected code
+
+```sql
+-- supabase/migrations/7402_wr_files_storage.sql
+insert into storage.buckets (id, name, public)
+values ('wr-files', 'wr-files', false);
+
+create policy wr_files_insert_own_folder on storage.objects
+  for insert to authenticated
+  with check ( bucket_id = 'wr-files' and (storage.foldername(name))[1] = auth.uid()::text );
+
+create policy wr_files_select_own_folder on storage.objects
+  for select to authenticated
+  using ( bucket_id = 'wr-files' and (storage.foldername(name))[1] = auth.uid()::text );
+
+create policy wr_files_update_own_folder on storage.objects
+  for update to authenticated
+  using ( bucket_id = 'wr-files' and (storage.foldername(name))[1] = auth.uid()::text );
+```
+
+```ts
+// supabase/functions/wr-share-link/index.ts
+import { createClient } from 'jsr:@supabase/supabase-js@2'
+
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'authorization, apikey, content-type',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+}
+
+Deno.serve(async (req) => {
+  if (req.method === 'OPTIONS') {
+    return new Response(null, { headers: corsHeaders })
+  }
+
+  const authHeader = req.headers.get('Authorization') ?? ''
+  const token = authHeader.replace('Bearer ', '')
+
+  const anon = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_ANON_KEY')!,
+  )
+  const { data: userData, error: userErr } = await anon.auth.getUser(token)
+  if (userErr || !userData.user) {
+    return new Response(JSON.stringify({ error: 'not authenticated' }), {
+      status: 401,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    })
+  }
+
+  const { path } = await req.json()
+  const ownerFolder = path.split('/')[0]
+  if (ownerFolder !== userData.user.id) {
+    return new Response(JSON.stringify({ error: 'forbidden: not your file' }), {
+      status: 403,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    })
+  }
+
+  const admin = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,
+  )
+  const { data, error } = await admin.storage.from('wr-files').createSignedUrl(path, 3600)
+  return new Response(JSON.stringify({ data, error }), {
+    headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+  })
+})
+```
+
+```ts
+// src/reading-supabase/worked-review-2/folder-isolation.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+const url = process.env.SUPABASE_URL!;
+const anonKey = process.env.SUPABASE_ANON_KEY!;
+const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+const admin = createClient(url, serviceKey);
+const stamp = Date.now();
+
+async function makeUser(email: string) {
+  const { data, error } = await admin.auth.admin.createUser({
+    email,
+    password: 'wr-Passw0rd!',
+    email_confirm: true,
+  });
+  if (error) throw error;
+  const signInClient = createClient(url, anonKey);
+  const { data: signIn, error: sErr } = await signInClient.auth.signInWithPassword({
+    email,
+    password: 'wr-Passw0rd!',
+  });
+  if (sErr) throw sErr;
+  return { id: data.user.id, client: createClient(url, anonKey, {
+    global: { headers: { Authorization: `Bearer ${signIn.session!.access_token}` } },
+  }) };
+}
+
+async function main() {
+  const dana = await makeUser(`wr+run-dana-${stamp}@example.com`);
+  const erin = await makeUser(`wr+run-erin-${stamp}@example.com`);
+
+  const { error: uploadErr } = await dana.client.storage
+    .from('wr-files')
+    .upload(`${dana.id}/report.txt`, new Blob(['dana report']), { contentType: 'text/plain' });
+  if (uploadErr) throw uploadErr;
+  console.log('dana uploaded into her own folder');
+
+  const { error: intrusionErr } = await erin.client.storage
+    .from('wr-files')
+    .upload(`${dana.id}/erin-intrusion.txt`, new Blob(['intrusion']), { contentType: 'text/plain' });
+  if (!intrusionErr) {
+    throw new Error('folder isolation broken -- erin wrote into dana\'s folder');
+  }
+  console.log('erin correctly blocked from writing into dana\'s folder:', intrusionErr.message);
+
+  const { data: signedUrl, error: signErr } = await dana.client.storage
+    .from('wr-files')
+    .createSignedUrl(`${dana.id}/report.txt`, 60);
+  if (signErr) throw signErr;
+  console.log('dana signed her own file:', !!signedUrl.signedUrl);
+
+  await admin.auth.admin.deleteUser(dana.id);
+  await admin.auth.admin.deleteUser(erin.id);
+  console.log('folder isolation test passed');
+}
+
+main().catch((err) => {
+  console.error(err);
+  throw err;
+});
+```
+
+Run for real against this course's own local stack (the harness's `--run` repeats this at gate time):
+
+```text
+dana uploaded into her own folder
+erin correctly blocked from writing into dana's folder: new row violates row-level security policy
+dana signed her own file: true
+folder isolation test passed
+```
+
+## What changed and why
+
+| # | Bug | Fix |
+|---|---|---|
+| 1 | Bucket created `public: true` "for simplicity" | `public: false` — proven: an anonymous request read a file with zero credentials otherwise |
+| 2 | Storage policies check only `bucket_id`, no folder | `(storage.foldername(name))[1] = auth.uid()::text` — proven: any authenticated user could write into any folder otherwise |
+| 3 | `upsert: true` with insert/update policies, no select | Added `select` policy — real RLS failure on re-upload otherwise |
+| 4 | `createSignedUrl(path, 315360000)` — 10-year expiry | A short, deliberate expiry — proven: no server-side cap catches this |
+| 5 | `cacheControl: 3600` (number) and taken as a literal header value | `cacheControl: 'max-age=3600'` — real `tsc` error otherwise, and an invalid header either way |
+| 6 | TUS `chunkSize: 4 * 1024 * 1024` | `chunkSize: 6 * 1024 * 1024` per docs — local (file-backed) accepted it anyway; hosted (S3-backed) would not |
+| 7 | Edge Function signs URLs using only the `anon` key | `service_role`, used only after the function verifies the caller's own identity and path ownership — proven: the anon-only version blocked even the file's real owner |
+| 8 | Bare specifier `'supabase'` import | `jsr:@supabase/supabase-js@2` — real `BOOT_ERROR`/`503` otherwise |
+| 9 | No CORS headers set by either function | Explicit `OPTIONS` handling + headers on every response — proven: only visible on the real response, not the Kong-masked `OPTIONS` |
+| 10 | Assuming `verify_jwt` alone protects a newly-added function on this shared stack | Verify the caller's identity in the function's own code too — proven: a new function on this running stack skips the gateway-level check an older one still gets |
+| 11 | Thumbnails assumed to "just work" via the render endpoint | Uncomment `[storage.image_transformation]` locally, or pre-generate thumbnails — real `404`/`InvalidRequest` otherwise |
+
+## What the reviewer writes in the PR
+
+> Can't approve this one either — 11 things, roughly by how they'd bite:
+>
+> **Ships every file to the internet:**
+> 1. Bucket is `public: true` "for simplicity" — I read a file with zero credentials. Make it private; signed URLs are the actual "share" mechanism.
+> 2. Policies check `bucket_id` only, never the folder — I wrote into another user's folder as a completely unrelated user. Add the `storage.foldername` check.
+>
+> **Silent failures a real user will hit immediately:**
+> 3. No `select` policy, but `upsert: true` — re-uploading the same path 403s with a message that never says "select."
+> 4. Signed URL with a 10-year `expiresIn` — there's no server cap; this is a second password for that file, indefinitely.
+>
+> **Compiles or "works," does the wrong thing:**
+> 5. `cacheControl: 3600` — wrong type, and even as a string it's not a valid directive.
+> 6. TUS `chunkSize` is 4MB, docs say exactly 6MB — passed locally by accident (file backend), will fail on hosted (S3 backend).
+>
+> **Blocks the one caller who's supposed to work:**
+> 7. Share-link function signs URLs with `anon` and never forwards the caller's token — it blocks the file's own owner, not just strangers.
+>
+> **Won't even boot, or leaks CORS/JWT gaps:**
+> 8. Bare `'supabase'` import in the second function — real `BOOT_ERROR` on every call.
+> 9. Neither function sets its own CORS headers — invisible against `curl`/Kong locally, will bite a real browser.
+> 10. Don't rely on `verify_jwt` alone for a function added after this stack started — verify identity in code too.
+> 11. Thumbnails need the image-transformation add-on (or pre-generation) — it's not automatic anywhere without it enabled.
+>
+> Happy to pair — most of these are one property or one header away from correct.
+
+## Mental Model
+
+The bucket-level bugs (1) and the RLS-shaped bugs (2, 3) all share one property: they compile, they run, and the **wrong** request is the one that "just works" — a public bucket serves everyone happily, a folder-less policy lets any upload through, `upsert` on a fresh path succeeds and only breaks on the second attempt. The two Edge Function identity bugs (7, and its inverse in the fixed version) show the same shape from opposite directions: too broad (anon-catalog-25-style) breaks nobody visibly but exposes everyone, too narrow (this review's actual bug) breaks the one caller who should succeed. The infrastructure-adjacent bugs (6, 10, 11) are the most honest ones to get wrong: each has a real, documented requirement or limit that simply doesn't manifest as an error on **this specific local stack**, for a reason worth understanding (file backend vs. S3 backend; Kong's config snapshot timing; a commented-out local flag) rather than memorizing as "it just works here."
+
+## Trade-offs
+
+- **A public bucket is genuinely the right choice for content that is meant to be public** (marketing assets, a public avatar) — the bug here isn't "public buckets are wrong," it's using one for content a feature description called "sharing," which implies scoped, revocable access a public bucket cannot express at all.
+- **`service_role` inside an Edge Function, used only after an explicit identity check, is more code than trusting RLS alone** — at the benefit of the function being able to enforce authorization logic RLS genuinely cannot express on its own (here: "the folder must match the verified caller," which storage.objects RLS could also do, but a real app's sharing rules often need a lookup RLS can't see, like an explicit grants table).
+- **A short signed-URL expiry is safer but less convenient** — a share link that expires in an hour means legitimately re-sharing it later requires generating a new one, which is friction a 10-year expiry "solves" by removing the safety property entirely rather than by being more convenient in a good way.
+
+## Common Misconceptions
+
+- **"A `bucket_id` check in a storage policy scopes access to that user's files."** Proven above: it scopes to the *bucket*, which every authenticated user in this review shares — folder-level isolation is an explicit `storage.foldername(name)` check the AI-generated policy never wrote.
+- **"If `curl -X OPTIONS` looks fine, the function's CORS setup is fine."** Proven above with two functions that give an identical `OPTIONS` response locally (Kong answers before either function runs) and a genuinely different real POST response — only one of them actually sets the headers a browser's preflight needs.
+- **"`verify_jwt = true` (the default) always protects a function before its own code runs."** Proven above on this exact shared, never-restarted stack: it does for a function present when the stack last started, and does not, right now, for a function added afterward — which is exactly why the fixed function in this review checks identity in its own code too.
+
+<Mermaid title="Where each bug sits in one file-sharing request" code={wr2Diagram} />
+
+export const wr2Diagram = `flowchart TD
+  A["bucket: public true"] -->|"1: anon reads with zero creds"| A
+  B["policy: bucket_id only"] -->|"2: any user writes any folder"| B
+  C["upsert:true, no select policy"] -->|"3: re-upload 403s"| C
+  D["createSignedUrl(path, 10yr)"] -->|"4: no server cap"| D
+  E["cacheControl: 3600 (number)"] -->|"5: tsc error + invalid header"| E
+  F["TUS chunkSize: 4MB"] -->|"6: docs say 6MB exactly"| F
+  G["share-link fn: anon key only"] -->|"7: blocks the real owner"| G
+  H["second fn: bare 'supabase' import"] -->|"8: BOOT_ERROR"| H
+  I["neither fn sets CORS headers"] -->|"9: masked by Kong locally"| I
+  J["verify_jwt assumed sufficient"] -->|"10: not wired for a new fn here"| J
+  K["render endpoint assumed on"] -->|"11: 404 locally"| K
+`;
+
+<Callout title="The one-line takeaway">
+Three of these eleven bugs are invisible specifically *because* of something about the local, shared, never-restarted stack this course runs on — the TUS chunk-size limit (file backend, not S3), the `verify_jwt` gap on a newly-added function (Kong's config snapshot timing), and the image-transformation 404 (a commented-out local flag) — each one would behave differently, and in the TUS/`verify_jwt` cases more strictly, on hosted Supabase. A review that only tests locally and calls that equivalence would ship all three straight to production.
+</Callout>
+
+export const quizWorkedReview2 = [
+  {
+    q: 'A file was uploaded through the normal, policy-checked upload path into a bucket created with `public: true`. A request with no `Authorization` and no `apikey` header at all still read it successfully via `/storage/v1/object/public/wr-files/...`. Why do the correctly-written RLS policies on `storage.objects` not stop this?',
+    options: [
+      'The policies are wrong and need to check public access explicitly',
+      'The /storage/v1/object/public/... endpoint is specifically the public-bucket read path, which does not evaluate storage.objects RLS at all -- public:true routes reads around RLS entirely, by design',
+      'RLS only applies to INSERT and UPDATE, never SELECT, on storage.objects',
+      'The anon key was sent implicitly by curl',
+    ],
+    answer: 1,
+    explain: 'Proven directly above: the exact request carried zero credentials of any kind and still returned the file content with HTTP 200 -- the bucket\'s own public flag, not a policy gap, is what makes this path skip RLS.',
+  },
+  {
+    q: '`with check (bucket_id = \'wr-files\')` was the entire insert policy. Erin, with no relationship to Dana, POSTed to a path starting with Dana\'s user id and got HTTP 200 with a real object created. What does this prove about what a `bucket_id`-only check actually scopes?',
+    options: [
+      'It scopes access correctly as long as usernames are unpredictable',
+      "It scopes only to the bucket as a whole -- the $userId/ prefix in the path is a client-side naming convention the policy never inspects, so any authenticated user can write to any path in the bucket regardless of whose id prefixes it",
+      'This only works because Erin guessed a valid UUID',
+      'bucket_id checks are sufficient once combined with a public:false bucket',
+    ],
+    answer: 1,
+    explain: "Proven directly above: Erin's write succeeded with a real 200 and a real object id, into a path prefixed with someone else's user id -- the fix, storage.foldername(name)[1] = auth.uid()::text, is proven separately to reject the identical request.",
+  },
+  {
+    q: 'A bucket had insert and update policies (both folder-scoped correctly) but no select policy. Uploading to a brand-new path succeeded; re-uploading the SAME path with `x-upsert: true` failed with a real RLS error. Why does adding a select policy fix this specific failure?',
+    options: [
+      'select policies are unrelated; the real fix is a different update policy',
+      'upsert compiles to INSERT ... ON CONFLICT DO UPDATE, and Postgres needs select-policy-visibility into the existing row to evaluate whether a conflict exists at all -- with no select policy, that check itself is denied, independent of the insert/update policies being correct',
+      'The bucket needs public:true for upsert to work',
+      'This only happens when the file content is identical',
+    ],
+    answer: 1,
+    explain: 'Proven directly above: the identical request succeeds on a fresh path (pure insert, no conflict check needed) and fails only on a re-upload (the ON CONFLICT path), with the fix (adding a select policy) making the exact same re-upload succeed.',
+  },
+  {
+    q: 'A 10,000,000-byte TUS upload, with a first chunk of exactly 4,000,000 bytes (not a multiple of the documented 6MB), completed with no error on this local stack -- confirmed via `docker exec supabase_storage_probe env` showing `STORAGE_BACKEND=file`. What does this actually prove?',
+    options: [
+      'The 6MB chunk-size requirement in the docs is outdated and no longer applies anywhere',
+      "The requirement is real and documented, but ties to hosted Supabase's S3-backed multipart storage; this local stack's filesystem backend has no such constraint to enforce, so a client that violates the documented requirement can pass locally and still fail once deployed against hosted, S3-backed storage",
+      'TUS uploads never actually check chunk size at any layer',
+      'The upload succeeded because the file was under some other, larger size limit',
+    ],
+    answer: 1,
+    explain: 'Proven directly above: the exact env var confirms the file backend, and the full upload completed with a correct final size and no error anywhere in the chunk sequence -- a passing local test here is not equivalent to a passing hosted test, which the docs\' own 6MB requirement implies is enforced by the S3 backend it targets.',
+  },
+  {
+    q: 'The `wr-share-link-anon` function used only `SUPABASE_ANON_KEY`, with no forwarding of the caller\'s own token. Dana, the real authenticated owner of the requested file, called it and got `{"data":null,"error":{"message":"Object not found",...}}`, HTTP 200. Why does this fail even for the file\'s legitimate owner?',
+    options: [
+      'The file genuinely did not exist at that path',
+      "The client inside the function has no identity at all -- it never received Dana's JWT -- so from storage.objects RLS's perspective, auth.uid() is null for this request regardless of who actually called the function over HTTP, and the folder-scoped policy denies it the same way it would deny a total stranger",
+      'anon keys cannot call createSignedUrl under any circumstances',
+      'The function returned 200 because the request itself was fine; this is expected correct behavior',
+    ],
+    answer: 1,
+    explain: "Proven directly above, contrasted with the fixed function: the fixed version forwards and verifies the caller's real token first, and the identical request for Dana's own file then succeeds with a real signed URL -- confirming the anon-only version's failure is an identity problem, not a missing-file problem.",
+  },
+  {
+    q: '`curl -X OPTIONS` against both the fixed and the broken share-link function returned an identical response locally. The real `POST` response headers, however, differed: only the fixed function\'s response included `access-control-allow-headers`. What does this gap prove about testing CORS locally with curl?',
+    options: [
+      'Nothing differs; both functions handle CORS identically',
+      "On this local stack, Kong answers OPTIONS preflight requests itself before either function's code runs, so an OPTIONS probe gives no signal about what a function itself does -- the real CORS headers a function sets only show up on its actual response, which is where the broken function's missing headers become visible",
+      'OPTIONS requests are not supported by the local Edge Runtime at all',
+      'curl cannot send an Origin header, so this test is invalid',
+    ],
+    answer: 1,
+    explain: "Proven directly above: identical OPTIONS responses from both functions (Kong's own default headers), but the real POST response from the broken function carried no access-control-allow-headers or access-control-allow-methods at all, versus explicit values from the fixed function -- a real browser's preflight decision depends on exactly those headers.",
+  },
+];
+
+<Quiz client:visible id="reading-supabase/worked-review-2" questions={quizWorkedReview2} />
+
+<ProgressTracker client:visible id="reading-supabase/worked-review-2" />

@@ -1,0 +1,685 @@
+---
+title: 'Worked review 2: แอป file-sharing'
+description: 'bucket, storage.objects policy, resumable-upload client และ share-link Edge Function ที่ AI สร้าง -- รีวิวทีละบั๊กกับ public bucket leak จริง, folder-scoping bypass จริง, signed URL ที่ถูก RLS บล็อกจริง และ BOOT_ERROR จริง บน local Supabase Storage 1.72.1 stack'
+sidebar:
+  order: 5
+---
+
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import Mermaid from '../../../../components/Mermaid.astro';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## ฟีเจอร์
+
+prompt ที่ให้ไปคือ: *"สร้าง file sharing: user อัปโหลดไฟล์เข้าโฟลเดอร์ตัวเอง มี resumable upload สำหรับไฟล์ใหญ่ และสร้าง share link ที่ใช้ได้กับใครก็ตามที่มี URL"* สิ่งที่ตามมาอ่านดูเหมือน draft แรกที่ทำงานได้จริง -- bucket สร้างได้, upload สำเร็จ, share link เปิดในหน้าต่าง incognito ใหม่โดยไม่ต้อง login ส่วนสุดท้ายนั่นแหละคือกับดัก: "เปิดได้โดยไม่ต้อง login" คือฟีเจอร์ที่ตั้งใจสำหรับ share link แต่เป็นพฤติกรรมที่เกิดขึ้นโดยไม่ตั้งใจกับทุกอย่างอื่นในรีวิวนี้ มันมี **บั๊กจริง 11 ตัว** ดูที่ **[AI bug catalog](/supabase/th/reading-supabase/ai-bug-catalog/)** สำหรับรูปแบบทั่วไปเบื้องหลังหลายตัว (22, 23, 24, 25, 16, 17 ล้วนโผล่ซ้ำที่นี่ในรูปแบบเฉพาะของ Storage หรือ Edge Function) ทุกข้อกล่าวอ้างด้านล่างถูกพิสูจน์บน local stack ของคอร์สนี้เอง -- `curl` จริงยิง `supabase_storage_probe` (storage-api `1.72.1`) และ process `supabase functions serve` จริงสำหรับ Edge Function ของรีวิวนี้เอง ซึ่งถูกหยุดอีกครั้งทันทีที่ทุกข้อพิสูจน์ด้านล่างถูกเก็บครบ
+
+## โค้ดที่ AI สร้าง
+
+```sql
+-- reading-supabase/worked-review-2/files-migration.sql -- as generated, see review below
+insert into storage.buckets (id, name, public)
+values ('wr-files', 'wr-files', true);
+-- AI comment: "public for simplicity, we'll lock it down later"
+
+create policy wr_files_insert on storage.objects
+  for insert to authenticated
+  with check ( bucket_id = 'wr-files' );
+
+create policy wr_files_select on storage.objects
+  for select to authenticated
+  using ( bucket_id = 'wr-files' );
+```
+
+```typescript
+// reading-supabase/worked-review-2/resumable-upload.ts -- as generated, see review below
+import * as tus from 'tus-js-client';
+
+export function uploadLargeFile(file: File, userId: string) {
+  const upload = new tus.Upload(file, {
+    endpoint: `${process.env.SUPABASE_URL}/storage/v1/upload/resumable`,
+    headers: {
+      authorization: `Bearer ${process.env.SUPABASE_ANON_KEY}`,
+      'x-upsert': 'true',
+    },
+    chunkSize: 4 * 1024 * 1024, // 4MB chunks
+    metadata: {
+      bucketName: 'wr-files',
+      objectName: `${userId}/${file.name}`,
+      contentType: file.type,
+      cacheControl: 3600,
+    },
+    onError: (error) => console.error('upload failed', error),
+    onSuccess: () => console.log('upload complete'),
+  });
+  upload.start();
+}
+```
+
+```typescript
+// reading-supabase/worked-review-2/share-link/index.ts -- as generated, see review below
+import { createClient } from 'jsr:@supabase/supabase-js@2'
+
+// AI comment: "anon key is fine here, createSignedUrl doesn't need service_role"
+Deno.serve(async (req) => {
+  const { path } = await req.json()
+  const client = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_ANON_KEY')!,
+  )
+  const { data, error } = await client.storage
+    .from('wr-files')
+    .createSignedUrl(path, 315360000) // "a share link that never expires, basically"
+  return new Response(JSON.stringify({ data, error }), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+})
+```
+
+## เดินรีวิวทีละจุด
+
+### public bucket "เพื่อความง่าย"
+
+`storage.buckets` ถูก insert ด้วย `public: true` พิสูจน์แล้ว: ไฟล์ที่อัปโหลดผ่าน path ที่ policy เช็คตามปกติ กลับอ่านได้จาก request ที่**ไม่มี credential อะไรเลย**:
+
+```bash
+# scripts/reading-supabase/worked-review-2/public-bucket-leak.sh
+curl -s -w "\nHTTP=%{http_code}\n" "$SUPABASE_URL/storage/v1/object/public/wr-files/$DANA_ID/secret-report.txt"
+```
+
+```text
+dana's private-looking file
+
+HTTP=200
+```
+
+ไม่มี `Authorization` ไม่มีแม้แต่ `apikey` -- endpoint public object (`/storage/v1/object/public/...`) คือ path เดียวเทียบเท่า PostgREST ที่**ไม่ประเมิน RLS ของ `storage.objects` เลย**สำหรับ bucket ที่ public ตามการออกแบบ เพราะ "public" หมายความแบบนั้นจริง ๆ
+
+<SpotTheBug lang="sql" code={`insert into storage.buckets (id, name, public)
+values ('wr-files', 'wr-files', true);
+-- AI comment: "public for simplicity, we'll lock it down later"`}>
+ทุก RLS policy ที่เขียนให้ bucket นี้ในส่วนหลังของ migration เดียวกันนั้นถูกต้องจริง ๆ แต่ไม่มีผลอะไรเลยกับการอ่าน เพราะ `public: true` เปลี่ยนเส้นทางการอ่านให้อ้อม RLS ของ `storage.objects` ไปทั้งหมดผ่าน endpoint แยกต่างหาก -- "เดี๋ยวค่อยล็อกทีหลัง" อธิบายขั้นตอนที่ต้องเกิดที่ bucket เอง ไม่ใช่ policy ที่จะมาชดเชยได้ วิธีแก้คือ `public: false` ตั้งแต่ migration แรก การเข้าถึงแบบ "share" ต่อไฟล์คือ **signed URL** (ด้านล่าง) ไม่ใช่ public ระดับ bucket เด็ดขาด
+</SpotTheBug>
+
+### ไม่มีการ scope โฟลเดอร์ -- รูปแบบ path เป็นแค่การตกแต่ง ไม่ใช่การบังคับใช้
+
+policy `insert`/`select` ที่ AI สร้างเช็คแค่ `bucket_id = 'wr-files'` รูปแบบ path `$userId/$filename` ใน upload client เป็นแค่**ธรรมเนียม** ไม่มี policy ไหนตรวจสอบมันเลย พิสูจน์แล้ว: Erin ที่ไม่มีความสัมพันธ์อะไรกับ Dana เลย เขียนตรงเข้าไปในสิ่งที่หน้าตาเหมือนโฟลเดอร์ของ Dana:
+
+```bash
+# scripts/reading-supabase/worked-review-2/no-folder-scoping.sh
+curl -s -w "\nHTTP=%{http_code}\n" -X POST "$SUPABASE_URL/storage/v1/object/wr-files/$DANA_ID/erin-intrusion.txt" \
+  -H "Authorization: Bearer $ERIN_TOKEN" -H "apikey: $SUPABASE_ANON_KEY" -H "Content-Type: text/plain" \
+  --data-binary @erin-intrusion.txt
+```
+
+```text
+{"Key":"wr-files/56d4732b-ab57-4f1b-a6e0-a667455cf4a4/erin-intrusion.txt","Id":"7fbc5a00-51f1-4673-bce8-14cdb596d48f"}
+HTTP=200
+```
+
+<SpotTheBug lang="sql" code={`create policy wr_files_insert on storage.objects
+  for insert to authenticated
+  with check ( bucket_id = 'wr-files' );`}>
+นี่คือฝาแฝดฝั่ง storage ของ [ai-bug-catalog entry 22](/supabase/th/reading-supabase/ai-bug-catalog/): การเช็ค `bucket_id` อย่างเดียว scope แค่ไปที่ **bucket** ไม่เคยไปถึง path ข้างในเลย client code ที่ upload ไปที่ `${userId}/...` เสมอ สร้าง *ภาพลวงตา* ของการแยก per-user โดยไม่มีการบังคับใช้จริงเลย -- authenticated user คนไหนก็เขียน (และด้วย select policy ที่คู่กัน อ่าน) path ไหนในถังก็ได้ วิธีแก้คือ `(storage.foldername(name))[1] = auth.uid()::text` ในทุก `using`/`with check` ของ policy พิสูจน์ด้านล่างว่าปฏิเสธ request เดียวกันเป๊ะ
+</SpotTheBug>
+
+### `upsert: true` มี insert กับ update policy แต่ไม่มี `select` policy
+
+TUS client ตั้ง `x-upsert: true` และ migration หลัง (ไม่ได้โชว์ข้างบน) เพิ่ม `update` policy ที่ scope ตามโฟลเดอร์ถูกต้อง -- แต่ไม่เคยมี `select` policy เลย ด้วยเหตุผลว่า "insert กับ update ได้อยู่แล้ว จะต้อง select ทำไม" พิสูจน์ด้วยการ re-upload path ที่มีอยู่แล้วจริง:
+
+```bash
+# scripts/reading-supabase/worked-review-2/upsert-no-select.sh
+curl -s -w "\nHTTP=%{http_code}\n" -X PUT "$SUPABASE_URL/storage/v1/object/wr-files/$DANA_ID/secret-report.txt" \
+  -H "Authorization: Bearer $DANA_TOKEN" -H "apikey: $SUPABASE_ANON_KEY" -H "Content-Type: text/plain" -H "x-upsert: true" \
+  --data-binary @dana-secret-v2.txt
+```
+
+```text
+{"statusCode":"403","error":"Unauthorized","message":"new row violates row-level security policy","code":"AccessDenied"}
+HTTP=400
+```
+
+<SpotTheBug lang="sql" code={`create policy wr_files_insert_own_folder on storage.objects for insert to authenticated with check (...);
+create policy wr_files_update_own_folder on storage.objects for update to authenticated using (...);
+-- no select policy -- "they can already insert and update"`}>
+ตรงกับ [ai-bug-catalog entry 23](/supabase/th/reading-supabase/ai-bug-catalog/) เป๊ะ: `upsert` compile เป็น `INSERT ... ON CONFLICT DO UPDATE` และ Postgres ต้องการเห็นแถวที่มีอยู่แล้วผ่าน select-policy ถึงจะประเมิน conflict path ได้ -- ถ้าไม่มี select policy การเช็คนั้นเองก็ถูกปฏิเสธ เรียกเดียวกันเป๊ะที่สำเร็จบน path ใหม่เอี่ยม (insert ล้วน ๆ) กลับ fail ทันทีที่ path เดิมถูก re-upload โดยไม่มีข้อความไหนพูดถึงคำว่า "select" เลยสักคำ วิธีแก้ พิสูจน์ด้านล่าง คือเพิ่ม select policy: request เดียวกันเป๊ะก็สำเร็จ
+</SpotTheBug>
+
+### signed URL ที่มีอายุ 10 ปี
+
+`createSignedUrl(path, 315360000)` -- 315,360,000 วินาที พิสูจน์แล้ว: API ยอมรับมันโดยไม่ validate อะไรเลย และ token ที่ออกมาก็มีระยะเวลานั้นจริง:
+
+```bash
+# scripts/reading-supabase/worked-review-2/ten-year-signed-url.sh
+curl -s -X POST "$SUPABASE_URL/storage/v1/object/sign/wr-files/$DANA_ID/secret-report.txt" \
+  -H "Authorization: Bearer $DANA_TOKEN" -H "apikey: $SUPABASE_ANON_KEY" -H "Content-Type: application/json" \
+  -d '{"expiresIn": 315360000}'
+```
+
+```text
+{"signedURL":"/object/sign/wr-files/56d4732b-.../secret-report.txt?token=eyJhbGc..."}
+HTTP=200
+```
+
+decode claim `iat`/`exp` ของ token ที่คืนมายืนยันสิ่งนี้ เป็นวินาที:
+
+```text
+{'url': 'wr-files/56d4732b-.../secret-report.txt', 'scope': 'download', 'iat': 1790671228, 'exp': 2106031228}
+years: 9.99315537303217
+```
+
+<SpotTheBug lang="ts" code={`.createSignedUrl(path, 315360000) // "a share link that never expires, basically"`}>
+ไม่มี cap ฝั่ง server บน `expiresIn` ที่จะจับเรื่องนี้ได้เลย -- ยืนยันด้านบนด้วย request จริงที่ถูกยอมรับ "share link" ควรจะหมดอายุ; signed URL ที่มีอายุยืนยาวกว่า session, การเปลี่ยนรหัสผ่าน และกระบวนการ offboarding ของบริษัทจริงแทบทุกกรณี ในทางปฏิบัติก็คือรหัสผ่านที่สองที่เพิกถอนไม่ได้สำหรับไฟล์นั้น เพราะ signed URL ของ Supabase Storage เพิกถอนทีละอันก่อนหมดอายุ (`exp`) ไม่ได้ -- ทางเดียวที่จะตัดทิ้งก่อนกำหนดคือ rotate signing mechanism ระดับ bucket/project ซึ่งทำให้ signed URL ที่ยังค้างอยู่ตัวอื่นทั้งหมดใช้ไม่ได้ไปด้วย วิธีแก้คือกำหนดวันหมดอายุสั้น ๆ อย่างตั้งใจ (นาทีถึงชั่วโมงต้น ๆ สำหรับ share link เลือกตามฟีเจอร์ ไม่ใช่ตัวเลขที่อ่านได้ว่า "แทบไม่หมดอายุเลย")
+</SpotTheBug>
+
+### `cacheControl: 3600` เป็นตัวเลข และเป็นค่าวินาทีดิบไม่ว่าจะทางไหน
+
+มีความผิดพลาดแยกกันสองอย่างซ้อนอยู่บน field เดียว อย่างแรก metadata ของ TUS ตั้ง `cacheControl: 3600` -- เป็น **number** -- ในขณะที่ type คือ `string`:
+
+```ts
+// @expect-error Type 'number' is not assignable to type 'string'.
+import { createClient } from '@supabase/supabase-js';
+const supabase = createClient('http://x', 'x');
+await supabase.storage.from('wr-files').upload('x/y.txt', new Blob(), {
+  cacheControl: 3600,
+});
+```
+
+```text
+error TS2322: Type 'number' is not assignable to type 'string'.
+```
+
+อย่างที่สอง แม้แก้เป็น string `'3600'` แล้ว ค่านั้นก็ถูกใช้**ตามตัวอักษรเป๊ะ**เป็นเนื้อหาของ header ไม่ถูกแปลงเป็น `Cache-Control` directive ที่ถูกต้อง:
+
+```bash
+# scripts/reading-supabase/worked-review-2/cachecontrol-literal.sh
+curl -s -X POST "$SUPABASE_URL/storage/v1/object/wr-files/$DANA_ID/cache-test.txt" \
+  -H "Authorization: Bearer $DANA_TOKEN" -H "apikey: $SUPABASE_ANON_KEY" -H "cache-control: 3600" \
+  --data-binary @dana-secret.txt
+curl -sI "$SUPABASE_URL/storage/v1/object/wr-files/$DANA_ID/cache-test.txt" -H "Authorization: Bearer $DANA_TOKEN" -H "apikey: $SUPABASE_ANON_KEY" | grep -i cache-control
+```
+
+```text
+cache-control: 3600
+```
+
+<SpotTheBug lang="ts" code={`metadata: {
+  ...
+  cacheControl: 3600,
+},`}>
+`Cache-Control: 3600` (เปล่า ๆ ไม่มีชื่อ directive) ไม่ใช่ HTTP ที่ถูกต้อง -- cache ที่ทำตาม spec ไม่มีข้อผูกมัดต้องเคารพมันเลย และยืนยันข้างบน storage API เก็บและคืนค่าตามตัวอักษรที่ได้รับมาเป๊ะ ไม่มีการ validate เลยว่ามันเป็น directive จริงหรือเปล่า browser หรือ CDN จะทำอะไรกับ header ที่ค่าไม่ถูกต้องนั้นไม่มีการรับประกันอะไรเลย วิธีแก้คือ `cacheControl: '3600'` (เป็น string ผ่าน `tsc`) จัดรูปแบบเป็น directive จริง -- `'max-age=3600'` -- ซึ่งเป็นสิ่งที่ตัวอย่างจริงอื่น ๆ ในบท Storage ของคอร์สนี้ใช้กันหมด
+</SpotTheBug>
+
+### TUS chunk size ไม่ใช่ 6MB -- และช่องว่าง local/hosted ที่ควรพูดออกมาดัง ๆ
+
+docs ชัดเจนและแคบมากตรงนี้ อ้างตรง ๆ จาก [supabase.com/docs/guides/storage/resumable-uploads](https://supabase.com/docs/guides/storage/resumable-uploads) (ดึงมาใหม่สำหรับรีวิวนี้): *"chunkSize: 6 * 1024 * 1024, // NOTE: it must be set to 6MB (for now) do not change it."* client ที่ AI สร้างตั้ง `chunkSize: 4 * 1024 * 1024` พิสูจน์ตรง ๆ กับ bucket ของรีวิวนี้เอง -- upload จริง 10,000,000 ไบต์ chunk แรกพอดี 4,000,000 ไบต์ (ไม่ใช่ 6MB):
+
+```bash
+# scripts/reading-supabase/worked-review-2/tus-wrong-chunk.sh
+curl -s -w "\nHTTP=%{http_code}\n" -X PATCH "$LOCATION" \
+  -H "Authorization: Bearer $DANA_TOKEN" -H "apikey: $SUPABASE_ANON_KEY" \
+  -H "Tus-Resumable: 1.0.0" -H "Upload-Offset: 0" -H "Content-Type: application/offset+octet-stream" \
+  --data-binary @wr-chunk1-4mb.bin
+```
+
+```text
+HTTP=204
+```
+
+...และ upload เต็ม 10,000,000 ไบต์เสร็จสมบูรณ์โดยไม่มี error เกิดขึ้นตรงไหนเลย:
+
+```text
+{"id":"...","bucket_id":"wr-files","size":10000000,...}
+```
+
+<SpotTheBug lang="ts" code={`chunkSize: 4 * 1024 * 1024, // 4MB chunks`}>
+บน **local stack นี้โดยเฉพาะ** `docker exec supabase_storage_probe env` แสดง `STORAGE_BACKEND=file` -- backend เป็น filesystem ไม่ใช่ S3 multipart backend ที่ hosted Supabase ใช้ ซึ่งเป็นเหตุผลพอดีว่าทำไมข้อกำหนด 6MB (ข้อจำกัด minimum-part-size ของ S3 multipart ที่ docs ส่งต่อมาตรง ๆ ไม่ใช่ limit ที่ Supabase ตั้งขึ้นเอง) ไม่เคยทำให้เกิด error จริงที่นี่ พิสูจน์ไว้ข้างบน การส่ง client ตัวนี้เป๊ะไปที่ **hosted** Supabase (S3-backed) คาดว่าจะ fail จริงและต่างออกไป ตามคำเตือนชัดเจนในตัว docs เอง -- นี่คือช่องว่าง local-กับ-hosted ของจริงที่รีวิวนี้ตั้งใจพูดออกมาดัง ๆ แทนที่จะกลบไว้: test ที่ผ่านแค่ local ที่นี่คือความมั่นใจปลอม วิธีแก้ง่าย ๆ คือทำตาม docs ตามตัวอักษร: `chunkSize: 6 * 1024 * 1024` ไม่เปลี่ยนแปลง
+</SpotTheBug>
+
+### Edge Function เซ็น URL ด้วย anon key -- RLS บล็อกทุกคน รวมถึงเจ้าของไฟล์เองด้วย
+
+function body ของ `share-link` สร้าง Supabase client ด้วย `SUPABASE_ANON_KEY` และไม่เคย forward `Authorization` header ของผู้เรียกเลย ทุก request ที่ function ทำจึงรันในฐานะ anonymous จริง ๆ -- ไม่มี `auth.uid()` เลย พิสูจน์แล้ว: Dana เจ้าของไฟล์ที่ authenticated จริง ขอ link ไปที่ไฟล์ของตัวเองจาก function:
+
+```bash
+# scripts/reading-supabase/worked-review-2/edge-anon-blocks-owner.sh
+curl -s -w "\nHTTP=%{http_code}\n" -X POST "$FUNCTIONS_URL/wr-share-link-anon" \
+  -H "Authorization: Bearer $DANA_TOKEN" -H "apikey: $ANON_KEY" -H "Content-Type: application/json" \
+  -d '{"path":"'"$DANA_ID"'/secret-report.txt"}'
+```
+
+```text
+{"data":null,"error":{"name":"StorageApiError","message":"Object not found","status":400,"statusCode":"404","code":"NoSuchKey"}}
+HTTP=200
+```
+
+function เองคืน `HTTP 200` -- *request* ไปที่ function สำเร็จ -- ในขณะที่ *storage call ข้างในมัน* fail กับทุกคน ด้วยข้อความ error ("Object not found") ที่ไม่ให้เบาะแสเลยว่าสาเหตุจริงคือ RLS ปฏิเสธ request ที่ไม่มี identity เลย ไม่ใช่ไฟล์ที่หายไป
+
+<SpotTheBug lang="ts" code={`const client = createClient(
+  Deno.env.get('SUPABASE_URL')!,
+  Deno.env.get('SUPABASE_ANON_KEY')!,
+)
+const { data, error } = await client.storage.from('wr-files').createSignedUrl(path, ...)`}>
+นี่คือ failure mode ตรงข้ามของ [ai-bug-catalog entry 25](/supabase/th/reading-supabase/ai-bug-catalog/) (ที่ ship `service_role` กว้างเกินไป) -- ที่นี่ function scope แคบเกินไป และ RLS -- ที่ป้องกันผู้เรียกอื่นทุกคนอย่างถูกต้อง -- ก็บล็อกคนเดียวที่ควรจะสำเร็จด้วย เพราะ function ไม่เคยระบุตัวตนว่าใครเป็นคนเรียกจริง ๆ วิธีแก้ไม่ใช่แค่ "เปลี่ยนไปใช้ `service_role`" เฉย ๆ (แค่นั้นจะสร้างบั๊ก service_role-อยู่ผิดที่แบบรีวิวก่อนหน้าขึ้นมาใหม่ ทำให้ใครก็ขอไฟล์ของใครก็ได้) -- แต่คือ `service_role` ที่ใช้**หลังจาก**ที่ function ตรวจสอบตัวตนผู้เรียกจริงแล้ว และเช็คว่า path ที่ขอเป็นของเขาจริง พิสูจน์ด้านล่าง
+</SpotTheBug>
+
+### function ที่แก้แล้ว และสิ่งที่ "scope ถูกต้อง" ต้องมีจริง ๆ
+
+function ที่แก้แล้วระบุตัวตนผู้เรียกด้วย key **anon** บวกกับ token ที่ forward มาของเขาเอง (`anon.auth.getUser(token)`) เช็คโฟลเดอร์ของ path ที่ขอกับ id ที่ยืนยันแล้ว แล้วค่อยใช้ **`service_role`** -- อย่างตั้งใจ เฉพาะกับ path ที่เช็คแล้วเท่านั้น -- เพื่อสร้าง signed URL พิสูจน์สองครั้ง: ไฟล์ของ Dana เองสำเร็จ และ Dana ขอไฟล์ของ Erin ผ่าน path ถูกปฏิเสธโดยการเช็คของ function เอง ไม่ใช่โดย RLS:
+
+```bash
+# scripts/reading-supabase/worked-review-2/edge-fixed-own-and-forbidden.sh
+curl -s -w "\nHTTP=%{http_code}\n" -X POST "$FUNCTIONS_URL/wr-share-link" \
+  -H "Authorization: Bearer $DANA_TOKEN" -H "apikey: $ANON_KEY" -H "Content-Type: application/json" \
+  -d '{"path":"'"$DANA_ID"'/secret-report.txt"}'
+
+curl -s -w "\nHTTP=%{http_code}\n" -X POST "$FUNCTIONS_URL/wr-share-link" \
+  -H "Authorization: Bearer $DANA_TOKEN" -H "apikey: $ANON_KEY" -H "Content-Type: application/json" \
+  -d '{"path":"'"$ERIN_ID"'/erin-own.txt"}'
+```
+
+```text
+--- dana's own file ---
+{"data":{"signedUrl":"http://kong:8000/storage/v1/object/sign/wr-files/56d4732b-.../secret-report.txt?token=..."},"error":null}
+HTTP=200
+
+--- dana requesting erin's file by path ---
+{"error":"forbidden: not your file"}
+HTTP=403
+```
+
+### bare specifier import -- `BOOT_ERROR` เดียวกับที่ function อีกตัวเจอ
+
+function เล็ก ๆ อีกตัวในรีวิวนี้ ที่ตั้งใจใช้ client ของโปรเจกต์ซ้ำแบบเดียวกับที่ `deno.json` import map ของบทอื่นทำ import `'supabase'` โดยไม่มี import map ตั้งไว้สำหรับ**function นี้**เลย พิสูจน์ด้วยการเรียกจริง:
+
+```bash
+# scripts/reading-supabase/worked-review-2/bare-import-boot-error.sh
+curl -s -w "\nHTTP=%{http_code}\n" "$FUNCTIONS_URL/wr-bare-import" -H "Authorization: Bearer $ANON_KEY" -H "apikey: $ANON_KEY"
+```
+
+```text
+{"code":"BOOT_ERROR","message":"Worker failed to boot (please check logs)"}
+HTTP=503
+```
+
+<SpotTheBug lang="ts" code={`import { createClient } from 'supabase'`}>
+ตรงกับ [ai-bug-catalog entry 16](/supabase/th/reading-supabase/ai-bug-catalog/) เป๊ะ: Deno resolve `jsr:`, `npm:` และ full URL specifier ได้ แต่ชื่อ package เปล่า ๆ resolve ไม่ได้เลยถ้า `deno.json` ของ**function นี้เอง**ไม่ map มันไว้ -- การก็อปปี้ import line จาก function ที่มี map มาใส่ใน function ที่ไม่มี ก็พอที่จะทำให้ทั้ง function พังตั้งแต่ boot ก่อนที่ code จัดการ request ไหนจะรันด้วยซ้ำ วิธีแก้คือ `import { createClient } from 'jsr:@supabase/supabase-js@2'` (หรือ entry `imports` ที่ตรงกันใน `deno.json` ของ function นี้เอง)
+</SpotTheBug>
+
+### header CORS ที่หายไปบน response จริง -- ถูกบดบังโดย Kong บน `OPTIONS` ตอนอยู่ local
+
+ทั้งสอง function ที่ AI สร้างไม่ได้ตั้ง CORS header ของตัวเองเลย บน **local stack นี้** Kong ตอบ `OPTIONS` preflight เองก่อนที่ function ไหนจะเห็น request เลยด้วยซ้ำ (บันทึกไว้แล้วใน [Writing and Invoking a Function](/supabase/th/edge-functions/writing-and-invoking-a-function/)) -- ทำให้การ probe ด้วย `OPTIONS` กับทั้งสอง function หน้าตาเหมือนกันเป๊ะและไม่ให้สัญญาณอะไรเลย ความต่างจริง ๆ โผล่แค่ใน response จริงเท่านั้น:
+
+```bash
+# scripts/reading-supabase/worked-review-2/cors-real-response.sh
+curl -s -i -X POST "$FUNCTIONS_URL/wr-share-link" -H "Authorization: Bearer $DANA_TOKEN" -H "apikey: $ANON_KEY" \
+  -H "Content-Type: application/json" -H "Origin: https://example.com" -d '{"path":"'"$DANA_ID"'/secret-report.txt"}' \
+  | grep -i access-control
+
+curl -s -i -X POST "$FUNCTIONS_URL/wr-share-link-anon" -H "Authorization: Bearer $DANA_TOKEN" -H "apikey: $ANON_KEY" \
+  -H "Content-Type: application/json" -H "Origin: https://example.com" -d '{"path":"'"$DANA_ID"'/secret-report.txt"}' \
+  | grep -i access-control
+```
+
+```text
+--- fixed function's real response headers ---
+access-control-allow-origin: *
+access-control-allow-headers: authorization, apikey, content-type
+access-control-allow-methods: POST, OPTIONS
+
+--- broken function's real response headers ---
+Access-Control-Allow-Origin: *
+(nothing else -- no access-control-allow-headers, no access-control-allow-methods, from the function itself)
+```
+
+<SpotTheBug lang="ts" code={`Deno.serve(async (req) => {
+  const { path } = await req.json()
+  // no OPTIONS handling, no CORS headers set anywhere in this function
+  ...
+})`}>
+Kong ใส่ `Access-Control-Allow-Origin: *` เปล่า ๆ ลงทุก response อยู่แล้วไม่ว่าจะยังไง ซึ่งเป็นตัวการที่ทำให้บั๊กนี้มองไม่เห็นเลยจาก `curl` OPTIONS probe และจากการ test local ทั่วไป -- การเช็ค preflight ของ browser จริงต้องการ `Access-Control-Allow-Headers` ที่ระบุทุก header ที่ไม่ใช่ simple header ที่ request จริงส่งไป (ที่นี่คือ `authorization` กับ `apikey`) อย่างชัดเจนด้วย ซึ่งมีแค่ function ที่แก้แล้วที่ตั้งไว้ วิธีแก้คือตอบ `OPTIONS` อย่างชัดเจนและตั้ง CORS header เดียวกันบนทุก response พิสูจน์ไว้ข้างบน ไม่พึ่ง default ของ gateway
+</SpotTheBug>
+
+### `verify_jwt` -- และช่องว่างของ shared stack ที่ควรพูดตรง ๆ
+
+ทั้งสอง function ไม่ได้ตั้ง `verify_jwt = false` ดังนั้น default (`true`) ควรจะ gate ทุก request ที่ชั้น gateway ก่อนที่ code ของ function เองจะรัน -- ตรงตามที่พิสูจน์ไว้แล้วสำหรับ `edge-hello` ใน [Writing and Invoking a Function](/supabase/th/edge-functions/writing-and-invoking-a-function/) พิสูจน์กับ function**เดิมนั้น** บน shared stack เดียวกันเป๊ะ ตอนนี้เลย:
+
+```bash
+# scripts/reading-supabase/worked-review-2/verify-jwt-existing-function.sh
+curl -s -w "\nHTTP=%{http_code}\n" "$FUNCTIONS_URL/edge-hello"
+```
+
+```text
+{"code":"UNAUTHORIZED_NO_AUTH_HEADER","message":"Missing authorization header","msg":"Missing authorization header"}
+HTTP=401
+```
+
+แต่ request ที่ไม่มี header เหมือนกันเป๊ะ ยิงไปที่ function**ของรีวิวนี้เองที่เพิ่งเพิ่มใหม่** กลับไม่ถูก gateway ปฏิเสธเลย -- มันไปถึง code ของ function เอง ซึ่งคืน `401` ของตัวเองแทน:
+
+```bash
+# scripts/reading-supabase/worked-review-2/verify-jwt-new-function.sh
+curl -s -w "\nHTTP=%{http_code}\n" -X POST "$FUNCTIONS_URL/wr-share-link" -H "apikey: $ANON_KEY" -H "Content-Type: application/json" -d '{"path":"x"}'
+```
+
+```text
+{"error":"not authenticated"}
+HTTP=401
+```
+
+<Callout title="artifact ของ shared stack ไม่ใช่คุณสมบัติด้าน security">
+harness ของคอร์สนี้ไม่เคย restart shared local stack เลย (ตาม hard rules ของโมดูลนี้เอง) -- และ declarative gateway config ของ Kong รวมถึง route `verify_jwt` ต่อ function ถูก provision ตอนที่ stack (หรือ `supabase functions serve`) เริ่มทำงานจากรายการ function บน disk **ณ ตอนนั้น** function ที่ถูกเพิ่มเข้าไปใน filesystem หลังจากนั้น บน shared stack ที่รันอยู่แล้ว จะถูก serve โดย Edge Runtime แต่ไม่เคยได้การเช็คระดับ gateway นั้นต่อสายย้อนหลังให้เลยถ้าไม่ restart ซึ่งคอร์สนี้ตั้งใจไม่ทำเด็ดขาด นี่คือ artifact ของการพัฒนาบน local/shared stack ยืนยันด้านบนด้วยการเช็คเดียวกันที่สำเร็จกับ function *เก่า* (`edge-hello`) แต่ fail กับ function *ใหม่เอี่ยม* บน stack ที่รันอยู่*ตัวเดียวกัน* -- ไม่ใช่ข้อความเกี่ยวกับ hosted Supabase ซึ่ง provision `verify_jwt` ต่อ function ตอน deploy นี่คือเหตุผลพอดีที่ function ที่แก้แล้วในรีวิวนี้ตรวจสอบตัวตนผู้เรียกใน**code ของตัวเอง**ด้วย (`anon.auth.getUser(token)`) แทนที่จะเชื่อ config `verify_jwt` เพียงอย่างเดียว -- ชั้นป้องกันเดียวที่ยังถูกต้องเสมอไม่ว่า gateway จะอยู่ในสถานะไหน
+</Callout>
+
+### สมมติว่า image transformation ใช้ได้เลย
+
+ไม่มีอะไรใน code ที่ AI สร้างขอ transformed image ตรง ๆ แต่คำอธิบาย PR ของฟีเจอร์นี้บอกว่า "thumbnail ผ่าน render endpoint ไม่ต้องทำอะไรเพิ่ม" พิสูจน์กับ bucket ของรีวิวนี้เอง PNG ที่ upload จริง:
+
+```bash
+# scripts/reading-supabase/worked-review-2/image-transform-404.sh
+curl -s -w "\nHTTP=%{http_code}\n" "$SUPABASE_URL/storage/v1/render/image/authenticated/wr-files/$DANA_ID/photo.png?width=20&height=20" \
+  -H "Authorization: Bearer $DANA_TOKEN" -H "apikey: $SUPABASE_ANON_KEY"
+```
+
+```text
+{"statusCode":"404","error":"Not Found","message":"Route GET:/render/image/authenticated/wr-files/.../photo.png?width=20&height=20 not found","code":"InvalidRequest"}
+HTTP=404
+```
+
+<SpotTheBug lang="ts" code={`// PR description: "thumbnails via the render endpoint, no extra work needed"`}>
+พิสูจน์เหมือนเป๊ะใน [Image Transformations and CDN](/supabase/th/realtime-and-storage/image-transformations-and-cdn/): local CLI ship `[storage.image_transformation]` ที่ถูก**comment ไว้**เป็น default ทำให้ route `/render/image/...` ไม่มีอยู่เลยบน local -- นี่ไม่ใช่ transform ที่ fail แต่คือ route ที่ไม่มีอยู่จริง ยืนยันด้วยรูปแบบ `404`/`InvalidRequest` ไม่ใช่ error ประมวลผลภาพแบบไหนเลย วิธีแก้สำหรับรีวิวนี้เหมือนกับบทนั้น: uncomment flag บน local ให้ตรงกับโปรเจกต์ hosted ที่เปิด add-on นี้ไว้ หรือตั้งงบให้ pre-generate thumbnail ตอน upload ถ้า plan เป้าหมายไม่มีมัน
+</SpotTheBug>
+
+## โค้ดที่แก้แล้ว
+
+```sql
+-- supabase/migrations/7402_wr_files_storage.sql
+insert into storage.buckets (id, name, public)
+values ('wr-files', 'wr-files', false);
+
+create policy wr_files_insert_own_folder on storage.objects
+  for insert to authenticated
+  with check ( bucket_id = 'wr-files' and (storage.foldername(name))[1] = auth.uid()::text );
+
+create policy wr_files_select_own_folder on storage.objects
+  for select to authenticated
+  using ( bucket_id = 'wr-files' and (storage.foldername(name))[1] = auth.uid()::text );
+
+create policy wr_files_update_own_folder on storage.objects
+  for update to authenticated
+  using ( bucket_id = 'wr-files' and (storage.foldername(name))[1] = auth.uid()::text );
+```
+
+```ts
+// supabase/functions/wr-share-link/index.ts
+import { createClient } from 'jsr:@supabase/supabase-js@2'
+
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'authorization, apikey, content-type',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+}
+
+Deno.serve(async (req) => {
+  if (req.method === 'OPTIONS') {
+    return new Response(null, { headers: corsHeaders })
+  }
+
+  const authHeader = req.headers.get('Authorization') ?? ''
+  const token = authHeader.replace('Bearer ', '')
+
+  const anon = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_ANON_KEY')!,
+  )
+  const { data: userData, error: userErr } = await anon.auth.getUser(token)
+  if (userErr || !userData.user) {
+    return new Response(JSON.stringify({ error: 'not authenticated' }), {
+      status: 401,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    })
+  }
+
+  const { path } = await req.json()
+  const ownerFolder = path.split('/')[0]
+  if (ownerFolder !== userData.user.id) {
+    return new Response(JSON.stringify({ error: 'forbidden: not your file' }), {
+      status: 403,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    })
+  }
+
+  const admin = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,
+  )
+  const { data, error } = await admin.storage.from('wr-files').createSignedUrl(path, 3600)
+  return new Response(JSON.stringify({ data, error }), {
+    headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+  })
+})
+```
+
+```ts
+// src/reading-supabase/worked-review-2/folder-isolation.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+const url = process.env.SUPABASE_URL!;
+const anonKey = process.env.SUPABASE_ANON_KEY!;
+const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+const admin = createClient(url, serviceKey);
+const stamp = Date.now();
+
+async function makeUser(email: string) {
+  const { data, error } = await admin.auth.admin.createUser({
+    email,
+    password: 'wr-Passw0rd!',
+    email_confirm: true,
+  });
+  if (error) throw error;
+  const signInClient = createClient(url, anonKey);
+  const { data: signIn, error: sErr } = await signInClient.auth.signInWithPassword({
+    email,
+    password: 'wr-Passw0rd!',
+  });
+  if (sErr) throw sErr;
+  return { id: data.user.id, client: createClient(url, anonKey, {
+    global: { headers: { Authorization: `Bearer ${signIn.session!.access_token}` } },
+  }) };
+}
+
+async function main() {
+  const dana = await makeUser(`wr+run-dana-${stamp}@example.com`);
+  const erin = await makeUser(`wr+run-erin-${stamp}@example.com`);
+
+  const { error: uploadErr } = await dana.client.storage
+    .from('wr-files')
+    .upload(`${dana.id}/report.txt`, new Blob(['dana report']), { contentType: 'text/plain' });
+  if (uploadErr) throw uploadErr;
+  console.log('dana uploaded into her own folder');
+
+  const { error: intrusionErr } = await erin.client.storage
+    .from('wr-files')
+    .upload(`${dana.id}/erin-intrusion.txt`, new Blob(['intrusion']), { contentType: 'text/plain' });
+  if (!intrusionErr) {
+    throw new Error('folder isolation broken -- erin wrote into dana\'s folder');
+  }
+  console.log('erin correctly blocked from writing into dana\'s folder:', intrusionErr.message);
+
+  const { data: signedUrl, error: signErr } = await dana.client.storage
+    .from('wr-files')
+    .createSignedUrl(`${dana.id}/report.txt`, 60);
+  if (signErr) throw signErr;
+  console.log('dana signed her own file:', !!signedUrl.signedUrl);
+
+  await admin.auth.admin.deleteUser(dana.id);
+  await admin.auth.admin.deleteUser(erin.id);
+  console.log('folder isolation test passed');
+}
+
+main().catch((err) => {
+  console.error(err);
+  throw err;
+});
+```
+
+รันจริงกับ local stack ของคอร์สนี้เอง (`--run` ของ harness ทำซ้ำอันนี้ตอน gate):
+
+```text
+dana uploaded into her own folder
+erin correctly blocked from writing into dana's folder: new row violates row-level security policy
+dana signed her own file: true
+folder isolation test passed
+```
+
+## สิ่งที่เปลี่ยนและทำไม
+
+| # | บั๊ก | ทางแก้ |
+|---|---|---|
+| 1 | สร้าง bucket ด้วย `public: true` "เพื่อความง่าย" | `public: false` -- พิสูจน์แล้ว: request ไม่ระบุตัวตนอ่านไฟล์ได้โดยไม่มี credential เลยถ้าไม่แก้ |
+| 2 | storage policy เช็คแค่ `bucket_id` ไม่มีโฟลเดอร์ | `(storage.foldername(name))[1] = auth.uid()::text` -- พิสูจน์แล้ว: authenticated user คนไหนก็เขียนโฟลเดอร์ไหนก็ได้ถ้าไม่แก้ |
+| 3 | `upsert: true` มี insert/update policy ไม่มี select | เพิ่ม `select` policy -- RLS fail จริงตอน re-upload ถ้าไม่แก้ |
+| 4 | `createSignedUrl(path, 315360000)` -- อายุ 10 ปี | อายุสั้น ตั้งใจกำหนด -- พิสูจน์แล้ว: ไม่มี cap ฝั่ง server จับเรื่องนี้เลย |
+| 5 | `cacheControl: 3600` (number) และถูกใช้เป็นค่า header ตามตัวอักษร | `cacheControl: 'max-age=3600'` -- error `tsc` จริงถ้าไม่แก้ และเป็น header ที่ไม่ถูกต้องทั้งสองทาง |
+| 6 | TUS `chunkSize: 4 * 1024 * 1024` | `chunkSize: 6 * 1024 * 1024` ตาม docs -- local (file-backed) ยอมรับมันอยู่ดี; hosted (S3-backed) จะไม่ยอม |
+| 7 | Edge Function เซ็น URL ด้วย key `anon` อย่างเดียว | `service_role` ใช้หลังจาก function ตรวจสอบตัวตนผู้เรียกและความเป็นเจ้าของ path แล้ว -- พิสูจน์แล้ว: เวอร์ชัน anon อย่างเดียวบล็อกแม้แต่เจ้าของไฟล์จริง |
+| 8 | bare specifier import `'supabase'` | `jsr:@supabase/supabase-js@2` -- `BOOT_ERROR`/`503` จริงถ้าไม่แก้ |
+| 9 | ไม่มี function ไหนตั้ง CORS header เลย | จัดการ `OPTIONS` อย่างชัดเจน + header บนทุก response -- พิสูจน์แล้ว: เห็นแค่บน response จริง ไม่ใช่ OPTIONS ที่ Kong บดบังไว้ |
+| 10 | สมมติว่า `verify_jwt` อย่างเดียวป้องกัน function ใหม่บน shared stack นี้ | ตรวจสอบตัวตนผู้เรียกใน code ของ function เองด้วย -- พิสูจน์แล้ว: function ใหม่บน stack ที่รันอยู่ข้าม gateway-level check ที่ function เก่ายังได้อยู่ |
+| 11 | สมมติว่า thumbnail "ใช้ได้เลย" ผ่าน render endpoint | uncomment `[storage.image_transformation]` บน local หรือ pre-generate thumbnail -- `404`/`InvalidRequest` จริงถ้าไม่แก้ |
+
+## สิ่งที่ reviewer เขียนใน PR
+
+> อันนี้ก็ approve ไม่ได้เหมือนกัน -- มี 11 เรื่อง จัดตามว่ามันจะกัดยังไง:
+>
+> **ส่งไฟล์ทุกไฟล์ไปอินเทอร์เน็ต:**
+> 1. bucket เป็น `public: true` "เพื่อความง่าย" -- ผมอ่านไฟล์ได้โดยไม่มี credential เลย ตั้งเป็น private; signed URL คือกลไก "share" ที่แท้จริง
+> 2. policy เช็คแค่ `bucket_id` ไม่เคยเช็คโฟลเดอร์เลย -- ผมเขียนเข้าโฟลเดอร์ของอีกคนในฐานะคนที่ไม่เกี่ยวข้องกันเลย เพิ่มการเช็ค `storage.foldername`
+>
+> **fail แบบเงียบ ๆ ที่ user จริงจะเจอทันที:**
+> 3. ไม่มี select policy แต่มี `upsert: true` -- re-upload path เดิม 403 ด้วยข้อความที่ไม่เคยพูดถึง "select" เลย
+> 4. signed URL อายุ 10 ปี -- ไม่มี cap ฝั่ง server; นี่คือรหัสผ่านที่สองของไฟล์นั้นแบบไม่มีกำหนด
+>
+> **compile หรือ "ทำงาน" ได้ แต่ทำผิด:**
+> 5. `cacheControl: 3600` -- type ผิด และแม้เป็น string ก็ไม่ใช่ directive ที่ถูกต้อง
+> 6. TUS `chunkSize` เป็น 4MB docs บอกชัดว่า 6MB -- ผ่าน local โดยบังเอิญ (file backend) จะ fail บน hosted (S3 backend)
+>
+> **บล็อกคนเดียวที่ควรจะใช้ได้:**
+> 7. function share-link เซ็น URL ด้วย `anon` และไม่เคย forward token ของผู้เรียกเลย -- มันบล็อกเจ้าของไฟล์เองด้วย ไม่ใช่แค่คนแปลกหน้า
+>
+> **boot ไม่ขึ้นด้วยซ้ำ หรือมีช่องโหว่ CORS/JWT:**
+> 8. import `'supabase'` เปล่า ๆ ใน function ที่สอง -- `BOOT_ERROR` จริงทุกครั้งที่เรียก
+> 9. ไม่มี function ไหนตั้ง CORS header ของตัวเองเลย -- มองไม่เห็นตอน test ด้วย curl/Kong บน local จะกัด browser จริง
+> 10. อย่าพึ่ง `verify_jwt` อย่างเดียวสำหรับ function ที่เพิ่มหลัง stack เริ่มทำงาน -- ตรวจสอบตัวตนใน code ด้วย
+> 11. thumbnail ต้องการ add-on image-transformation (หรือ pre-generate) -- ไม่ได้อัตโนมัติเลยถ้าไม่เปิด
+>
+> ยินดี pair ด้วย -- ส่วนใหญ่ห่างจากความถูกต้องแค่ property เดียวหรือ header เดียว
+
+## Mental Model
+
+บั๊กระดับ bucket (1) กับบั๊กทรง RLS (2, 3) มีคุณสมบัติร่วมกันอย่างหนึ่ง: มัน compile ผ่าน มันรันได้ และ request ที่**ผิด**คือตัวที่ "ทำงานได้" -- public bucket เสิร์ฟทุกคนอย่างมีความสุข policy ไม่มีโฟลเดอร์ปล่อยให้ upload ไหนก็ผ่าน `upsert` บน path ใหม่สำเร็จและ fail แค่ตอนครั้งที่สอง บั๊ก identity สอง Edge Function (7 และตัวตรงข้ามในเวอร์ชันที่แก้แล้ว) แสดงรูปทรงเดียวกันจากคนละทิศ: กว้างเกินไป (สไตล์ catalog-25) ไม่พังให้เห็นแต่เปิดให้ทุกคน แคบเกินไป (บั๊กจริงของรีวิวนี้) พังคนเดียวที่ควรสำเร็จ บั๊กที่เกี่ยวกับ infrastructure (6, 10, 11) เป็นบั๊กที่ผิดได้แบบซื่อที่สุด: แต่ละตัวมีข้อกำหนดหรือ limit จริงที่มีเอกสารรองรับ แต่ไม่แสดงเป็น error บน **local stack เฉพาะนี้** ด้วยเหตุผลที่ควรเข้าใจ (file backend เทียบกับ S3 backend; จังหวะ snapshot config ของ Kong; flag ที่ comment ไว้บน local) มากกว่าจะจำไว้ว่า "ที่นี่มันก็ใช้ได้"
+
+## Trade-offs
+
+- **public bucket เป็นตัวเลือกที่ถูกต้องจริง ๆ สำหรับเนื้อหาที่ตั้งใจให้ public** (asset การตลาด, avatar สาธารณะ) -- บั๊กที่นี่ไม่ใช่ "public bucket ผิด" แต่คือการใช้มันกับเนื้อหาที่คำอธิบายฟีเจอร์เรียกว่า "sharing" ซึ่งบอกเป็นนัยถึงการเข้าถึงที่ scope ได้และเพิกถอนได้ ที่ public bucket แสดงออกไม่ได้เลย
+- **`service_role` ข้างใน Edge Function ที่ใช้หลังจากเช็ค identity ชัดเจนแล้ว เป็น code ที่มากกว่าการเชื่อ RLS อย่างเดียว** -- แลกมาด้วยประโยชน์ที่ function บังคับใช้ logic การอนุญาตที่ RLS แสดงออกเองไม่ได้จริง ๆ (ที่นี่คือ "โฟลเดอร์ต้องตรงกับผู้เรียกที่ยืนยันแล้ว" ซึ่ง RLS ของ storage.objects ก็ทำได้เหมือนกัน แต่กฎ sharing ของแอปจริงมักต้องการ lookup ที่ RLS มองไม่เห็น เช่น table grant ที่ชัดเจน)
+- **signed-URL อายุสั้นปลอดภัยกว่าแต่สะดวกน้อยกว่า** -- share link ที่หมดอายุใน 1 ชั่วโมง หมายความว่าการ re-share อย่างถูกต้องภายหลังต้องสร้างใหม่ ซึ่งเป็นแรงเสียดทานที่อายุ 10 ปี "แก้" ได้ด้วยการเอาคุณสมบัติด้านความปลอดภัยออกไปทั้งหมด ไม่ใช่ด้วยความสะดวกที่ดีขึ้น
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"การเช็ค `bucket_id` ใน storage policy scope การเข้าถึงไปที่ไฟล์ของ user คนนั้น"** พิสูจน์ไว้ข้างบน: มัน scope แค่ไปที่ *bucket* ซึ่ง authenticated user ทุกคนในรีวิวนี้ใช้ร่วมกัน -- การแยกระดับโฟลเดอร์คือการเช็ค `storage.foldername(name)` อย่างชัดเจนที่ policy ที่ AI สร้างไม่เคยเขียนเลย
+- **"ถ้า `curl -X OPTIONS` ดูโอเค แปลว่า CORS setup ของ function โอเค"** พิสูจน์ไว้ข้างบนด้วยสอง function ที่ให้ response `OPTIONS` เหมือนกันเป๊ะบน local (Kong ตอบก่อนที่ function ไหนจะรัน) แต่ response POST จริงต่างกันจริง ๆ -- มีแค่ตัวเดียวที่ตั้ง header ที่ preflight ของ browser ต้องการจริง
+- **"`verify_jwt = true` (default) ป้องกัน function เสมอก่อน code ของมันเองจะรัน"** พิสูจน์ไว้ข้างบนบน shared stack ที่ไม่เคย restart ตัวนี้เป๊ะ: มันป้องกันสำหรับ function ที่มีอยู่ตอน stack เริ่มทำงานครั้งล่าสุด และไม่ป้องกันเลยตอนนี้ สำหรับ function ที่เพิ่มเข้ามาทีหลัง -- ซึ่งเป็นเหตุผลพอดีที่ function ที่แก้แล้วในรีวิวนี้เช็ค identity ใน code ของตัวเองด้วย
+
+<Mermaid title="แต่ละบั๊กอยู่ตรงไหนใน request ของ file-sharing หนึ่งครั้ง" code={wr2Diagram} />
+
+export const wr2Diagram = `flowchart TD
+  A["bucket: public true"] -->|"1: anon reads with zero creds"| A
+  B["policy: bucket_id only"] -->|"2: any user writes any folder"| B
+  C["upsert:true, no select policy"] -->|"3: re-upload 403s"| C
+  D["createSignedUrl(path, 10yr)"] -->|"4: no server cap"| D
+  E["cacheControl: 3600 (number)"] -->|"5: tsc error + invalid header"| E
+  F["TUS chunkSize: 4MB"] -->|"6: docs say 6MB exactly"| F
+  G["share-link fn: anon key only"] -->|"7: blocks the real owner"| G
+  H["second fn: bare 'supabase' import"] -->|"8: BOOT_ERROR"| H
+  I["neither fn sets CORS headers"] -->|"9: masked by Kong locally"| I
+  J["verify_jwt assumed sufficient"] -->|"10: not wired for a new fn here"| J
+  K["render endpoint assumed on"] -->|"11: 404 locally"| K
+`;
+
+<Callout title="สรุปในบรรทัดเดียว">
+สามในสิบเอ็ดบั๊กนี้มองไม่เห็นเพราะ*บาง*สิ่งเกี่ยวกับ local, shared, never-restarted stack ที่คอร์สนี้รันอยู่โดยเฉพาะ -- limit chunk-size ของ TUS (file backend ไม่ใช่ S3), ช่องว่าง `verify_jwt` บน function ใหม่เอี่ยม (จังหวะ snapshot config ของ Kong), และ 404 ของ image-transformation (flag ที่ comment ไว้บน local) -- แต่ละตัวจะทำงานต่างออกไป และในกรณี TUS/`verify_jwt` เข้มงวดกว่า บน hosted Supabase รีวิวที่ test แค่ local แล้วเรียกว่าเทียบเท่ากันจะ ship ทั้งสามตัวตรงเข้า production เลย
+</Callout>
+
+export const quizWorkedReview2 = [
+  {
+    q: 'ไฟล์ถูกอัปโหลดผ่าน path การ upload ที่ policy เช็คตามปกติ เข้า bucket ที่สร้างด้วย `public: true` request ที่ไม่มี `Authorization` และไม่มี `apikey` เลย ก็ยังอ่านมันสำเร็จผ่าน `/storage/v1/object/public/wr-files/...` ทำไม RLS policy ที่เขียนถูกต้องบน `storage.objects` ถึงหยุดเรื่องนี้ไม่ได้?',
+    options: [
+      'policy เขียนผิด ต้องเช็ค public access ตรง ๆ ด้วย',
+      'endpoint /storage/v1/object/public/... คือ path การอ่านของ public bucket โดยเฉพาะ ที่ไม่ประเมิน storage.objects RLS เลย -- public:true เปลี่ยนเส้นทางการอ่านให้อ้อม RLS ไปทั้งหมดตามการออกแบบ',
+      'RLS ใช้ได้แค่กับ INSERT และ UPDATE ไม่เคยใช้กับ SELECT บน storage.objects',
+      'anon key ถูกส่งไปโดยปริยายโดย curl',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ตรง ๆ ข้างบน: request ตัวนั้นเป๊ะไม่มี credential อะไรเลย แต่ก็ยังคืนเนื้อหาไฟล์ด้วย HTTP 200 -- flag public ของ bucket เอง ไม่ใช่ช่องโหว่ policy คือสิ่งที่ทำให้ path นี้ข้าม RLS ไป',
+  },
+  {
+    q: '`with check (bucket_id = \'wr-files\')` คือ insert policy ทั้งหมด Erin ที่ไม่มีความสัมพันธ์อะไรกับ Dana เลย POST ไปที่ path ที่ขึ้นต้นด้วย user id ของ Dana แล้วได้ HTTP 200 พร้อม object จริงถูกสร้าง นี่พิสูจน์อะไรเกี่ยวกับสิ่งที่การเช็ค `bucket_id` อย่างเดียว scope ได้จริง?',
+    options: [
+      'มัน scope การเข้าถึงถูกต้องตราบใดที่ username เดาไม่ได้',
+      'มัน scope แค่ไปที่ bucket ทั้งก้อนเท่านั้น -- prefix $userId/ ใน path เป็นแค่ธรรมเนียมการตั้งชื่อฝั่ง client ที่ policy ไม่เคยตรวจสอบเลย ดังนั้น authenticated user คนไหนก็เขียน path ไหนในถังก็ได้ไม่ว่า id ของใครจะขึ้นต้นอยู่',
+      'นี่ใช้ได้แค่เพราะ Erin เดา UUID ที่ถูกต้องได้',
+      'การเช็ค bucket_id เพียงพอแล้วถ้ารวมกับ bucket ที่ public:false',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ตรง ๆ ข้างบน: การเขียนของ Erin สำเร็จด้วย 200 จริงและ object id จริง เข้า path ที่ขึ้นต้นด้วย user id ของคนอื่น -- ทางแก้ storage.foldername(name)[1] = auth.uid()::text พิสูจน์แยกต่างหากว่าปฏิเสธ request เดียวกันเป๊ะ',
+  },
+  {
+    q: 'bucket หนึ่งมี insert กับ update policy (scope ตามโฟลเดอร์ถูกต้องทั้งคู่) แต่ไม่มี select policy การ upload ไปที่ path ใหม่เอี่ยมสำเร็จ; การ re-upload path เดิมด้วย `x-upsert: true` fail ด้วย RLS error จริง ทำไมการเพิ่ม select policy ถึงแก้ failure เฉพาะนี้ได้?',
+    options: [
+      'select policy ไม่เกี่ยวเลย ทางแก้จริงคือ update policy ที่ต่างออกไป',
+      'upsert compile เป็น INSERT ... ON CONFLICT DO UPDATE และ Postgres ต้องการ select-policy-visibility เข้าไปในแถวที่มีอยู่แล้วถึงจะประเมินได้ว่ามี conflict อยู่หรือเปล่า -- ถ้าไม่มี select policy การเช็คนั้นเองก็ถูกปฏิเสธ ไม่ว่า insert/update policy จะถูกต้องแค่ไหน',
+      'bucket ต้องการ public:true ถึงจะให้ upsert ทำงานได้',
+      'นี่เกิดขึ้นแค่ตอนเนื้อหาไฟล์เหมือนกันเป๊ะ',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ตรง ๆ ข้างบน: request เดียวกันเป๊ะสำเร็จบน path ใหม่ (insert ล้วน ๆ ไม่ต้องเช็ค conflict) และ fail แค่ตอน re-upload (path ON CONFLICT) โดยทางแก้ (เพิ่ม select policy) ทำให้ re-upload เดียวกันเป๊ะสำเร็จ',
+  },
+  {
+    q: 'upload TUS ขนาด 10,000,000 ไบต์ ด้วย chunk แรกพอดี 4,000,000 ไบต์ (ไม่ใช่ตัวคูณของ 6MB ตามเอกสาร) เสร็จสมบูรณ์โดยไม่มี error บน local stack นี้ -- ยืนยันผ่าน `docker exec supabase_storage_probe env` ที่แสดง `STORAGE_BACKEND=file` นี่พิสูจน์อะไรจริง ๆ?',
+    options: [
+      'ข้อกำหนด chunk size 6MB ใน docs ล้าสมัยแล้วและไม่ใช้ที่ไหนอีกต่อไป',
+      'ข้อกำหนดนั้นจริงและมีเอกสารรองรับ แต่ผูกกับ S3-backed multipart storage ของ hosted Supabase; local stack นี้ backend เป็น filesystem ไม่มีข้อจำกัดแบบนั้นให้บังคับใช้ ดังนั้น client ที่ละเมิดข้อกำหนดที่มีเอกสารรองรับ ผ่าน local ได้แต่ยังคง fail ได้เมื่อ deploy จริงกับ hosted, S3-backed storage',
+      'TUS upload ไม่เคยเช็ค chunk size ที่ชั้นไหนเลยจริง ๆ',
+      'upload สำเร็จเพราะไฟล์อยู่ใต้ limit ขนาดอื่นที่ใหญ่กว่า',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ตรง ๆ ข้างบน: env var ตัวนั้นเป๊ะยืนยัน file backend และ upload เต็มเสร็จด้วยขนาดสุดท้ายที่ถูกต้องโดยไม่มี error ตรงไหนในลำดับ chunk เลย -- test local ที่ผ่านที่นี่ไม่เท่ากับ test hosted ที่ผ่าน ซึ่งข้อกำหนด 6MB ของ docs เองบอกเป็นนัยว่าถูกบังคับใช้โดย S3 backend ที่มันเจาะจงถึง',
+  },
+  {
+    q: 'function `wr-share-link-anon` ใช้แค่ `SUPABASE_ANON_KEY` ไม่ forward token ของผู้เรียกเลย Dana เจ้าของไฟล์ที่ authenticated จริง เรียกมันแล้วได้ `{"data":null,"error":{"message":"Object not found",...}}`, HTTP 200 ทำไมถึง fail แม้แต่กับเจ้าของไฟล์ที่ถูกต้องตามกฎหมาย?',
+    options: [
+      'ไฟล์ไม่มีอยู่จริงที่ path นั้นจริง ๆ',
+      'client ข้างใน function ไม่มี identity อะไรเลย -- มันไม่เคยได้รับ JWT ของ Dana -- ดังนั้นจากมุมมองของ storage.objects RLS, auth.uid() เป็น null สำหรับ request นี้ไม่ว่าใครจะเป็นคนเรียก function จริงผ่าน HTTP ก็ตาม และ policy ที่ scope ตามโฟลเดอร์ปฏิเสธมันแบบเดียวกับที่จะปฏิเสธคนแปลกหน้าเลย',
+      'anon key เรียก createSignedUrl ไม่ได้เลยไม่ว่ากรณีไหน',
+      'function คืน 200 เพราะ request เองโอเค นี่คือพฤติกรรมที่ถูกต้องตามที่คาดไว้',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ตรง ๆ ข้างบน เทียบกับ function ที่แก้แล้ว: เวอร์ชันที่แก้ forward และยืนยัน token จริงของผู้เรียกก่อน แล้ว request เดียวกันสำหรับไฟล์ของ Dana เองก็สำเร็จด้วย signed URL จริง -- ยืนยันว่าความล้มเหลวของเวอร์ชัน anon อย่างเดียวเป็นปัญหา identity ไม่ใช่ปัญหาไฟล์หายไป',
+  },
+  {
+    q: '`curl -X OPTIONS` กับทั้ง function ที่แก้แล้วและที่ยังมีบั๊ก คืน response เหมือนกันเป๊ะบน local response `POST` จริงกลับต่างกัน: มีแค่ function ที่แก้แล้วที่มี `access-control-allow-headers` ช่องว่างนี้พิสูจน์อะไรเกี่ยวกับการ test CORS ด้วย curl บน local?',
+    options: [
+      'ไม่มีอะไรต่างกันเลย ทั้งสอง function จัดการ CORS เหมือนกัน',
+      'บน local stack นี้ Kong ตอบ OPTIONS preflight request เองก่อนที่ code ของ function ไหนจะรัน ทำให้การ probe ด้วย OPTIONS ไม่ให้สัญญาณอะไรเลยว่า function เองทำอะไร -- CORS header จริงที่ function ตั้งจะโผล่แค่บน response จริงของมันเท่านั้น ซึ่งเป็นจุดที่ header ที่หายไปของ function ที่มีบั๊กเห็นชัด',
+      'local Edge Runtime ไม่รองรับ OPTIONS request เลย',
+      'curl ส่ง Origin header ไม่ได้ ดังนั้น test นี้ไม่ถูกต้อง',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ตรง ๆ ข้างบน: response OPTIONS เหมือนกันเป๊ะจากทั้งสอง function (header default ของ Kong เอง) แต่ response POST จริงจาก function ที่มีบั๊กไม่มี access-control-allow-headers หรือ access-control-allow-methods เลย เทียบกับค่าที่ชัดเจนจาก function ที่แก้แล้ว -- การตัดสินใจ preflight ของ browser จริงขึ้นกับ header สองตัวนี้พอดี',
+  },
+];
+
+<Quiz client:visible id="reading-supabase/worked-review-2" questions={quizWorkedReview2} />
+
+<ProgressTracker client:visible id="reading-supabase/worked-review-2" />
