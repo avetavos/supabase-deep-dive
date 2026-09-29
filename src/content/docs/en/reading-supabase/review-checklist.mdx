@@ -1,0 +1,169 @@
+---
+title: Review checklist
+description: 'A one-page, eight-group checklist for reviewing Supabase code — each line a yes/no question linking the catalog entry and the tool that proves it.'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+This is the checklist to run down — by eye, on any diff, yours or an AI's — after the tools in **[Verification Tools](/supabase/en/reading-supabase/verification-tools/)** have run and come back clean. It fits on one printed page on purpose: a checklist nobody actually opens during a review is worthless. Every line links the catalog entry that explains *why*, so this page stays a list, not a re-run of the course. The groups follow the same order as **[How to read Supabase code you did not write](/supabase/en/reading-supabase/)**, plus a final Tooling group covering how each of the other seven actually gets verified.
+
+<Mermaid title="What actually catches each group, if anything" code={checklistCoverageDiagram} />
+
+export const checklistCoverageDiagram = `flowchart LR
+  A["Schema &amp; migrations"] --> T["Partial: tsc/deno check catch nothing\nsemantic -- only a live query or gen types re-run does"]
+  R["RLS &amp; roles"] --> M["Accepted, not rejected --\npg_policies + a real anon/service_role curl shows it"]
+  U["Auth &amp; sessions"] --> M
+  C["Client calls"] --> T2["tsc catches a typo'd method name,\nnever a skipped error check"]
+  E["Edge functions"] --> D["deno check only -- tsc is not run\nagainst edge functions at all"]
+  RT["Realtime"] --> Q["pg_publication_tables / relreplident\nquery -- nothing fails loudly"]
+  S["Storage"] --> M
+  O["Ops &amp; pooling"] --> H["Mostly human review --\nkey provenance, prepare:false"]
+`;
+
+## Schema & migrations
+
+- Does every `uuid` primary key default to `gen_random_uuid()`, not `uuid_generate_v4()` — or is `create extension "uuid-ossp"` genuinely present in an applied migration? See the **[AI Bug Catalog](/supabase/en/reading-supabase/ai-bug-catalog/)**, entry 1.
+- Does any FK meant to own its parent's lifecycle (`references auth.users(id)`, most commonly) have a deliberate `on delete cascade` or `on delete set null` — not the implicit `no action`? See entry 2.
+- Did the most recent PR that renamed or dropped a column also regenerate and commit `database.types.ts` in the same PR? `tsc` passing is not evidence this was done. See entry 3.
+
+## RLS & roles
+
+- Does every table with RLS enabled have a policy for every command the client actually calls (`select`, `insert`, `update`, `delete` are independent)? See the **[AI Bug Catalog](/supabase/en/reading-supabase/ai-bug-catalog/)**, entry 4.
+- Does every `for update` (or `for all`) policy have an explicit `with check`, or does it rely on `using` being silently reused? See entry 5, proven with a real row-hijack.
+- Is `auth.uid()`/`auth.role()`/`auth.jwt()` wrapped in `(select ...)` in every policy, not called bare? See entry 6, proven with a real ~10x `explain analyze` difference.
+- Does every `security definer` function set `search_path = ''`? See entry 7, proven with a real schema-injection leak — the single highest-value line on this page.
+- Does `select count(*) from pg_policies where tablename = '<table>'` return more than zero for every table with RLS enabled? See entry 8, proven with a real, silent, zero-policy empty table.
+
+## Auth & sessions
+
+- Does every server-side authorization check use `getUser()`/`getClaims()`, never `getSession()`? See the **[AI Bug Catalog](/supabase/en/reading-supabase/ai-bug-catalog/)**, entry 9, proven with a real tampered-token bypass of `getSession()`.
+- Does refresh-retry logic have an explicit branch for `error_code === 'refresh_token_already_used'`, distinct from a transient failure? See entry 10.
+- Does any policy or client code read a custom JWT claim (`auth.jwt() ->> '...'`) that is cross-checked against a real, registered Auth Hook in `config.toml`'s `[auth.hook.custom_access_token]`? See entry 11.
+
+## Client calls
+
+- Does every `supabase-js` call destructure and check `error`, not just `data`? See the **[AI Bug Catalog](/supabase/en/reading-supabase/ai-bug-catalog/)**, entry 12.
+- Does every `.single()` call have an adjacent `PGRST116` check, or use `.maybeSingle()` where zero rows is expected? See entry 13.
+- Is `createClient()` called exactly once, at module scope, not per request or per component? See entry 14, proven with a real "Multiple GoTrueClient instances" warning.
+- Does any client combine `global.headers.Authorization` (frozen at construction) with a later `auth.setSession()` call? See entry 15, proven with a real frozen-header data leak.
+
+## Edge functions
+
+- Does every `import` inside `supabase/functions/**/index.ts` use `jsr:`/`npm:`/a relative path, never a bare specifier? See the **[AI Bug Catalog](/supabase/en/reading-supabase/ai-bug-catalog/)**, entry 16, proven with a real `BOOT_ERROR` 503.
+- Which key does `createClient()` receive inside each function — cross-checked against whether that function's job actually needs to bypass RLS? See entry 17.
+- Does any secret live in a plain `supabase/functions/<name>/.env` instead of a `.local`-suffixed file or `supabase secrets set`? See entry 18, proven against this exact CLI's own `.gitignore`.
+
+## Realtime
+
+- Is every table a `postgres_changes` subscription targets a confirmed member of `supabase_realtime` (`select * from pg_publication_tables where pubname = 'supabase_realtime'`)? See the **[AI Bug Catalog](/supabase/en/reading-supabase/ai-bug-catalog/)**, entry 19, proven with a real silent-miss.
+- Does every private channel topic have a matching `select` (and `insert`, for broadcasting) policy on `realtime.messages`? See entry 20, proven with a real `Unauthorized` rejection.
+- Is `replica identity full` set on any table whose Realtime consumers read `payload.old`'s non-key columns? See entry 21, proven with a real `old: null` vs full-row comparison.
+
+## Storage
+
+- Does every storage policy check `(storage.foldername(name))[1]` against the caller's own id, not just `bucket_id`? See the **[AI Bug Catalog](/supabase/en/reading-supabase/ai-bug-catalog/)**, entry 22, proven with a real cross-user folder write.
+- Does any bucket used with `upload(..., { upsert: true })` have a `select` policy, in addition to `insert`/`update`? See entry 23, proven with a real upsert-specific 403.
+- Is a signed URL's `expiresIn` ever exceeded by how long the URL is actually cached or reused? See entry 24, proven with a real post-expiry `InvalidJWT`.
+
+## Ops & pooling
+
+- Does `SERVICE_ROLE_KEY`/`SUPABASE_SERVICE_ROLE_KEY` appear anywhere a client bundle could ship it? See the **[AI Bug Catalog](/supabase/en/reading-supabase/ai-bug-catalog/)**, entry 25 — the single highest-consequence line on this page.
+- Does any `postgres()`/driver connection through a transaction-mode pooler (`:6543`-style port) set `prepare: false`? See entry 26, doc-sourced and honestly not reproduced under this course's own low-concurrency local test.
+- Does any `pg_net` caller read `net._http_response` with a real wait/retry loop, not immediately in the same statement? See entry 27, proven with a real zero-rows-then-populated race.
+
+## Tooling
+
+- Is `supabase db lint` run before trusting a migration is free of unindexed policy columns, missing `search_path`, or an unwrapped `auth.uid()`? See **[Verification Tools](/supabase/en/reading-supabase/verification-tools/)**.
+- Is `deno check` — not `tsc` — run against every `supabase/functions/**/index.ts`, knowing `tsc` is never run against edge functions at all in this course's own harness? See **[Verification Tools](/supabase/en/reading-supabase/verification-tools/)**.
+- Does CI run this course's own harness (`npm run verify`, `--run`, `--apply`) against every fence, not just a human skim? See **[Verification Tools](/supabase/en/reading-supabase/verification-tools/)**.
+
+<Callout title="A checklist narrows the search, it does not replace it">
+Every line above maps to one of the 27 patterns in the **[AI Bug Catalog](/supabase/en/reading-supabase/ai-bug-catalog/)** — the large majority of which produce a clean `200` (or a passing `tsc`/`deno check`) at the point they're introduced. Run this list on every diff regardless of how clean the compiler or a quick manual test came back.
+</Callout>
+
+## Mental Model
+
+```text
+Eight groups, same order as the reading-order lesson:
+
+Schema & migrations -> extension deps, FK delete behavior, generated-type drift
+RLS & roles          -> policy-per-command, using/with check, auth.uid() wrapping,
+                        search_path, RLS-enabled-zero-policies
+Auth & sessions      -> getUser() not getSession(), refresh reuse, custom claims
+Client calls         -> error checked, .single()/PGRST116, singleton, frozen headers
+Edge functions       -> jsr:/npm:, which key, secrets file naming
+Realtime             -> publication membership, private-channel policy, replica identity
+Storage              -> folder-scoped policy, upsert needs select, signed URL expiry
+Ops & pooling         -> which key reaches this code, prepare:false, pg_net is async
+
+Run this AFTER the tools in Verification Tools come back clean -- the checklist and
+the tools cover different failure classes, and most of this catalog's 27 entries pass
+every tool cleanly right up until the checklist line that actually names the gap.
+```
+
+export const quizReviewChecklist = [
+  {
+    q: "Why does this checklist say to run it AFTER the tools in Verification Tools, rather than instead of them?",
+    options: [
+      "The checklist is strictly more thorough than any tool, so order doesn't matter",
+      "The tools and the checklist cover different failure classes -- tsc/deno check validate syntax and types, supabase db lint catches a specific known set of patterns, and neither one validates intent the way a human reading a policy's using/with check pair for what it actually grants can",
+      "The checklist replaces the tools entirely once memorized",
+      "Order genuinely does not matter for this course",
+    ],
+    answer: 1,
+    explain: "Proved throughout the AI Bug Catalog: using(true) with no with check, a security definer function missing search_path, and RLS-enabled-zero-policies are all syntactically perfect to every tool this course runs -- only a reader applying this checklist's specific questions catches them.",
+  },
+  {
+    q: "Which single checklist line is described as \"the single highest-consequence line on this page\", and why?",
+    options: [
+      "The uuid_generate_v4() vs gen_random_uuid() line",
+      "Whether SERVICE_ROLE_KEY appears anywhere a client bundle could ship it -- because that one key bypasses every RLS policy every other line on this checklist is about, with no technical control once it reaches a browser",
+      "The deno check line under Tooling",
+      "The signed URL expiresIn line",
+    ],
+    answer: 1,
+    explain: "Stated directly in the Ops & pooling group, matching the AI Bug Catalog's entry 25: service_role bypasses Row Level Security entirely, making every RLS-related line elsewhere on this checklist moot the moment this one specific key reaches client-side code.",
+  },
+  {
+    q: "Why does the Edge functions group specifically call out deno check instead of tsc, rather than listing both as equally valid?",
+    options: [
+      "tsc is faster so it should be preferred",
+      "This course's own harness never runs tsc against files under supabase/functions/**/index.ts at all -- only deno check validates an edge function's own Deno module graph, which is exactly where a bare-specifier import fails",
+      "deno check and tsc always produce identical results",
+      "tsc does not exist for TypeScript edge functions",
+    ],
+    answer: 1,
+    explain: "Proved in the AI Bug Catalog's entry 16: a bare specifier import type-checks fine under a Node-style tsc pass but produces a real BOOT_ERROR 503 under deno check / a real supabase functions serve deploy -- the two tools check different module resolution rules entirely.",
+  },
+  {
+    q: "The RLS & roles group has more checklist lines than any other group -- why does this course weight it that heavily?",
+    options: [
+      "RLS is the hardest concept to explain, unrelated to how often it causes real bugs",
+      "Five of this catalog's most consequential, silent failure modes (missing insert policy, using(true) hijack, unwrapped auth.uid(), missing search_path, zero-policy tables) all live in this one layer, and every one of them is syntactically valid SQL that no tool in this stack rejects",
+      "RLS is deprecated in favor of a newer Supabase feature",
+      "The other seven groups are less important overall",
+    ],
+    answer: 1,
+    explain: "Matches the AI Bug Catalog directly: entries 4-8, five of the catalog's 27, are all RLS & roles patterns -- more than any other single group, because a wrong-but-valid policy is invisible to every compiler and linter this course runs, unlike a bare-specifier import or a missing .single() error check.",
+  },
+  {
+    q: "Why does the Ops & pooling group's prepared-statement line cite official documentation rather than a locally reproduced error, unlike most other lines on this page?",
+    options: [
+      "Because the bug is not real",
+      "Because reproducing Supavisor transaction-mode's actual backend-reassignment failure needs genuine concurrent connection churn a single local reviewer's low-concurrency test does not generate -- the mechanism is real and documented, stated honestly rather than staged",
+      "Because prepared statements do not apply to Supabase at all",
+      "Because this line is optional and can be skipped",
+    ],
+    answer: 1,
+    explain: "Matches the AI Bug Catalog's entry 26 directly: the same honest non-reproduction (pg_backend_pid() staying identical across a PREPARE and a later EXECUTE under low local concurrency) is documented there, with the mechanism quoted from Supabase's own troubleshooting guide.",
+  },
+];
+
+<Quiz client:visible id="reading-supabase/review-checklist" questions={quizReviewChecklist} />
+
+<ProgressTracker client:visible id="reading-supabase/review-checklist" />

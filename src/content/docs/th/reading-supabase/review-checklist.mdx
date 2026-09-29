@@ -1,0 +1,169 @@
+---
+title: Checklist สำหรับ review
+description: 'checklist หน้าเดียว 8 กลุ่ม สำหรับ review โค้ด Supabase -- แต่ละบรรทัดเป็นคำถาม yes/no ลิงก์ไปยัง catalog entry และ tool ที่พิสูจน์มัน'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+นี่คือ checklist ที่ต้องไล่ดู -- ด้วยตา บน diff ไหนก็ได้ ของคุณเองหรือของ AI -- หลังจาก tool ใน **[Verification Tools](/supabase/th/reading-supabase/verification-tools/)** รันแล้วผ่านสะอาด มันตั้งใจให้พอดีหน้าเดียวเวลาพิมพ์ออกมา: checklist ที่ไม่มีใครเปิดดูจริงตอน review นั้นไร้ค่า ทุกบรรทัดลิงก์ไปยัง catalog entry ที่อธิบายว่า *ทำไม* หน้านี้จึงยังเป็นแค่ list ไม่ใช่การรันคอร์สซ้ำ กลุ่มต่าง ๆ เรียงตามลำดับเดียวกับ **[How to read Supabase code you did not write](/supabase/th/reading-supabase/)** บวกกลุ่ม Tooling สุดท้ายที่คลุมว่าอีกเจ็ดกลุ่มถูก verify ได้อย่างไรจริง ๆ
+
+<Mermaid title="อะไรจับกลุ่มไหนได้จริงบ้าง" code={checklistCoverageDiagram} />
+
+export const checklistCoverageDiagram = `flowchart LR
+  A["Schema &amp; migrations"] --> T["Partial: tsc/deno check catch nothing\nsemantic -- only a live query or gen types re-run does"]
+  R["RLS &amp; roles"] --> M["Accepted, not rejected --\npg_policies + a real anon/service_role curl shows it"]
+  U["Auth &amp; sessions"] --> M
+  C["Client calls"] --> T2["tsc catches a typo'd method name,\nnever a skipped error check"]
+  E["Edge functions"] --> D["deno check only -- tsc is not run\nagainst edge functions at all"]
+  RT["Realtime"] --> Q["pg_publication_tables / relreplident\nquery -- nothing fails loudly"]
+  S["Storage"] --> M
+  O["Ops &amp; pooling"] --> H["Mostly human review --\nkey provenance, prepare:false"]
+`;
+
+## Schema & migrations
+
+- primary key ที่เป็น `uuid` ทุกตัว default เป็น `gen_random_uuid()` ไม่ใช่ `uuid_generate_v4()` -- หรือ `create extension "uuid-ossp"` มีอยู่จริงใน migration ที่ apply แล้วหรือเปล่า? ดู **[AI Bug Catalog](/supabase/th/reading-supabase/ai-bug-catalog/)** entry 1
+- FK ที่ควรเป็นเจ้าของ lifecycle ของ parent (`references auth.users(id)` พบบ่อยที่สุด) มี `on delete cascade` หรือ `on delete set null` ที่ตั้งใจไว้ชัดเจน -- ไม่ใช่ `no action` แบบ implicit หรือเปล่า? ดู entry 2
+- PR ล่าสุดที่ rename หรือลบ column ก็ regenerate และ commit `database.types.ts` ใน PR เดียวกันด้วยหรือเปล่า? `tsc` ผ่านไม่ใช่หลักฐานว่าทำแล้ว ดู entry 3
+
+## RLS & roles
+
+- ทุก table ที่เปิด RLS มี policy สำหรับทุกคำสั่งที่ client เรียกจริงหรือเปล่า (`select`, `insert`, `update`, `delete` เป็นอิสระต่อกัน)? ดู **[AI Bug Catalog](/supabase/th/reading-supabase/ai-bug-catalog/)** entry 4
+- policy `for update` (หรือ `for all`) ทุกตัวมี `with check` ชัดเจน หรืออาศัย `using` ที่ถูกใช้ซ้ำแบบเงียบ ๆ หรือเปล่า? ดู entry 5 พิสูจน์ด้วยการขโมย row จริง
+- `auth.uid()`/`auth.role()`/`auth.jwt()` ถูก wrap ด้วย `(select ...)` ใน policy ทุกตัว ไม่ถูกเรียกเปล่า ๆ หรือเปล่า? ดู entry 6 พิสูจน์ด้วยความต่างของ `explain analyze` จริงประมาณ 10 เท่า
+- ฟังก์ชัน `security definer` ทุกตัวตั้ง `search_path = ''` หรือเปล่า? ดู entry 7 พิสูจน์ด้วยการรั่วไหลจาก schema-injection จริง -- บรรทัดที่มีค่ามากที่สุดในหน้านี้
+- `select count(*) from pg_policies where tablename = '<table>'` คืนมากกว่าศูนย์สำหรับทุก table ที่เปิด RLS หรือเปล่า? ดู entry 8 พิสูจน์ด้วย table ที่ว่างเปล่าแบบเงียบเพราะ 0 policy จริง
+
+## Auth & sessions
+
+- authorization check ฝั่ง server ทุกจุดใช้ `getUser()`/`getClaims()` ไม่ใช่ `getSession()` เลยหรือเปล่า? ดู **[AI Bug Catalog](/supabase/th/reading-supabase/ai-bug-catalog/)** entry 9 พิสูจน์ด้วยการ bypass `getSession()` ด้วย token ที่ถูกแก้จริง
+- refresh-retry logic มี branch ชัดเจนสำหรับ `error_code === 'refresh_token_already_used'` แยกจากความล้มเหลวชั่วคราวหรือเปล่า? ดู entry 10
+- policy หรือโค้ด client ใด ๆ ที่อ่าน custom JWT claim (`auth.jwt() ->> '...'`) ถูกเช็คไขว้กับ Auth Hook จริงที่ลงทะเบียนไว้ใน `[auth.hook.custom_access_token]` ของ `config.toml` หรือเปล่า? ดู entry 11
+
+## Client calls
+
+- ทุก call ของ `supabase-js` destructure และเช็ค `error` ไม่ใช่แค่ `data` หรือเปล่า? ดู **[AI Bug Catalog](/supabase/th/reading-supabase/ai-bug-catalog/)** entry 12
+- `.single()` ทุกครั้งมีการเช็ค `PGRST116` อยู่ข้าง ๆ หรือใช้ `.maybeSingle()` ตรงที่ 0 row เป็นสิ่งที่คาดหวังไว้อยู่แล้วหรือเปล่า? ดู entry 13
+- `createClient()` ถูกเรียกครั้งเดียวเป๊ะที่ module scope ไม่ใช่ต่อ request หรือต่อ component หรือเปล่า? ดู entry 14 พิสูจน์ด้วยคำเตือน "Multiple GoTrueClient instances" จริง
+- client ไหนผสม `global.headers.Authorization` (ที่ freeze ตอนสร้าง) กับ `auth.setSession()` ที่เรียกทีหลังหรือเปล่า? ดู entry 15 พิสูจน์ด้วยการรั่วไหลของข้อมูลจาก header ที่ถูก freeze จริง
+
+## Edge functions
+
+- `import` ทุกตัวข้างใน `supabase/functions/**/index.ts` ใช้ `jsr:`/`npm:`/relative path ไม่ใช่ bare specifier เลยหรือเปล่า? ดู **[AI Bug Catalog](/supabase/th/reading-supabase/ai-bug-catalog/)** entry 16 พิสูจน์ด้วย `BOOT_ERROR` 503 จริง
+- `createClient()` ข้างในแต่ละ function ได้รับ key ไหน เช็คไขว้กับว่างานของ function นั้นต้องข้าม RLS จริงหรือเปล่า? ดู entry 17
+- secret ไหนอยู่ใน `supabase/functions/<name>/.env` ธรรมดา แทนที่จะเป็นไฟล์ suffix `.local` หรือ `supabase secrets set` หรือเปล่า? ดู entry 18 พิสูจน์กับ `.gitignore` ของ CLI ตัวนี้เป๊ะ
+
+## Realtime
+
+- ทุก table ที่ `postgres_changes` subscription เล็งไปหาเป็นสมาชิกที่ยืนยันแล้วของ `supabase_realtime` หรือเปล่า (`select * from pg_publication_tables where pubname = 'supabase_realtime'`)? ดู **[AI Bug Catalog](/supabase/th/reading-supabase/ai-bug-catalog/)** entry 19 พิสูจน์ด้วยการพลาดแบบเงียบจริง
+- ทุก private channel topic มี policy `select` (และ `insert` สำหรับการ broadcast) ที่ตรงกันบน `realtime.messages` หรือเปล่า? ดู entry 20 พิสูจน์ด้วยการถูกปฏิเสธ `Unauthorized` จริง
+- `replica identity full` ถูกตั้งบน table ใด ๆ ที่ consumer ของ Realtime อ่าน column ที่ไม่ใช่ key จาก `payload.old` หรือเปล่า? ดู entry 21 พิสูจน์ด้วยการเทียบ `old: null` กับ row เต็มจริง
+
+## Storage
+
+- policy ของ storage ทุกตัวเช็ค `(storage.foldername(name))[1]` เทียบกับ id ของผู้เรียกเอง ไม่ใช่แค่ `bucket_id` หรือเปล่า? ดู **[AI Bug Catalog](/supabase/th/reading-supabase/ai-bug-catalog/)** entry 22 พิสูจน์ด้วยการเขียนข้าม folder ของคนอื่นจริง
+- bucket ไหนที่ใช้กับ `upload(..., { upsert: true })` มี policy `select` เพิ่มจาก `insert`/`update` หรือเปล่า? ดู entry 23 พิสูจน์ด้วย 403 ที่เฉพาะกับ upsert จริง
+- `expiresIn` ของ signed URL เคยถูกใช้เกินเวลาที่ URL นั้นถูก cache หรือใช้ซ้ำจริงหรือเปล่า? ดู entry 24 พิสูจน์ด้วย `InvalidJWT` หลังหมดอายุจริง
+
+## Ops & pooling
+
+- `SERVICE_ROLE_KEY`/`SUPABASE_SERVICE_ROLE_KEY` ปรากฏอยู่ในที่ที่ client bundle อาจ ship ออกไปได้หรือเปล่า? ดู **[AI Bug Catalog](/supabase/th/reading-supabase/ai-bug-catalog/)** entry 25 -- บรรทัดที่ผลกระทบสูงที่สุดในหน้านี้
+- `postgres()`/driver connection ใด ๆ ที่ผ่าน pooler โหมด transaction (พอร์ตแบบ `:6543`) ตั้ง `prepare: false` หรือเปล่า? ดู entry 26 มีเอกสารรองรับ และระบุตรง ๆ ว่า reproduce ไม่ได้ในการทดสอบความหนาแน่นต่ำในเครื่องของคอร์สนี้เอง
+- ผู้เรียก `pg_net` ใด ๆ อ่าน `net._http_response` ด้วยการรอ/retry loop จริง ไม่ใช่ทันทีใน statement เดียวกันหรือเปล่า? ดู entry 27 พิสูจน์ด้วย race condition จาก 0 row แล้วมีข้อมูลจริง
+
+## Tooling
+
+- `supabase db lint` ถูกรันก่อนเชื่อว่า migration ไม่มีปัญหา unindexed policy column, `search_path` ที่หายไป หรือ `auth.uid()` ที่ไม่ wrap หรือเปล่า? ดู **[Verification Tools](/supabase/th/reading-supabase/verification-tools/)**
+- `deno check` -- ไม่ใช่ `tsc` -- ถูกรันกับ `supabase/functions/**/index.ts` ทุกตัว โดยรู้ว่า `tsc` ไม่เคยถูกรันกับ edge function เลยใน harness ของคอร์สนี้เองหรือเปล่า? ดู **[Verification Tools](/supabase/th/reading-supabase/verification-tools/)**
+- CI รัน harness ของคอร์สนี้เอง (`npm run verify`, `--run`, `--apply`) กับทุก fence ไม่ใช่แค่คนสกิมอ่านหรือเปล่า? ดู **[Verification Tools](/supabase/th/reading-supabase/verification-tools/)**
+
+<Callout title="checklist แค่ช่วยแคบการค้นหา ไม่ได้แทนที่มัน">
+ทุกบรรทัดข้างบนแมปกับหนึ่งใน 27 รูปแบบใน **[AI Bug Catalog](/supabase/th/reading-supabase/ai-bug-catalog/)** -- ส่วนใหญ่คืน `200` ที่สะอาด (หรือผ่าน `tsc`/`deno check`) ตอนที่มันถูกใส่เข้ามา รัน list นี้กับทุก diff ไม่ว่า compiler หรือการทดสอบด้วยมือเร็ว ๆ จะสะอาดแค่ไหนก็ตาม
+</Callout>
+
+## Mental Model
+
+```text
+Eight groups, same order as the reading-order lesson:
+
+Schema & migrations -> extension deps, FK delete behavior, generated-type drift
+RLS & roles          -> policy-per-command, using/with check, auth.uid() wrapping,
+                        search_path, RLS-enabled-zero-policies
+Auth & sessions      -> getUser() not getSession(), refresh reuse, custom claims
+Client calls         -> error checked, .single()/PGRST116, singleton, frozen headers
+Edge functions       -> jsr:/npm:, which key, secrets file naming
+Realtime             -> publication membership, private-channel policy, replica identity
+Storage              -> folder-scoped policy, upsert needs select, signed URL expiry
+Ops & pooling         -> which key reaches this code, prepare:false, pg_net is async
+
+Run this AFTER the tools in Verification Tools come back clean -- the checklist and
+the tools cover different failure classes, and most of this catalog's 27 entries pass
+every tool cleanly right up until the checklist line that actually names the gap.
+```
+
+export const quizReviewChecklist = [
+  {
+    q: "ทำไม checklist นี้ถึงบอกให้รัน หลังจาก tool ใน Verification Tools แทนที่จะรันแทนมัน?",
+    options: [
+      "The checklist is strictly more thorough than any tool, so order doesn't matter",
+      "The tools and the checklist cover different failure classes -- tsc/deno check validate syntax and types, supabase db lint catches a specific known set of patterns, and neither one validates intent the way a human reading a policy's using/with check pair for what it actually grants can",
+      "The checklist replaces the tools entirely once memorized",
+      "Order genuinely does not matter for this course",
+    ],
+    answer: 1,
+    explain: "พิสูจน์ตลอดทั้ง AI Bug Catalog: using(true) ที่ไม่มี with check, ฟังก์ชัน security definer ที่ขาด search_path, และ RLS-enabled-zero-policies ล้วนถูกต้องตามไวยากรณ์เป๊ะสำหรับทุก tool ที่คอร์สนี้รัน -- มีแค่ผู้อ่านที่ใช้คำถามเฉพาะของ checklist นี้เท่านั้นที่จับได้",
+  },
+  {
+    q: "บรรทัด checklist ไหนถูกระบุว่าเป็น \"บรรทัดที่ผลกระทบสูงที่สุดในหน้านี้\" และทำไม?",
+    options: [
+      "The uuid_generate_v4() vs gen_random_uuid() line",
+      "Whether SERVICE_ROLE_KEY appears anywhere a client bundle could ship it -- because that one key bypasses every RLS policy every other line on this checklist is about, with no technical control once it reaches a browser",
+      "The deno check line under Tooling",
+      "The signed URL expiresIn line",
+    ],
+    answer: 1,
+    explain: "ระบุตรง ๆ ในกลุ่ม Ops & pooling ตรงกับ entry 25 ของ AI Bug Catalog: service_role ข้าม Row Level Security ไปทั้งหมด ทำให้ทุกบรรทัดที่เกี่ยวกับ RLS ในที่อื่นของ checklist นี้ไม่มีความหมายทันทีที่ key เฉพาะตัวนี้ไปถึงโค้ดฝั่ง client",
+  },
+  {
+    q: "ทำไมกลุ่ม Edge functions ถึงเจาะจงเรียกหา deno check แทน tsc แทนที่จะให้ทั้งคู่มีค่าเท่ากัน?",
+    options: [
+      "tsc is faster so it should be preferred",
+      "This course's own harness never runs tsc against files under supabase/functions/**/index.ts at all -- only deno check validates an edge function's own Deno module graph, which is exactly where a bare-specifier import fails",
+      "deno check and tsc always produce identical results",
+      "tsc does not exist for TypeScript edge functions",
+    ],
+    answer: 1,
+    explain: "พิสูจน์ใน AI Bug Catalog entry 16: import แบบ bare specifier type-check ผ่านสบายภายใต้ tsc สไตล์ Node แต่คืน BOOT_ERROR 503 จริงภายใต้ deno check / การ deploy จริงด้วย supabase functions serve -- tool ทั้งสองตรวจ module resolution rule คนละแบบกันเลย",
+  },
+  {
+    q: "กลุ่ม RLS & roles มีบรรทัด checklist มากกว่ากลุ่มอื่นทุกกลุ่ม -- ทำไมคอร์สนี้ถึงให้น้ำหนักมันหนักขนาดนั้น?",
+    options: [
+      "RLS is the hardest concept to explain, unrelated to how often it causes real bugs",
+      "Five of this catalog's most consequential, silent failure modes (missing insert policy, using(true) hijack, unwrapped auth.uid(), missing search_path, zero-policy tables) all live in this one layer, and every one of them is syntactically valid SQL that no tool in this stack rejects",
+      "RLS is deprecated in favor of a newer Supabase feature",
+      "The other seven groups are less important overall",
+    ],
+    answer: 1,
+    explain: "ตรงกับ AI Bug Catalog โดยตรง: entry 4-8 ห้าตัวจาก 27 ตัวของ catalog ล้วนเป็นรูปแบบของ RLS & roles -- มากกว่ากลุ่มเดี่ยวกลุ่มอื่นทั้งหมด เพราะ policy ที่ผิดแต่ valid มองไม่เห็นได้เลยสำหรับ compiler และ linter ทุกตัวที่คอร์สนี้รัน ต่างจาก import แบบ bare specifier หรือการขาดเช็ค error ของ .single()",
+  },
+  {
+    q: "ทำไมบรรทัด prepared-statement ของกลุ่ม Ops & pooling ถึง quote เอกสารทางการ แทนที่จะเป็น error ที่ reproduce ในเครื่องได้ ต่างจากบรรทัดอื่นส่วนใหญ่ในหน้านี้?",
+    options: [
+      "Because the bug is not real",
+      "Because reproducing Supavisor transaction-mode's actual backend-reassignment failure needs genuine concurrent connection churn a single local reviewer's low-concurrency test does not generate -- the mechanism is real and documented, stated honestly rather than staged",
+      "Because prepared statements do not apply to Supabase at all",
+      "Because this line is optional and can be skipped",
+    ],
+    answer: 1,
+    explain: "ตรงกับ entry 26 ของ AI Bug Catalog โดยตรง: การยอมรับตรง ๆ ว่า reproduce ไม่ได้แบบเดียวกัน (pg_backend_pid() เหมือนกันเป๊ะระหว่าง PREPARE กับ EXECUTE ที่ตามมาภายใต้ความหนาแน่นต่ำในเครื่อง) ถูกบันทึกไว้ที่นั่น พร้อม quote กลไกจากเอกสาร troubleshooting ของ Supabase เอง",
+  },
+];
+
+<Quiz client:visible id="reading-supabase/review-checklist" questions={quizReviewChecklist} />
+
+<ProgressTracker client:visible id="reading-supabase/review-checklist" />
