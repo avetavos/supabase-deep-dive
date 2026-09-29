@@ -1,0 +1,562 @@
+---
+title: 'Worked review 3: dashboard แบบ realtime'
+description: 'schema, trigger, channel client, webhook function และ serverless job ที่ใช้ pooler ซึ่ง AI สร้าง -- รีวิวทีละบั๊กกับความเงียบจริงจากการไม่อยู่ใน publication, CHANNEL_ERROR จริง, ช่องว่าง replica-identity จริง, response ของ Edge Function ที่ถูกบล็อกจริง และ prepared-statement ที่ fail จริง บน local Realtime + Supavisor stack'
+sidebar:
+  order: 6
+---
+
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import Mermaid from '../../../../components/Mermaid.astro';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## ฟีเจอร์
+
+prompt ที่ให้ไปคือ: *"สร้าง live dashboard: table เก็บ event, feed realtime ของ event ใหม่, webhook ที่แจ้งระบบภายนอกทุก event และ background job ที่ rollup สถิติรายชั่วโมงโดยใช้ pooler"* แต่ละชิ้นที่นี่เดี่ยว ๆ ดูเหมือนโค้ดที่ทำงานได้ที่ AI assistant มอบให้อย่างมั่นใจ -- channel subscription ที่รายงาน `SUBSCRIBED`, trigger ที่ทำงาน, job ที่ query ได้ปกติสิบครั้งแรกที่ test มันมี **บั๊กจริง 10 ตัว** หลายตัวเป็นประเภทที่โผล่มาเฉพาะภายใต้เงื่อนไขที่ docs ของคอร์สนี้เองเตือนไว้พอดี (scale, contention, schedule string ที่ดูสมเหตุสมผล) ไม่ใช่ตอน manual test ครั้งแรก ดูที่ **[AI bug catalog](/supabase/th/reading-supabase/ai-bug-catalog/)** สำหรับรูปแบบทั่วไปเบื้องหลังสองตัว (19, 21) -- ที่เหลือเป็นเรื่องใหม่ในรีวิวนี้ เฉพาะกับโมเดล private-channel ของ Realtime, `pg_net`/`pg_cron` และ Supavisor ทุกข้อกล่าวอ้างด้านล่างถูกพิสูจน์บน local stack ของคอร์สนี้เอง -- realtime subscription จริง, `pg_net`/`pg_cron` ที่ติดตั้งจริง, process `supabase functions serve` จริง (หยุดแล้วทันทีที่เก็บข้อพิสูจน์ครบ) และ connection ที่แย่งกันจริงกับ Supavisor pooler ของคอร์สนี้เอง
+
+## โค้ดที่ AI สร้าง
+
+```sql
+-- reading-supabase/worked-review-3/dashboard-migration.sql -- as generated, see review below
+create table public.wr_dashboard_events (
+  id bigint generated always as identity primary key,
+  kind text not null,
+  payload jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now()
+);
+alter table public.wr_dashboard_events enable row level security;
+create policy wr_dashboard_events_select on public.wr_dashboard_events
+  for select to authenticated using (true);
+
+-- AI comment: "realtime works out of the box once RLS is set up"
+
+create or replace function public.wr_dashboard_webhook()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  perform net.http_post(
+    url := 'https://example-webhook-receiver.internal/wr3-dashboard',
+    body := jsonb_build_object('id', new.id, 'kind', new.kind)
+  );
+  return new;
+end;
+$$;
+
+create trigger wr_dashboard_events_webhook
+  after insert on public.wr_dashboard_events
+  for each row execute function public.wr_dashboard_webhook();
+```
+
+```typescript
+// reading-supabase/worked-review-3/dashboard-subscriber.ts -- as generated, see review below
+import { createClient } from '@supabase/supabase-js';
+
+export function subscribeToDashboard(url: string, anonKey: string) {
+  const client = createClient(url, anonKey);
+  return client
+    .channel('wr3:dashboard-events')
+    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'wr_dashboard_events' }, (payload) => {
+      console.log('new event, what changed:', payload.old, '->', payload.new);
+    })
+    .subscribe();
+}
+```
+
+## เดินรีวิวทีละจุด
+
+### `postgres_changes` บน table ที่ไม่เคยถูกเพิ่มเข้า `supabase_realtime`
+
+ไม่มีอะไรใน migration ที่ AI สร้างรัน `alter publication supabase_realtime add table ...` เลย พิสูจน์แล้ว: subscriber เชื่อมต่อ รายงานสำเร็จ และ insert จริงให้ความเงียบสนิท:
+
+```bash
+# scripts/reading-supabase/worked-review-3/publication-silence.sh
+# subscribe, wait 1.5s, insert a row as service_role, wait 3s
+```
+
+```text
+received event: false (table NOT in supabase_realtime publication yet)
+```
+
+<SpotTheBug lang="ts" code={`.on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'wr_dashboard_events' }, ...)
+.subscribe()`}>
+ตรงกับ [ai-bug-catalog entry 19](/supabase/th/reading-supabase/ai-bug-catalog/) เป๊ะ: callback ของ `subscribe()` รายงาน `SUBSCRIBED` -- การเชื่อมต่อ WebSocket และ channel เองโอเคจริง -- ในขณะที่ table เองไม่เคยถูกต่อสายเข้า logical replication เลย Postgres เลยไม่มีอะไรจะ stream ออกมา ไม่มี error ตรงไหนใน chain นี้เลยเพราะ จากมุมมองของ Postgres เองไม่มีอะไรผิดพลาด วิธีแก้ พิสูจน์ตรงด้านล่าง คือ statement เดียว: `alter publication supabase_realtime add table public.wr_dashboard_events;` -- หลังจากนั้น subscription เดียวกันเป๊ะได้รับ insert เดียวกันเป๊ะ
+</SpotTheBug>
+
+```text
+ALTER PUBLICATION
+received event: true
+```
+
+### `postgres_changes` เป็นกลไกที่ผิดสำหรับ table นี้ในระดับ scale
+
+แม้ต่อสายเข้า publication ถูกต้องแล้ว `postgres_changes` ก็ยัง re-authorize ทุก event กับ RLS `select` policy ของ subscriber แต่ละคนเอง -- พิสูจน์ไว้แล้วใน [Realtime: Postgres Changes](/supabase/th/realtime-and-storage/realtime-postgres-changes/) สำหรับ dashboard ตาม docs ของ Supabase เอง (ดึงมาใหม่สำหรับรีวิวนี้ [supabase.com/docs/guides/realtime/postgres-changes](https://supabase.com/docs/guides/realtime/postgres-changes)): *"If you expect more than ~3,000 concurrent subscribers on the same changes, use Broadcast to stream database changes instead."* live dashboard คือฟีเจอร์ทรงที่มีแนวโน้มข้ามเส้นนั้นพอดี -- ผู้ชมเยอะ ดู rollup เดียวกัน
+
+<SpotTheBug lang="sql" code={`create policy wr_dashboard_events_select on public.wr_dashboard_events
+  for select to authenticated using (true);
+-- AI comment: "realtime works out of the box once RLS is set up"`}>
+"ใช้ได้เลยไม่ต้องทำอะไร" เป็นจริงตอน subscriber น้อย และห่างจากความจริงลงหน้าผาที่มีเอกสารรองรับและอ้างอิงได้ในระดับ dashboard -- ตาม docs เดียวกัน การเปลี่ยนแปลงครั้งเดียว re-run การเช็ค authorization ต่อ subscriber สำหรับทุกหนึ่งใน connection ที่เปิดอยู่หลายพัน แทนที่จะคำนวณครั้งเดียวแล้วกระจายออกไป วิธีแก้ ใช้ใน corrected code ของรีวิวนี้ด้านล่าง คือ `realtime.broadcast_changes()` -- trigger เขียน event ครั้งเดียว และ private-channel policy ของ subscriber แต่ละคนถูกเช็คครั้งเดียวต่อ**connection** ไม่ใช่ต่อ**event**
+</SpotTheBug>
+
+### `broadcast_changes` ทำงาน แต่ client subscribe channel แบบ public
+
+การเปลี่ยนไปใช้ `realtime.broadcast_changes()` (trigger ยังไม่โชว์ -- รูปทรงเดียวกับ corrected code ด้านล่าง) โดยไม่อัปเดต client ให้เป็น `{ config: { private: true } }` ดูเหมือนน่าจะยังทำงานได้ -- ชื่อ channel ตรงกัน trigger ทำงาน พิสูจน์ด้วย subscription จริงและ insert จริง:
+
+```text
+received broadcast on PUBLIC channel subscription: false
+```
+
+<SpotTheBug lang="ts" code={`client.channel('wr3:dashboard-events')
+  .on('broadcast', { event: 'INSERT' }, callback)
+  .subscribe()
+// no { config: { private: true } }`}>
+`realtime.broadcast_changes()` เขียน message ของมันเป็น `private = true` เสมอ -- ยืนยันไว้แล้วใน [Realtime Broadcast and Presence](/supabase/th/realtime-and-storage/realtime-broadcast-and-presence/) -- ดังนั้นไม่มีทางไปถึงมันได้จาก public-channel subscription เลย นี่ไม่ใช่ช่องโหว่ permission ที่ fail ดัง ๆ แต่คือ topic ที่ไม่ตรงกัน ให้ความเงียบสนิทเหมือนบั๊กก่อนหน้าเป๊ะ ด้วยเหตุผลที่ต่างกันโดยสิ้นเชิง วิธีแก้คือ `{ config: { private: true } }` บน client พิสูจน์ด้านล่างพร้อมกับบั๊กถัดไป (private channel ที่ไม่มี policy ก็ fail เหมือนกัน แค่คนละแบบ)
+</SpotTheBug>
+
+### private channel ที่ไม่มี policy บน `realtime.messages`
+
+การตั้ง channel เป็น private โดยไม่มี policy คู่กันบน `realtime.messages` เปลี่ยนจากความเงียบเป็นการปฏิเสธที่ดังและจริง พิสูจน์ด้วย subscriber ที่ authenticated จริง:
+
+```text
+subscribe result with NO policy on realtime.messages: {"status":"CHANNEL_ERROR","message":"Unauthorized: You do not have permissions to read from this Channel topic: wr3:dashboard-events"}
+```
+
+<SpotTheBug lang="sql" code={`-- realtime.broadcast_changes() trigger exists, but no policy anywhere
+-- grants select on realtime.messages for this topic`}>
+นี่คือ failure mode เดียวในรีวิวนี้ที่อย่างน้อยก็ fail อย่างตรงไปตรงมาและทันที ต่างจากสองตัวเงียบ ๆ ข้างบน -- แต่ก็ยังควรใส่ไว้เพราะ "private channel ก็ต้องการ RLS เหมือนกัน บน table ที่ต่างไปจาก table ที่คุณ broadcast จากโดยสิ้นเชิง" ไม่ใช่เรื่องที่เห็นชัดจาก trigger code อย่างเดียว วิธีแก้ พิสูจน์ด้านล่าง คือ policy บน `realtime.messages` ที่ scope ด้วย `realtime.topic()`
+</SpotTheBug>
+
+```text
+subscribe result with the policy in place: {"status":"SUBSCRIBED"}
+received on correctly-configured private channel: true
+```
+
+### `REPLICA IDENTITY` ถูกปล่อยไว้ที่ default
+
+subscriber ที่ AI สร้าง log `payload.old` เพื่อแสดง "เปลี่ยนอะไรไป" -- code ที่ดูสมเหตุสมผลแต่อ่านแล้วแย่ทันทีที่ `REPLICA IDENTITY` ถูกปล่อยไว้ที่ default ของ Postgres เอง พิสูจน์ด้วย `UPDATE` จริง แถวเดียวกัน subscription เดียวกัน:
+
+```text
+REPLICA IDENTITY DEFAULT -- payload.old: {"id":5}
+```
+
+<SpotTheBug lang="ts" code={`console.log('new event, what changed:', payload.old, '->', payload.new);`}>
+ตรงกับ [ai-bug-catalog entry 21](/supabase/th/reading-supabase/ai-bug-catalog/) เป๊ะ: `payload.old` ไม่ใช่แค่ "ขาดบาง field" แต่ขาดทุกคอลัมน์ยกเว้น primary key ทำให้ `payload.old` ข้างบน log ออกมาเป็น `{"id":5}` -- ไม่มีอะไรให้ code นี้ diff กับ `payload.new` เพื่อแสดง "เปลี่ยนอะไรไป" เลยจริง ๆ (หมายเหตุ: บั๊กเฉพาะนี้ใช้กับ path `postgres_changes` เท่านั้น -- ตัวแปร `OLD`/`NEW` ของ trigger เอง ซึ่ง `broadcast_changes` ส่งตรง มีแถวเต็มเสมอไม่ว่า `REPLICA IDENTITY` จะเป็นอะไร; บั๊กนี้เกี่ยวกับ path ที่อิง WAL ที่บั๊กก่อนหน้าของรีวิวนี้ย้ายออกไปแล้ว ใส่ไว้เพราะการรีวิว codebase แบบผสมหรืออยู่ระหว่างเปลี่ยนผ่านหมายความว่าทั้งสองกลไกโผล่มาด้วยกัน) วิธีแก้ พิสูจน์ตรงด้านล่างด้วย update เดียวกันเป๊ะ คือ `alter table ... replica identity full;`
+</SpotTheBug>
+
+```text
+REPLICA IDENTITY DEFAULT -- payload.old: {"id":6,"kind":"ri-test","payload":{"note":"original"},"created_at":"2026-09-29T08:59:35.650623+00:00"}
+```
+
+### webhook trigger ที่ยิง `pg_net` แล้วไม่เคยเช็คผลลัพธ์เลย
+
+`wr_dashboard_webhook()` เรียก `net.http_post` แล้ว return -- ไม่มีการจัดการ error และไม่มีอะไรใน migration นี้เลยที่อ่าน `net._http_response` พิสูจน์แล้ว: insert ที่ยิง trigger นี้ return ในเวลาจริงต่ำกว่า 3ms (ยืนยันว่า `pg_net` เป็น async จริง ตามที่บท [Background Tasks and Webhooks](/supabase/th/edge-functions/background-tasks-and-webhooks-with-functions/) พิสูจน์ไว้แล้ว) และการส่งจริง เช็คแยกต่างหาก fail ไปเลย:
+
+```text
+Time: 2.498 ms
+```
+
+```text
+ id | status_code |         error_msg          |            created
+----+-------------+----------------------------+-------------------------------
+  6 |             | Couldn't connect to server | 2026-09-29 09:00:51.800611+00
+```
+
+<SpotTheBug lang="sql" code={`perform net.http_post(
+  url := 'https://example-webhook-receiver.internal/wr3-dashboard',
+  body := jsonb_build_object('id', new.id, 'kind', new.kind)
+);
+return new;`}>
+คุณค่าทั้งหมดของ `pg_net` คือ webhook ไม่เคยบล็อกการเขียนที่ยิง trigger มันเลย -- พิสูจน์ไว้ข้างบน และเป็นพฤติกรรมที่ถูกต้องจริง ไม่ใช่บั๊กในตัวมันเอง บั๊กคือไม่มีอะไรใน codebase นี้เคยดูผลลัพธ์เลย: webhook receiver ที่ล่ม ตั้งค่าผิด หรือแค่เข้าถึงไม่ได้ (พิสูจน์ข้างบนด้วย `Couldn't connect to server` จริง) fail **ทุกครั้ง** ตลอดไป โดยไม่มีใครเห็นเลยยกเว้น table ที่ไม่มีใคร query วิธีแก้ ใน corrected code ของรีวิวนี้ คือ monitoring function เล็ก ๆ เหนือ `net._http_response` -- เช็คตามตารางเวลา ไม่ใช่ข้างใน trigger เอง เพราะจุดประสงค์ทั้งหมดของ `pg_net` คือ trigger ไม่ควรรอคำตอบ
+</SpotTheBug>
+
+### `EdgeRuntime.waitUntil` ถูกเรียก แต่ก็ await อยู่ดี
+
+Edge Function คู่หนึ่งตั้งใจจะแจ้ง service ที่เฝ้าดู dashboard ในเบื้องหลังหลังจาก response เร็ว ๆ พิสูจน์ด้วย response timing จริงที่เก็บมาสำหรับสอง function ที่เหมือนกันทุกอย่างยกเว้นจุดเดียว:
+
+```text
+=== broken (awaits the waitUntil promise anyway) ===
+real  0m2.095s
+
+=== fixed (does not await it) ===
+real  0m0.075s
+```
+
+<SpotTheBug lang="ts" code={`const bg = slowFollowUp()
+EdgeRuntime.waitUntil(bg)
+await bg`}>
+การเรียก `EdgeRuntime.waitUntil(bg)` แล้ว `await bg` บรรทัดถัดไปเลย ก็ยัง register promise เป็น background task จริง -- แล้วก็บล็อก response บน promise ตัวเดียวกันเป๊ะทันทีอยู่ดี ทำลายจุดประสงค์ทั้งหมดไปเลย พิสูจน์ข้างบน: เวอร์ชันนี้ใช้เวลา response นานเท่ากับงาน "ช้า" นั้นเอง (2 วินาทีจริง ตรงกับ `setTimeout` ของ `slowFollowUp` เอง) เหมือนกับไม่เคยเรียก `waitUntil` เลย วิธีแก้ พิสูจน์ข้างบนว่าเร็วกว่า **~28 เท่า** บน Mac เครื่องนี้ คือแค่ไม่ await promise ที่ส่งให้ `waitUntil` -- ปล่อยให้มันรันจนจบด้วยตัวเอง
+</SpotTheBug>
+
+### Prepared statement ผ่าน transaction-mode pooler
+
+job rollup รายชั่วโมงเชื่อมผ่าน port transaction-mode ของ Supavisor เพื่อรัน aggregation query ซ้ำ ๆ `PREPARE` ครั้งเดียวแล้ว `EXECUTE` ตามตารางเวลา -- การ optimize ที่ดูเป็นธรรมชาติสำหรับ query ที่รันรูปทรงเดียวกันทุกครั้ง reproduce ด้วย contention จริงกับ pooler ของคอร์สนี้เอง (`pool_size = 20`) กลไกเดียวกับที่บท [Connection Pooling and Supavisor](/supabase/th/production-and-ecosystem/connection-pooling-and-supavisor/) พิสูจน์ไว้ครบแล้ว:
+
+```text
+$ docker exec -i supabase_db_probe psql "postgresql://postgres.pooler-dev:postgres@supabase_pooler_probe:6543/postgres" -c "PREPARE wr3_stmt AS select count(*) from public.wr_dashboard_events;"
+PREPARE
+# ...25 concurrent sessions competing for the same 20-connection pool...
+$ docker exec -i supabase_db_probe psql "postgresql://postgres.pooler-dev:postgres@supabase_pooler_probe:6543/postgres" -c "EXECUTE wr3_stmt;"
+ERROR:  prepared statement "wr3_stmt" does not exist
+```
+
+<SpotTheBug lang="sql" code={`PREPARE wr3_stmt AS select count(*) from public.wr_dashboard_events;
+-- ... later, on a schedule ...
+EXECUTE wr3_stmt;`}>
+Transaction mode คืน backend Postgres connection กลับสู่ pool หลังทุก statement ที่ autocommit ดังนั้น `PREPARE` กับ `EXECUTE` -- ที่ส่งผ่าน client connection เดียวกันไปที่ Supavisor -- ตกไปที่ backend จริง **คนละตัว** ได้ภายใต้ contention จริง และ backend ที่สองไม่เคยเห็น statement แรกถูก prepare เลย สิ่งนี้ผ่าน test local ที่ concurrency ต่ำทุกครั้ง (pool ที่โหลดเบา ๆ มักตกที่ backend เดิมโดยบังเอิญ) และ fail เฉพาะตอนที่ job รันพร้อมโหลด concurrent จริง -- ตรงกับเงื่อนไขที่ production rollup job เจอเป๊ะ และ local smoke test เร็ว ๆ ไม่เจอ วิธีแก้คือ `{ prepare: false }` บน driver (option จริงที่ package npm `postgres` มีให้สำหรับ pooler mode นี้โดยเฉพาะ) หรือสำหรับ job ที่ต้องการ prepared statement หรือฟีเจอร์ระดับ session จริง ๆ ใช้ session mode แทน transaction mode
+</SpotTheBug>
+
+### schedule string ของ `pg_cron` ที่ไม่ใช่ cron syntax ที่ถูกต้อง
+
+schedule ของ job rollup เองตั้งใจให้รันทุก 5 นาที เขียนเป็น `'*/5 minutes'` -- ภาษาอังกฤษที่อ่านง่าย ไม่ใช่ `pg_cron` syntax ที่ถูกต้อง พิสูจน์ด้วยการลอง schedule จริง:
+
+```text
+select cron.schedule('wr3-bad-schedule', '*/5 minutes', $$select 1;$$);
+ERROR:  invalid schedule: */5 minutes
+HINT:  Use cron format (e.g. 5 4 * * *), or interval format '[1-59] seconds'
+```
+
+<SpotTheBug lang="sql" code={`select cron.schedule('wr3-rollup', '*/5 minutes', $$ ... $$);`}>
+error ของ `pg_cron` เองทันทีและเฉพาะเจาะจง -- นี่คือบั๊กเดียวในรีวิวนี้ที่ fail ดังพอ ๆ กับบั๊ก 8 ข้างบน ตอน migration รัน ไม่ใช่ทีหลังภายใต้โหลด ใส่ไว้เพราะ schedule string แบบ "อ่านง่ายแต่ผิด" เป็นนิสัยของ AI ที่พบบ่อยข้าม cron-like syntax ทั่วไป และทางแก้เล็กพอที่จะพลาดตอนอ่านเร็ว ๆ: cron syntax จริง (`*/5 * * * *`) หรือ format interval-เป็นวินาทีแยกต่างหากของ `pg_cron` เอง ไม่ใช่ภาษาธรรมชาติเด็ดขาด
+</SpotTheBug>
+
+### client ตัวที่สอง ที่แยกออกไป ถือ token ที่ไม่เคย refresh
+
+module subscriber realtime ของ dashboard เขียนเป็นไฟล์แยกของตัวเอง สร้าง instance `createClient()` **ของตัวเอง** ที่ seed ครั้งเดียวด้วย token ที่ส่งให้ แยกออกจาก auth client จริงตัวเดียวของแอป พิสูจน์แบบสด ด้วยการบังคับ refresh token จริง แล้วเทียบ Realtime auth state ภายในของทั้งสอง client:
+
+```text
+token actually changed on refresh: true
+correctly-wired client auto-updated its realtime token: true
+separate realtime-only client still on the STALE original token: true (should be true -- the bug)
+```
+
+<SpotTheBug lang="ts" code={`const realtimeOnlyClient = createClient(url, anonKey);
+realtimeOnlyClient.realtime.setAuth(originalToken); // set once, never again`}>
+นี่เป็นบั๊กที่ subtler กว่า "ลืมเรียก `setAuth`" -- อ่าน source ของ `@supabase/supabase-js@2.117.2` ที่ติดตั้งอยู่ตรง ๆ แสดงว่า client instance **เดียวที่แชร์กัน** ต่อสายอัตโนมัติอยู่แล้ว: auth-state listener ภายในของมันเองเรียก `this.realtime.setAuth(token)` ทุก event `TOKEN_REFRESHED`/`SIGNED_IN`/`INITIAL_SESSION` พิสูจน์ข้างบนด้วย `refreshSession()` จริงที่ถูกบังคับ สะท้อนทันทีใน layer `realtime` ของ client ตัวนั้นเองโดยไม่มี code manual เลย client **ตัวที่สอง** ที่สร้างแยกต่างหากสำหรับ "แค่ส่วน realtime" ไม่เคยได้รับ auth event ของแอปนั้นเลย ดังนั้น token ที่มัน seed ไว้ตอนสร้างคือ token เดียวที่มันจะมีตลอดไป -- ถูกต้องจนกว่า token เดิมจะหมดอายุจริง แล้วก็ไม่ authorized เงียบ ๆ จากจุดนั้นเป็นต้นไป ไม่มี error จนกว่าจะ resubscribe ครั้งถัดไป วิธีแก้คือ client instance เดียวที่แชร์กันสำหรับทั้ง auth และ realtime instance เดียวกันตลอดทั้งแอป เหมือนที่ทุกบทอื่นในคอร์สนี้ทำอยู่แล้ว
+</SpotTheBug>
+
+## โค้ดที่แก้แล้ว
+
+```sql
+-- supabase/migrations/7403_wr_dashboard.sql
+create table public.wr_dashboard_events (
+  id bigint generated always as identity primary key,
+  kind text not null,
+  payload jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now()
+);
+alter table public.wr_dashboard_events enable row level security;
+create policy wr_dashboard_events_select on public.wr_dashboard_events
+  for select to authenticated using (true);
+
+create or replace function public.wr_broadcast_dashboard_event()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  perform realtime.broadcast_changes(
+    'wr3:dashboard-events',
+    tg_op,
+    tg_op,
+    tg_table_name,
+    tg_table_schema,
+    new,
+    old
+  );
+  return new;
+end;
+$$;
+
+create trigger wr_dashboard_events_broadcast
+  after insert on public.wr_dashboard_events
+  for each row execute function public.wr_broadcast_dashboard_event();
+
+create policy wr3_dashboard_events_read on realtime.messages
+  for select to authenticated
+  using ( realtime.topic() = 'wr3:dashboard-events' );
+
+create extension if not exists pg_net with schema extensions;
+
+create or replace function public.wr_dashboard_webhook()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  perform net.http_post(
+    url := 'https://example-webhook-receiver.internal/wr3-dashboard',
+    body := jsonb_build_object('id', new.id, 'kind', new.kind)
+  );
+  return new;
+end;
+$$;
+
+create trigger wr_dashboard_events_webhook
+  after insert on public.wr_dashboard_events
+  for each row execute function public.wr_dashboard_webhook();
+
+-- Checked on a schedule (a real deployment would wire this into
+-- `select cron.schedule('wr3-check-failed-webhooks', '*/5 * * * *', ...)`
+-- using real cron syntax, never left running on this shared local stack) --
+-- never inside the trigger itself, since pg_net's whole point is that the
+-- trigger does not wait for the answer.
+create or replace function public.wr_check_failed_webhooks()
+returns table(response_id bigint, error_msg text, created timestamptz)
+language sql
+security definer
+set search_path = ''
+stable
+as $$
+  select id, error_msg, created
+  from net._http_response
+  where created > now() - interval '5 minutes'
+    and (status_code is null or status_code >= 400);
+$$;
+revoke execute on function public.wr_check_failed_webhooks() from public;
+grant execute on function public.wr_check_failed_webhooks() to authenticated;
+```
+
+```ts
+// supabase/functions/wr-dashboard-notify/index.ts
+declare const EdgeRuntime: { waitUntil: (promise: Promise<unknown>) => void }
+
+async function slowFollowUp() {
+  await new Promise((r) => setTimeout(r, 2000))
+  console.log('slow follow-up finished at', new Date().toISOString())
+}
+
+Deno.serve(async (_req) => {
+  console.log('request received at', new Date().toISOString())
+  EdgeRuntime.waitUntil(slowFollowUp())
+  console.log('responding at', new Date().toISOString())
+  return new Response(JSON.stringify({ ok: true }), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+})
+```
+
+```ts
+// src/reading-supabase/worked-review-3/dashboard-realtime.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+declare const process: { env: Record<string, string | undefined>; exit: (code?: number) => never };
+
+const url = process.env.SUPABASE_URL!;
+const anonKey = process.env.SUPABASE_ANON_KEY!;
+const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+const admin = createClient(url, serviceKey);
+const stamp = Date.now();
+const email = `wr+run-dashboard-${stamp}@example.com`;
+
+async function main() {
+  const { data: created, error: cErr } = await admin.auth.admin.createUser({
+    email,
+    password: 'wr-Passw0rd!',
+    email_confirm: true,
+  });
+  if (cErr) throw cErr;
+
+  // ONE shared client for both auth and realtime -- the fix for the last bug above.
+  const client = createClient(url, anonKey);
+  const { data: signIn, error: sErr } = await client.auth.signInWithPassword({
+    email,
+    password: 'wr-Passw0rd!',
+  });
+  if (sErr) throw sErr;
+  client.realtime.setAuth(signIn.session!.access_token);
+
+  let received: unknown = null;
+  const channel = client
+    .channel('wr3:dashboard-events', { config: { private: true } })
+    .on('broadcast', { event: 'INSERT' }, (payload) => { received = payload; });
+  const subResult = await new Promise<{ status: string }>((resolve) => {
+    channel.subscribe((status) => resolve({ status }));
+  });
+  if (subResult.status !== 'SUBSCRIBED') {
+    throw new Error(`private channel subscribe failed: ${subResult.status}`);
+  }
+  console.log('private channel subscribed');
+
+  const { data: row, error: iErr } = await admin
+    .from('wr_dashboard_events')
+    .insert({ kind: 'dashboard-run', payload: { source: 'run-script' } })
+    .select()
+    .single();
+  if (iErr) throw iErr;
+
+  await new Promise((r) => setTimeout(r, 3000));
+  if (!received) throw new Error('did not receive broadcast_changes event on private channel');
+  console.log('received broadcast_changes event for insert id', row.id);
+
+  const { data: failed, error: fErr } = await client.rpc('wr_check_failed_webhooks');
+  if (fErr) throw fErr;
+  console.log('failed webhook deliveries visible to the monitoring function:', (failed as unknown[]).length >= 1);
+
+  await client.removeChannel(channel);
+  await admin.auth.admin.deleteUser(created.user.id);
+  await admin.from('wr_dashboard_events').delete().eq('id', row.id);
+  console.log('dashboard realtime test passed');
+  process.exit(0); // the open Realtime WebSocket otherwise keeps the process alive
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+```
+
+รันจริงกับ local stack ของคอร์สนี้เอง (`--run` ของ harness ทำซ้ำอันนี้ตอน gate):
+
+```text
+private channel subscribed
+received broadcast_changes event for insert id 12
+failed webhook deliveries visible to the monitoring function: true
+dashboard realtime test passed
+```
+
+## สิ่งที่เปลี่ยนและทำไม
+
+| # | บั๊ก | ทางแก้ |
+|---|---|---|
+| 1 | table ไม่เคยถูกเพิ่มเข้า publication `supabase_realtime` | ไม่จำเป็นแล้วเมื่อใช้ broadcast -- พิสูจน์ว่าเงียบสนิทถ้าใช้ `postgres_changes` แบบไม่แก้ |
+| 2 | เลือก `postgres_changes` สำหรับ dashboard (subscriber เยอะ) | `realtime.broadcast_changes()` -- docs อ้างเส้นตัดของ ~3,000 subscriber |
+| 3 | broadcast_changes trigger ทำงาน client อยู่บน channel แบบ public | `{ config: { private: true } }` -- พิสูจน์ว่าเงียบสนิทถ้าไม่แก้ (topic ไม่ตรงกัน) |
+| 4 | private channel ไม่มี policy `realtime.messages` | เพิ่มแล้ว scope ด้วย `realtime.topic()` -- ไม่งั้นได้ `CHANNEL_ERROR` จริง |
+| 5 | `REPLICA IDENTITY` ปล่อยไว้ที่ default | `replica identity full` สำหรับ path `postgres_changes` -- ไม่งั้นได้ `old: {"id":..}` จริง |
+| 6 | webhook `pg_net` ไม่มีการเช็คผลลัพธ์ที่ไหนเลย | monitoring function ตามตารางเวลาเหนือ `net._http_response` |
+| 7 | `EdgeRuntime.waitUntil(bg)` แล้ว `await bg` อยู่ดี | ไม่ await มัน -- พิสูจน์ว่า response เร็วขึ้นราว 28 เท่าถ้าแก้ |
+| 8 | prepared statement ผ่าน transaction-mode pooler | `{ prepare: false }` (หรือ session mode) -- ไม่งั้นได้ `prepared statement ... does not exist` จริง ภายใต้ contention |
+| 9 | schedule `pg_cron` `'*/5 minutes'` | cron syntax จริง `'*/5 * * * *'` -- ไม่งั้นได้ error `invalid schedule` จริง |
+| 10 | token ของ client ตัวที่สองที่แยกออกไปไม่เคย refresh | client เดียวที่แชร์กันสำหรับ auth + realtime -- พิสูจน์แล้ว: client ที่ต่อสายถูกต้อง auto-update ตัวที่แยกยังคงเก่าเงียบ ๆ |
+
+## สิ่งที่ reviewer เขียนใน PR
+
+> ใกล้แล้ว แต่มี 10 เรื่อง -- ส่วนใหญ่เกี่ยวกับ "subscribe สำเร็จ" พิสูจน์อะไรจริง ๆ:
+>
+> **เงียบ ไม่ใช่พัง -- พิสูจน์ด้วย insert จริงและ 3 วินาทีของความว่างเปล่า:**
+> 1. table ไม่อยู่ใน `supabase_realtime` -- เปลี่ยนไปใช้ broadcast (ข้อถัดไป) เลี่ยงเรื่องนี้ไปเลย
+> 2. `postgres_changes` บน table dashboard -- docs บอกเส้น ~3,000 subscriber ใช้ `broadcast_changes`
+> 3. broadcast trigger ทำงาน client subscribe channel แบบ public -- `broadcast_changes` private เสมอ
+>
+> **อย่างน้อยก็ fail ดัง ๆ:**
+> 4. private channel ไม่มี policy `realtime.messages` -- `CHANNEL_ERROR` จริง แก้ง่ายเมื่อรู้ว่าต้องดูตรงไหน
+>
+> **ข้อมูลผิด ไม่ใช่ข้อมูลหาย:**
+> 5. ไม่มี `replica identity full` -- `payload.old` มีแค่ `{"id":...}` ไม่มีอะไรให้ diff
+>
+> **ความล้มเหลวที่มองไม่เห็นใน production:**
+> 6. webhook `pg_net` ไม่มีใครเช็ค `net._http_response` เลย -- ผมพิสูจน์ว่ามี delivery failure จริงนั่งอยู่โดยไม่มีใครสังเกต
+> 7. `waitUntil` ถูกเรียก แต่ await อยู่ดี -- response 2 วินาที แทนที่จะเป็น 75ms เหมือนไม่ได้ใช้มันเลย
+>
+> **โผล่แค่ตอนโหลดจริงหรือ schedule ที่ไม่เคยรัน:**
+> 8. prepared statement ผ่าน transaction-mode pooler -- ผ่าน local test เร็ว ๆ ทุกครั้ง fail ภายใต้ contention จริง (พิสูจน์แล้ว)
+> 9. schedule `pg_cron` `'*/5 minutes'` ไม่ใช่ cron syntax -- fail ตอน migration จับได้ง่ายใน CI
+> 10. client realtime-only ตัวที่สองไม่เคยได้ token refresh ที่ client หลักจัดการอัตโนมัติอยู่แล้ว -- ใช้ client เดียว ไม่ใช่สอง
+>
+> ไม่มีอันไหนต้อง redesign เลย ส่วนใหญ่แค่เลือกกลไกที่สร้างมาสำหรับ scale นี้ และไม่แยก state ที่ควรอยู่ที่เดียวกัน
+
+## Mental Model
+
+บั๊กของรีวิวนี้แบ่งตาม *ความมั่นใจผิด ๆ ที่มันดูเป็น*: สามตัว (1, 3 และ webhook ที่ไม่เช็ค type, 6) fail ด้วย**ความเงียบสนิท** -- รูปทรงเดิมที่คอร์สนี้วนกลับมาเจอ เพราะ Realtime กับ `pg_net` ทั้งคู่เป็นระบบ async แบบ fire-and-forget ที่ตั้งใจไว้ ที่ "ไม่มี error" กับ "ไม่มีอะไรเกิดขึ้น" แยกกันไม่ออกถ้าไม่เช็ค state ตรง ๆ สองตัว (4, 9) fail ดังและทันที ซึ่งย้อนแย้งตรงที่ทำให้มันเป็นบั๊กที่ง่ายที่สุดในนี้ ไม่ใช่ยากที่สุด -- `CHANNEL_ERROR` จริงหรือ `invalid schedule` จริงตอน migration ถูกจับได้ในนาทีแรกของการ test ที่เหลืออีกห้าตัว (2, 5, 7, 8, 10) คือรูปทรงที่อันตรายจริง ๆ: **ถูกต้องทุก manual test เร็ว ๆ** ผิดแค่ภายใต้เงื่อนไขเฉพาะ -- จำนวน subscriber, diff ที่ถูกอ่านจริง, งบเวลา response, โหลด concurrent จริง, token ที่หมดอายุจริง -- ที่การอ่าน code รอบแรกไม่เคยสร้างขึ้นมา
+
+## Trade-offs
+
+- **`broadcast_changes` scale ผ่านต้นทุน authorization ต่อ subscriber ของ `postgres_changes` ได้** -- แลกมาด้วยการเสีย RLS re-evaluation อัตโนมัติต่อ event ของ `postgres_changes`; broadcast trigger ส่งแค่สิ่งที่คุณใส่ใน payload ตรง ๆ เท่านั้น ดังนั้น logic authorization ใด ๆ ที่มากกว่า "connection นี้อ่าน topic นี้ได้ไหม" ต้องสร้างเข้าไปใน trigger หรือ channel policy เอง
+- **การเช็ค `net._http_response` ตามตารางเวลา แทนที่จะเช็คทันทีใน trigger ทำให้ write path เร็วอยู่** -- แลกมาด้วยความล่าช้าในการตรวจจับจริง (สูงสุดตามช่วงตารางเวลาเอง) ระหว่าง webhook fail กับที่มีใครสังเกตเห็น ซึ่งเป็นการแลกที่ถูกต้องสำหรับ write path แต่เป็นตัวเลขจริงที่ต้องใส่ใน SLA ไม่ใช่ศูนย์
+- **client เดียวที่แชร์กันสำหรับ auth และ realtime ง่ายกว่าและถูกต้องเป็น default** -- client ตัวที่สองที่สร้างมาเฉพาะทางยังสมเหตุสมผลได้สำหรับ concern ที่แยกจริง ๆ (เช่น admin client แบบ service-role) ตราบใดที่มันไม่เคยถูกขอให้ถือ identity ของ user จริงไว้นานแบบที่บั๊กของรีวิวนี้ทำ
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"channel ที่รายงาน `SUBSCRIBED` กำลังรับ event อยู่"** พิสูจน์ไว้ข้างบนสองครั้ง ด้วยเหตุผลต่างกัน: table ที่หายไปจาก publication และ payload ของ `broadcast_changes` ที่ตกไปบน public channel ทั้งคู่ให้สถานะ `SUBSCRIBED` สะอาด ๆ แล้วก็ไม่มีอะไรเลยจริง ๆ ตลอดไป
+- **"การออกแบบ async ของ `pg_net` หมายความว่า webhook ที่ fail เป็นปัญหาของคนอื่นในที่สุด"** พิสูจน์ไว้ข้างบน: ไม่มีอะไรใน code ที่สร้าง -- หรือใน `pg_net` เอง -- เปิดเผยความล้มเหลวเลยถ้าไม่มีอะไร query `net._http_response` ตรง ๆ "ในที่สุด" จะเกิดขึ้นก็ต่อเมื่อ query นั้นมีอยู่เท่านั้น
+- **"ถ้าทำงานตอน test local จะทำงานใน production ด้วย"** พิสูจน์ไว้ข้างบนด้วยบั๊กเดียวในรีวิวนี้ที่ขึ้นกับโหลดทั้งหมด: prepared statement ผ่าน transaction-mode pooler ผ่าน local test ที่ concurrency ต่ำทุกครั้งด้วยความบังเอิญ และ fail เฉพาะตอนที่ traffic concurrent จริงมาแย่ง connection pool เดียวกัน
+
+<Mermaid title="แต่ละบั๊กอยู่ตรงไหนใน dashboard event หนึ่งชีวิต" code={wr3Diagram} />
+
+export const wr3Diagram = `flowchart TD
+  A["insert into wr_dashboard_events"] --> B["postgres_changes: table not in publication"]
+  B -->|"1: silence"| B
+  A --> C["broadcast_changes trigger fires"]
+  C --> D["client on a PUBLIC channel"]
+  D -->|"3: silence, topic mismatch"| D
+  C --> E["private channel, no realtime.messages policy"]
+  E -->|"4: CHANNEL_ERROR"| E
+  A --> F["pg_net webhook, no result checked"]
+  F -->|"6: fails forever, unseen"| F
+  G["EdgeRuntime.waitUntil(bg); await bg"] -->|"7: response blocked anyway"| G
+  H["PREPARE / EXECUTE over transaction pooler"] -->|"8: fails under real contention"| H
+  I["pg_cron '*/5 minutes'"] -->|"9: invalid schedule"| I
+  J["second realtime-only client"] -->|"10: token never refreshes"| J
+`;
+
+<Callout title="สรุปในบรรทัดเดียว">
+ครึ่งหนึ่งของบั๊กในรีวิวนี้ (1, 3, 6 และบั๊ก pooler ภายใต้โหลด, 8) ไม่ให้ error อะไรเลยในทั้ง stack ภายใต้เงื่อนไขเดียวกับที่ manual test เร็ว ๆ ใช้ -- subscriber คนเดียว insert traffic ต่ำครั้งเดียว webhook receiver ที่บังเอิญเข้าถึงได้วันนั้น job ที่รันครั้งเดียวแทนที่จะรันภายใต้ concurrency จริง การรีวิว realtime, async-delivery และ pooled-connection code หมายความว่าต้องถามว่า "หน้าตามันเป็นยังไงที่จำนวน subscriber, failure rate และ concurrency ที่มันถูกสร้างมาให้รองรับจริง ๆ" ไม่ใช่แค่ "demo ทำงานไหม"
+</Callout>
+
+export const quizWorkedReview3 = [
+  {
+    q: 'channel subscription รายงาน `SUBSCRIBED` และ insert จริงเข้า table ที่ subscribe ไว้ให้ศูนย์ event ตลอด 3 วินาทีจริงของการรอ `alter publication supabase_realtime add table ...` ถูกรันแล้ว insert เดียวกันเป๊ะได้รับทันที สถานะ `SUBSCRIBED` แรกเริ่มยืนยันอะไรจริง ๆ?',
+    options: [
+      'ว่า table ถูกตั้งค่าถูกต้องสำหรับ Postgres Changes',
+      'ยืนยันแค่ว่า WebSocket connection กับ channel เองทำงานอยู่ -- ไม่บอกอะไรเลยว่า table นั้นเฉพาะถูกเพิ่มเข้า supabase_realtime publication หรือยัง ซึ่งเป็นขั้นตอนแยกที่ไม่ถูกเช็ค',
+      'ว่า RLS policy scope ถูกต้องสำหรับ subscriber นี้',
+      'SUBSCRIBED จะคืนก็ต่อเมื่อ event แรกถูกยืนยันว่าส่งถึงแล้วเท่านั้น',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ตรง ๆ ข้างบน: code subscription เดียวกันเป๊ะรายงาน SUBSCRIBED ทั้งก่อนและหลังแก้ publication -- สถานะนี้อธิบายแค่ว่า channel connection สำเร็จ ไม่ใช่ว่า table ถูกต่อสายเข้า replication แล้ว',
+  },
+  {
+    q: 'docs ของ Supabase เองระบุว่า: "If you expect more than ~3,000 concurrent subscribers on the same changes, use Broadcast to stream database changes instead." ทำไมฟีเจอร์ dashboard ถึงทำให้ guidance นี้เกี่ยวข้องโดยเฉพาะ เทียบกับฟีเจอร์ที่มี subscriber หนึ่งคนต่อหนึ่งแถว (เช่น notification ของ user เอง)?',
+    options: [
+      'ไม่สำคัญเลย -- postgres_changes ทำงานเหมือนกันไม่ว่าจำนวน subscriber จะเท่าไหร่',
+      'postgres_changes re-authorize ทุก event กับ RLS select policy ของ subscriber แต่ละคนเอง ดังนั้นการเปลี่ยนแปลงครั้งเดียวคือการเช็ค authorization หนึ่งครั้งต่อ connection ที่เปิดอยู่ที่กำลังดูมัน -- premise ทั้งหมดของ dashboard (ผู้ชมเยอะดูข้อมูลเดียวกัน) คือรูปทรงที่ทวีคูณต้นทุนนี้พอดี ต่างจาก feed ต่อ user ที่แต่ละการเปลี่ยนแปลงมักมี subscriber น้อยมาก',
+      'Broadcast จำเป็นแค่กับ table ที่มีมากกว่า 3,000 แถวทั้งหมด',
+      'limit นี้ใช้แค่กับ hosted Supabase เท่านั้น ไม่ใช้กับ self-hosted หรือ local',
+    ],
+    answer: 1,
+    explain: 'อ้างตรงจาก docs ที่ดึงมาใหม่สำหรับรีวิวนี้ -- คำอธิบายกลไก (ต้นทุน authorization ต่อ subscriber) คือสิ่งที่ทำให้ฟีเจอร์ผู้ชมเยอะ-feed เดียวแบบ dashboard เป็นกรณีเฉพาะที่ guidance นี้เตือนไว้พอดี',
+  },
+  {
+    q: 'trigger เรียก `realtime.broadcast_changes()` ถูกต้อง แต่ subscription จริงที่ไม่มี `{ config: { private: true } }` ได้ศูนย์ event จาก insert จริง การเพิ่ม `private: true` อย่างเดียว (ไม่เปลี่ยนอย่างอื่นเลย) แล้วทำให้ได้รับ event นี่พิสูจน์อะไรเกี่ยวกับ broadcast_changes?',
+    options: [
+      'broadcast_changes ใช้ได้แค่กับ service_role client เท่านั้น',
+      'broadcast_changes เขียน message เป็น private = true เสมอ ดังนั้น public-channel subscription กำลังฟัง topic อื่นที่ไม่ตรงกันเลยโดยสิ้นเชิง -- ไม่ได้ถูกปฏิเสธ แค่ไม่เคยไปถึงที่ที่ถูกต้อง',
+      'private: true ให้สิทธิ์ RLS bypass กับ subscriber',
+      'นี่เป็นปัญหาเรื่อง timing ไม่เกี่ยวกับ flag private',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ตรง ๆ ข้างบน: trigger เดียวกันเป๊ะ insert เดียวกันเป๊ะ ตัวแปรเดียวที่เปลี่ยนคือ flag private บน client ที่ subscribe -- ยืนยันว่า broadcast_changes message ไปไม่ถึงจาก public-channel subscription โดยการออกแบบ',
+  },
+  {
+    q: 'prepared statement (`PREPARE wr3_stmt AS ...`) ทำงานได้ปกติตอนรันทันทีหลัง prepare ผ่าน port transaction-mode ของ Supavisor แต่ fail ด้วย `ERROR: prepared statement "wr3_stmt" does not exist` ทันทีที่ 25 session พร้อมกันแย่งกันใช้ pool 20-connection เดียวกัน ทำไม concurrency ถึงเป็นตัวกระตุ้นเรื่องนี้โดยเฉพาะ?',
+    options: [
+      'Prepared statement ไม่เคยถูกรองรับโดย Supavisor เลยไม่ว่าเงื่อนไขไหน',
+      'transaction mode คืน backend Postgres connection กลับสู่ pool หลังทุก statement ที่ autocommit; ภายใต้ contention จริงสำหรับจำนวน backend ที่จำกัด PREPARE กับ EXECUTE (ส่งผ่าน client connection เดียวกันไปที่ pooler) ตกไปที่ backend connection จริงคนละตัวได้ และ backend ตัวที่สองไม่เคยเห็น PREPARE เลย',
+      'prepared statement หมดอายุหลัง timeout ที่กำหนดตายตัว',
+      'นี่เกิดขึ้นแค่ตอน query เองผิด syntax',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ตรง ๆ ข้างบน จำลองกลไกเดียวกันเป๊ะกับบท Connection Pooling and Supavisor: pool ที่โหลดเบา ๆ มักตกที่ backend เดิมโดยบังเอิญ (ผ่าน test local concurrency ต่ำ) ในขณะที่ contention จริงสำหรับ backend 20 ตัวของ pool คือสิ่งที่เปิดเผยความไม่ตรงกันนี้จริง ๆ',
+  },
+  {
+    q: 'มี `createClient()` สอง instance: หนึ่งใช้สำหรับ sign-in (auth client จริงของแอป) และอีกตัวแยกต่างหากที่สร้างมาแค่สำหรับ realtime subscription seed ครั้งเดียวด้วย `realtime.setAuth(originalToken)` หลังจาก `refreshSession()` จริงที่ถูกบังคับบน client แรก realtime layer ของมันเอง auto-update เป็น token ใหม่ -- แต่ realtime layer ของ client ตัวที่สองยังถือ token เดิมที่ล้าสมัยไปแล้วอยู่ ทำไมมีแค่ตัวเดียวใน สอง ที่ update?',
+    options: [
+      'ทั้งคู่ควร update เหมือนกัน นี่บ่งชี้ว่าเป็นบั๊กใน supabase-js เอง',
+      'supabase-js client ที่ติดตั้งอยู่ต่อสาย auth-state listener ภายในของมันเองตรงเข้ากับ realtime.setAuth() ของ client instance ตัวนั้นเป๊ะ ทุกครั้งที่ token เปลี่ยน -- client ตัวที่สองที่สร้างแยกต่างหากไม่เคยอยู่ใน listener chain นั้นเลย ดังนั้นไม่มีอะไรบอกมันเลยว่า refresh เกิดขึ้น',
+      'token ของ client ตัวที่สอง update แค่หลัง reload หน้าเต็มรูปแบบเท่านั้น',
+      'การเรียก realtime.setAuth() ถูกแชร์กันทั่วโลกข้าม client instance ทั้งหมดโดยอัตโนมัติ',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ตรง ๆ ข้างบนด้วย token refresh จริงที่ถูกบังคับ: realtime.accessTokenValue ของ client ที่ต่อสายถูกต้องตรงกับ token ใหม่โดยอัตโนมัติไม่มีการเรียก manual เลย ในขณะที่ client ที่สร้างแยกต่างหากตรงกับ token เดิมที่ล้าสมัย -- ยืนยันว่าการต่อสายอัตโนมัติ scope อยู่ที่ client instance ตัวเดียวที่เป็นเจ้าของ auth session ไม่ได้แชร์กันทั่วโลก',
+  },
+];
+
+<Quiz client:visible id="reading-supabase/worked-review-3" questions={quizWorkedReview3} />
+
+<ProgressTracker client:visible id="reading-supabase/worked-review-3" />

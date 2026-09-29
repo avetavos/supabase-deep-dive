@@ -1,0 +1,562 @@
+---
+title: 'Worked review 3: a realtime dashboard'
+description: 'An AI-generated schema, trigger, channel client, webhook function, and a pooled-connection serverless job — reviewed bug by bug against real publication silence, a real CHANNEL_ERROR, a real replica-identity gap, a real blocked Edge Function response, and a real prepared-statement failure on a local Realtime + Supavisor stack.'
+sidebar:
+  order: 6
+---
+
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import Mermaid from '../../../../components/Mermaid.astro';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## The feature
+
+The prompt was: *"Build a live dashboard: an events table, a realtime feed of new events, a webhook that notifies an external system on every event, and a background job that rolls up hourly stats using the pooler."* Every piece here individually looks like working code an AI assistant would hand back with confidence — a channel subscription that reports `SUBSCRIBED`, a trigger that fires, a job that queries fine the first ten times it's tested. It has **10 real bugs**, several of them the specific kind that only shows up under exactly the condition this course's own docs warn about (scale, contention, a schedule string that looks plausible) rather than on a first manual test. Check the **[AI bug catalog](/supabase/en/reading-supabase/ai-bug-catalog/)** for the general shape behind two of them (19, 21) — the rest are new to this review, specific to Realtime's private-channel model, `pg_net`/`pg_cron`, and Supavisor. Every claim below was proven on this course's own local stack — real Realtime subscriptions, a real `pg_net`/`pg_cron` install, a real `supabase functions serve` process (stopped once proofs were captured), and real contended connections against this course's own Supavisor pooler.
+
+## The generated code
+
+```sql
+-- reading-supabase/worked-review-3/dashboard-migration.sql -- as generated, see review below
+create table public.wr_dashboard_events (
+  id bigint generated always as identity primary key,
+  kind text not null,
+  payload jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now()
+);
+alter table public.wr_dashboard_events enable row level security;
+create policy wr_dashboard_events_select on public.wr_dashboard_events
+  for select to authenticated using (true);
+
+-- AI comment: "realtime works out of the box once RLS is set up"
+
+create or replace function public.wr_dashboard_webhook()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  perform net.http_post(
+    url := 'https://example-webhook-receiver.internal/wr3-dashboard',
+    body := jsonb_build_object('id', new.id, 'kind', new.kind)
+  );
+  return new;
+end;
+$$;
+
+create trigger wr_dashboard_events_webhook
+  after insert on public.wr_dashboard_events
+  for each row execute function public.wr_dashboard_webhook();
+```
+
+```typescript
+// reading-supabase/worked-review-3/dashboard-subscriber.ts -- as generated, see review below
+import { createClient } from '@supabase/supabase-js';
+
+export function subscribeToDashboard(url: string, anonKey: string) {
+  const client = createClient(url, anonKey);
+  return client
+    .channel('wr3:dashboard-events')
+    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'wr_dashboard_events' }, (payload) => {
+      console.log('new event, what changed:', payload.old, '->', payload.new);
+    })
+    .subscribe();
+}
+```
+
+## The review walk
+
+### `postgres_changes` on a table never added to `supabase_realtime`
+
+Nothing in the generated migration runs `alter publication supabase_realtime add table ...`. Proven: a subscriber connects, reports success, and a real insert produces total silence:
+
+```bash
+# scripts/reading-supabase/worked-review-3/publication-silence.sh
+# subscribe, wait 1.5s, insert a row as service_role, wait 3s
+```
+
+```text
+received event: false (table NOT in supabase_realtime publication yet)
+```
+
+<SpotTheBug lang="ts" code={`.on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'wr_dashboard_events' }, ...)
+.subscribe()`}>
+Exactly [ai-bug-catalog entry 19](/supabase/en/reading-supabase/ai-bug-catalog/): the `subscribe()` callback reports `SUBSCRIBED` — the WebSocket connection and channel are genuinely fine — while the table itself was never wired into logical replication, so Postgres has nothing to stream. There is no error anywhere in this chain because, from Postgres's own perspective, nothing went wrong. The fix, proven directly below, is one statement: `alter publication supabase_realtime add table public.wr_dashboard_events;` — after which the identical subscription receives the identical insert.
+</SpotTheBug>
+
+```text
+ALTER PUBLICATION
+received event: true
+```
+
+### `postgres_changes` is the wrong mechanism for this table at scale
+
+Even correctly wired into the publication, `postgres_changes` re-authorizes every event against every subscriber's own RLS `select` policy — proven already in [Realtime: Postgres Changes](/supabase/en/realtime-and-storage/realtime-postgres-changes/). For a dashboard, per Supabase's own docs (fetched fresh for this review, [supabase.com/docs/guides/realtime/postgres-changes](https://supabase.com/docs/guides/realtime/postgres-changes)): *"If you expect more than ~3,000 concurrent subscribers on the same changes, use Broadcast to stream database changes instead."* A live dashboard is exactly the shape of feature likely to cross that line — many viewers, watching the same rollup.
+
+<SpotTheBug lang="sql" code={`create policy wr_dashboard_events_select on public.wr_dashboard_events
+  for select to authenticated using (true);
+-- AI comment: "realtime works out of the box once RLS is set up"`}>
+"Works out of the box" is true at low subscriber counts and a documented, cited scaling cliff away from true at dashboard scale — per the same docs, a single change re-runs a per-subscriber authorization check for every one of potentially thousands of open connections, rather than being computed once and fanned out. The fix, applied in this review's corrected code below, is `realtime.broadcast_changes()` — a trigger writes the event once, and every subscriber's private-channel policy is checked once per **connection**, not once per **event**.
+</SpotTheBug>
+
+### `broadcast_changes` fires, but the client subscribes to a public channel
+
+Switching to `realtime.broadcast_changes()` (trigger not shown yet — same shape as the corrected code below) without also updating the client to `{ config: { private: true } }` looks like it should still work — the channel name matches, the trigger fires. Proven with a real subscription and a real insert:
+
+```text
+received broadcast on PUBLIC channel subscription: false
+```
+
+<SpotTheBug lang="ts" code={`client.channel('wr3:dashboard-events')
+  .on('broadcast', { event: 'INSERT' }, callback)
+  .subscribe()
+// no { config: { private: true } }`}>
+`realtime.broadcast_changes()` always writes its message as `private = true` — confirmed already in [Realtime Broadcast and Presence](/supabase/en/realtime-and-storage/realtime-broadcast-and-presence/) — so there is no way to reach it from a public-channel subscription; this is not a permissions gap that fails loudly, it is a topic mismatch that produces the identical total silence as the previous bug, for a completely different reason. The fix is `{ config: { private: true } }` on the client, proven below alongside the next bug (a private channel with no policy also fails, just differently).
+</SpotTheBug>
+
+### A private channel with no `realtime.messages` policy
+
+Marking the channel private without a matching policy on `realtime.messages` swaps silence for a real, loud rejection. Proven with a real authenticated subscriber:
+
+```text
+subscribe result with NO policy on realtime.messages: {"status":"CHANNEL_ERROR","message":"Unauthorized: You do not have permissions to read from this Channel topic: wr3:dashboard-events"}
+```
+
+<SpotTheBug lang="sql" code={`-- realtime.broadcast_changes() trigger exists, but no policy anywhere
+-- grants select on realtime.messages for this topic`}>
+This is the one failure mode in this review that at least fails honestly and immediately, unlike the two silent ones above — but it's still worth including because "private channels need RLS too, on a completely different table than the one you're broadcasting from" is not obvious from the trigger code alone. The fix, proven below, is a policy on `realtime.messages` scoped by `realtime.topic()`.
+</SpotTheBug>
+
+```text
+subscribe result with the policy in place: {"status":"SUBSCRIBED"}
+received on correctly-configured private channel: true
+```
+
+### `REPLICA IDENTITY` left at its default
+
+The generated subscriber logs `payload.old` to show "what changed" — reasonable-looking code that reads badly the moment `REPLICA IDENTITY` is left at Postgres's own default. Proven with a real `UPDATE`, same row, same subscription:
+
+```text
+REPLICA IDENTITY DEFAULT -- payload.old: {"id":5}
+```
+
+<SpotTheBug lang="ts" code={`console.log('new event, what changed:', payload.old, '->', payload.new);`}>
+Exactly [ai-bug-catalog entry 21](/supabase/en/reading-supabase/ai-bug-catalog/): `payload.old` is not "just missing a few fields," it is missing every column except the primary key, so `payload.old` above logs as `{"id":5}` — nothing this code can actually diff against `payload.new` to show "what changed." (Note: this specific bug applies to the `postgres_changes` path only — a trigger's own `OLD`/`NEW` variables, which `broadcast_changes` passes directly, always carry the full row regardless of `REPLICA IDENTITY`; this bug is about the WAL-based path this review's earlier bug already moved away from, included because reviewing a hybrid or in-transition codebase means both mechanisms show up.) The fix, proven directly below with the identical update, is `alter table ... replica identity full;`.
+</SpotTheBug>
+
+```text
+REPLICA IDENTITY DEFAULT -- payload.old: {"id":6,"kind":"ri-test","payload":{"note":"original"},"created_at":"2026-09-29T08:59:35.650623+00:00"}
+```
+
+### A webhook trigger that fires `pg_net` and never checks the result
+
+`wr_dashboard_webhook()` calls `net.http_post` and returns — no error handling, and nothing anywhere in this migration ever reads `net._http_response`. Proven: the insert that fires it returns in real, sub-3ms time (confirming `pg_net` is genuinely asynchronous, as the [Background Tasks and Webhooks](/supabase/en/edge-functions/background-tasks-and-webhooks-with-functions/) lesson already proved), and the actual delivery, checked separately, failed outright:
+
+```text
+Time: 2.498 ms
+```
+
+```text
+ id | status_code |         error_msg          |            created
+----+-------------+----------------------------+-------------------------------
+  6 |             | Couldn't connect to server | 2026-09-29 09:00:51.800611+00
+```
+
+<SpotTheBug lang="sql" code={`perform net.http_post(
+  url := 'https://example-webhook-receiver.internal/wr3-dashboard',
+  body := jsonb_build_object('id', new.id, 'kind', new.kind)
+);
+return new;`}>
+`pg_net`'s entire value proposition is that a webhook never blocks the write that triggered it — proven above, and genuinely correct behavior, not a bug by itself. The bug is that nothing in this codebase ever looks at the result: a webhook receiver that is down, misconfigured, or simply unreachable (proven above with a real `Couldn't connect to server`) fails **every single time**, forever, with zero visibility anywhere except a table nobody queries. The fix, in this review's corrected code, is a small monitoring function over `net._http_response` — checked on a schedule, not inside the trigger itself, since the whole point of `pg_net` is that the trigger shouldn't wait for the answer.
+</SpotTheBug>
+
+### `EdgeRuntime.waitUntil`, called but awaited anyway
+
+A companion Edge Function is meant to notify a dashboard-watchers service in the background after responding fast. Proven with real, captured response timing for two otherwise-identical functions:
+
+```text
+=== broken (awaits the waitUntil promise anyway) ===
+real  0m2.095s
+
+=== fixed (does not await it) ===
+real  0m0.075s
+```
+
+<SpotTheBug lang="ts" code={`const bg = slowFollowUp()
+EdgeRuntime.waitUntil(bg)
+await bg`}>
+Calling `EdgeRuntime.waitUntil(bg)` and then `await bg` on the very next line does register the promise as a background task — and then immediately blocks the response on that exact same promise anyway, defeating the entire point. Proven above: this version takes as long to respond as the "slow" work itself (2 real seconds, matching `slowFollowUp`'s own `setTimeout`), identical to never having called `waitUntil` at all. The fix, proven above at **~28x** faster on this Mac, is simply not awaiting the promise passed to `waitUntil` — let it run to completion on its own.
+</SpotTheBug>
+
+### Prepared statements over the transaction-mode pooler
+
+The hourly rollup job connects through Supavisor's transaction-mode port to run a repeated aggregation query, `PREPARE`d once and `EXECUTE`d on a schedule — a natural-looking optimization for a query that runs the same shape every time. Reproduced with real contention against this course's own pooler (`pool_size = 20`), the same mechanism the [Connection Pooling and Supavisor](/supabase/en/production-and-ecosystem/connection-pooling-and-supavisor/) lesson proves in full:
+
+```text
+$ docker exec -i supabase_db_probe psql "postgresql://postgres.pooler-dev:postgres@supabase_pooler_probe:6543/postgres" -c "PREPARE wr3_stmt AS select count(*) from public.wr_dashboard_events;"
+PREPARE
+# ...25 concurrent sessions competing for the same 20-connection pool...
+$ docker exec -i supabase_db_probe psql "postgresql://postgres.pooler-dev:postgres@supabase_pooler_probe:6543/postgres" -c "EXECUTE wr3_stmt;"
+ERROR:  prepared statement "wr3_stmt" does not exist
+```
+
+<SpotTheBug lang="sql" code={`PREPARE wr3_stmt AS select count(*) from public.wr_dashboard_events;
+-- ... later, on a schedule ...
+EXECUTE wr3_stmt;`}>
+Transaction mode returns the backend Postgres connection to the pool after every autocommitted statement, so `PREPARE` and `EXECUTE` — sent over the same client connection to Supavisor — can land on two **different** real backends under real contention, and the second one never saw the first statement get prepared. This passes every low-concurrency local test (a lightly loaded pool often keeps landing on the same backend by luck) and fails specifically once the job runs alongside genuine concurrent load — exactly the condition a production rollup job hits and a quick local smoke test does not. The fix is `{ prepare: false }` on the driver (the real option the `postgres` npm package exposes for exactly this pooler mode) or, for a job that genuinely needs prepared statements or other session-level features, session mode instead of transaction mode.
+</SpotTheBug>
+
+### `pg_cron` schedule string that isn't valid cron syntax
+
+The rollup job's own schedule was meant to run every 5 minutes, written as `'*/5 minutes'` — readable English, not valid `pg_cron` syntax. Proven with a real schedule attempt:
+
+```text
+select cron.schedule('wr3-bad-schedule', '*/5 minutes', $$select 1;$$);
+ERROR:  invalid schedule: */5 minutes
+HINT:  Use cron format (e.g. 5 4 * * *), or interval format '[1-59] seconds'
+```
+
+<SpotTheBug lang="sql" code={`select cron.schedule('wr3-rollup', '*/5 minutes', $$ ... $$);`}>
+`pg_cron`'s own error is immediate and specific — this is the one bug in this review that fails as loudly as bug 8 above, at the moment the migration runs, not later under load. It's included anyway because "readable but wrong" schedule strings are a common AI habit across cron-like syntaxes generally, and the fix is small enough to miss on a fast read: real cron syntax (`*/5 * * * *`) or `pg_cron`'s own separate seconds-interval format, never natural language.
+</SpotTheBug>
+
+### A second, disconnected client holds a token that never refreshes
+
+The dashboard's realtime subscriber module is written as its own file, constructing its **own** `createClient()` instance seeded once with a token handed to it, separate from the app's one real auth client. Proven live, by forcing a real token refresh and comparing both clients' internal Realtime auth state:
+
+```text
+token actually changed on refresh: true
+correctly-wired client auto-updated its realtime token: true
+separate realtime-only client still on the STALE original token: true (should be true -- the bug)
+```
+
+<SpotTheBug lang="ts" code={`const realtimeOnlyClient = createClient(url, anonKey);
+realtimeOnlyClient.realtime.setAuth(originalToken); // set once, never again`}>
+This is a subtler bug than "forgot to call `setAuth`" — reading the installed `@supabase/supabase-js@2.117.2` source directly shows the **one, shared** client instance already wires this automatically: its own internal auth-state listener calls `this.realtime.setAuth(token)` on every `TOKEN_REFRESHED`/`SIGNED_IN`/`INITIAL_SESSION` event, proven above by a real, forced `refreshSession()` immediately reflecting in that client's own `realtime` layer with zero manual code. A **second**, independently-constructed client for "just the realtime part" never receives that app's auth events at all, so whatever token it was seeded with at construction time is the only token it will ever have — correct until the original token's real expiry, then silently unauthorized from that point forward, with no error until the next resubscribe. The fix is one shared client instance for both auth and realtime, the same instance throughout the app, exactly as every other lesson in this course already does it.
+</SpotTheBug>
+
+## The corrected code
+
+```sql
+-- supabase/migrations/7403_wr_dashboard.sql
+create table public.wr_dashboard_events (
+  id bigint generated always as identity primary key,
+  kind text not null,
+  payload jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now()
+);
+alter table public.wr_dashboard_events enable row level security;
+create policy wr_dashboard_events_select on public.wr_dashboard_events
+  for select to authenticated using (true);
+
+create or replace function public.wr_broadcast_dashboard_event()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  perform realtime.broadcast_changes(
+    'wr3:dashboard-events',
+    tg_op,
+    tg_op,
+    tg_table_name,
+    tg_table_schema,
+    new,
+    old
+  );
+  return new;
+end;
+$$;
+
+create trigger wr_dashboard_events_broadcast
+  after insert on public.wr_dashboard_events
+  for each row execute function public.wr_broadcast_dashboard_event();
+
+create policy wr3_dashboard_events_read on realtime.messages
+  for select to authenticated
+  using ( realtime.topic() = 'wr3:dashboard-events' );
+
+create extension if not exists pg_net with schema extensions;
+
+create or replace function public.wr_dashboard_webhook()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  perform net.http_post(
+    url := 'https://example-webhook-receiver.internal/wr3-dashboard',
+    body := jsonb_build_object('id', new.id, 'kind', new.kind)
+  );
+  return new;
+end;
+$$;
+
+create trigger wr_dashboard_events_webhook
+  after insert on public.wr_dashboard_events
+  for each row execute function public.wr_dashboard_webhook();
+
+-- Checked on a schedule (a real deployment would wire this into
+-- `select cron.schedule('wr3-check-failed-webhooks', '*/5 * * * *', ...)`
+-- using real cron syntax, never left running on this shared local stack) --
+-- never inside the trigger itself, since pg_net's whole point is that the
+-- trigger does not wait for the answer.
+create or replace function public.wr_check_failed_webhooks()
+returns table(response_id bigint, error_msg text, created timestamptz)
+language sql
+security definer
+set search_path = ''
+stable
+as $$
+  select id, error_msg, created
+  from net._http_response
+  where created > now() - interval '5 minutes'
+    and (status_code is null or status_code >= 400);
+$$;
+revoke execute on function public.wr_check_failed_webhooks() from public;
+grant execute on function public.wr_check_failed_webhooks() to authenticated;
+```
+
+```ts
+// supabase/functions/wr-dashboard-notify/index.ts
+declare const EdgeRuntime: { waitUntil: (promise: Promise<unknown>) => void }
+
+async function slowFollowUp() {
+  await new Promise((r) => setTimeout(r, 2000))
+  console.log('slow follow-up finished at', new Date().toISOString())
+}
+
+Deno.serve(async (_req) => {
+  console.log('request received at', new Date().toISOString())
+  EdgeRuntime.waitUntil(slowFollowUp())
+  console.log('responding at', new Date().toISOString())
+  return new Response(JSON.stringify({ ok: true }), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+})
+```
+
+```ts
+// src/reading-supabase/worked-review-3/dashboard-realtime.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+declare const process: { env: Record<string, string | undefined>; exit: (code?: number) => never };
+
+const url = process.env.SUPABASE_URL!;
+const anonKey = process.env.SUPABASE_ANON_KEY!;
+const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+const admin = createClient(url, serviceKey);
+const stamp = Date.now();
+const email = `wr+run-dashboard-${stamp}@example.com`;
+
+async function main() {
+  const { data: created, error: cErr } = await admin.auth.admin.createUser({
+    email,
+    password: 'wr-Passw0rd!',
+    email_confirm: true,
+  });
+  if (cErr) throw cErr;
+
+  // ONE shared client for both auth and realtime -- the fix for the last bug above.
+  const client = createClient(url, anonKey);
+  const { data: signIn, error: sErr } = await client.auth.signInWithPassword({
+    email,
+    password: 'wr-Passw0rd!',
+  });
+  if (sErr) throw sErr;
+  client.realtime.setAuth(signIn.session!.access_token);
+
+  let received: unknown = null;
+  const channel = client
+    .channel('wr3:dashboard-events', { config: { private: true } })
+    .on('broadcast', { event: 'INSERT' }, (payload) => { received = payload; });
+  const subResult = await new Promise<{ status: string }>((resolve) => {
+    channel.subscribe((status) => resolve({ status }));
+  });
+  if (subResult.status !== 'SUBSCRIBED') {
+    throw new Error(`private channel subscribe failed: ${subResult.status}`);
+  }
+  console.log('private channel subscribed');
+
+  const { data: row, error: iErr } = await admin
+    .from('wr_dashboard_events')
+    .insert({ kind: 'dashboard-run', payload: { source: 'run-script' } })
+    .select()
+    .single();
+  if (iErr) throw iErr;
+
+  await new Promise((r) => setTimeout(r, 3000));
+  if (!received) throw new Error('did not receive broadcast_changes event on private channel');
+  console.log('received broadcast_changes event for insert id', row.id);
+
+  const { data: failed, error: fErr } = await client.rpc('wr_check_failed_webhooks');
+  if (fErr) throw fErr;
+  console.log('failed webhook deliveries visible to the monitoring function:', (failed as unknown[]).length >= 1);
+
+  await client.removeChannel(channel);
+  await admin.auth.admin.deleteUser(created.user.id);
+  await admin.from('wr_dashboard_events').delete().eq('id', row.id);
+  console.log('dashboard realtime test passed');
+  process.exit(0); // the open Realtime WebSocket otherwise keeps the process alive
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+```
+
+Run for real against this course's own local stack (the harness's `--run` repeats this at gate time):
+
+```text
+private channel subscribed
+received broadcast_changes event for insert id 12
+failed webhook deliveries visible to the monitoring function: true
+dashboard realtime test passed
+```
+
+## What changed and why
+
+| # | Bug | Fix |
+|---|---|---|
+| 1 | Table never added to `supabase_realtime` publication | Not needed once broadcast is used — proven silent otherwise on `postgres_changes` |
+| 2 | `postgres_changes` chosen for a dashboard (many subscribers) | `realtime.broadcast_changes()` — docs cite ~3,000-subscriber scaling cliff |
+| 3 | `broadcast_changes` trigger, client on a public channel | `{ config: { private: true } }` — proven silent otherwise (topic mismatch) |
+| 4 | Private channel, no `realtime.messages` policy | Added, scoped by `realtime.topic()` — real `CHANNEL_ERROR` otherwise |
+| 5 | `REPLICA IDENTITY` left at default | `replica identity full` for the `postgres_changes` path — real `old: {"id":..}` otherwise |
+| 6 | `pg_net` webhook, no result checked anywhere | A scheduled monitoring function over `net._http_response` |
+| 7 | `EdgeRuntime.waitUntil(bg)` then `await bg` anyway | Don't await it — proven ~28x faster response otherwise |
+| 8 | Prepared statement over transaction-mode pooler | `{ prepare: false }` (or session mode) — real `prepared statement ... does not exist` otherwise, under contention |
+| 9 | `pg_cron` schedule `'*/5 minutes'` | Real cron syntax `'*/5 * * * *'` — real `invalid schedule` error otherwise |
+| 10 | A second, disconnected client's token never refreshes | One shared client for auth + realtime — proven: the shared client auto-updates, the separate one silently stays stale |
+
+## What the reviewer writes in the PR
+
+> Close, but 10 things — mostly about what "it subscribed successfully" actually proves:
+>
+> **Silent, not broken — proved with a real insert and 3 seconds of nothing:**
+> 1. Table isn't in `supabase_realtime` — switching to broadcast (next point) sidesteps this entirely.
+> 2. `postgres_changes` on a dashboard table — docs say ~3,000 subscribers is the line; use `broadcast_changes`.
+> 3. Broadcast trigger fires, client subscribes to a public channel — `broadcast_changes` is always private.
+>
+> **Fails loudly, at least:**
+> 4. Private channel, no `realtime.messages` policy — real `CHANNEL_ERROR`, easy to fix once you know where to look.
+>
+> **Wrong data, not missing data:**
+> 5. No `replica identity full` — `payload.old` is `{"id":...}` only, nothing to diff.
+>
+> **Invisible failures in production:**
+> 6. `pg_net` webhook, nobody ever checks `net._http_response` — I proved a real delivery failure sitting there unnoticed.
+> 7. `waitUntil` called, then awaited anyway — 2s response instead of 75ms, same as not using it.
+>
+> **Only shows up under real load or a schedule that never ran:**
+> 8. Prepared statement over the transaction-mode pooler — passes every quick local test, fails under real contention (proved it).
+> 9. `pg_cron` schedule `'*/5 minutes'` isn't cron syntax — fails at migration time, easy catch in CI.
+> 10. A second realtime-only client never gets token refreshes the main client already handles automatically — one client, not two.
+>
+> None of this is a redesign — mostly picking the mechanism built for this scale and not splitting state that should stay in one place.
+
+## Mental Model
+
+This review's bugs split by *how confidently wrong* they look: three (1, 3, and the untyped webhook, 6) fail with **total silence** — the exact shape this course keeps coming back to, because Realtime and `pg_net` are both deliberately async, fire-and-forget systems where "no error" and "nothing happened" are indistinguishable without checking state directly. Two (4, 9) fail loudly and immediately, which paradoxically makes them the easiest bugs here, not the hardest — a real `CHANNEL_ERROR` or a real `invalid schedule` at migration time gets caught in the first minute of testing. The remaining five (2, 5, 7, 8, 10) are the genuinely dangerous shape: **correct on every quick manual test**, wrong only under the specific condition — subscriber count, a diff that's actually read, response-time budget, real concurrent load, real token expiry — that a first pass through the code never constructs.
+
+## Trade-offs
+
+- **`broadcast_changes` scales past `postgres_changes`'s per-subscriber authorization cost** — at the cost of losing `postgres_changes`'s automatic RLS re-evaluation per event; a broadcast trigger only sends what you explicitly put in the payload, so any authorization logic beyond "can this connection read this topic at all" has to be built into the trigger or the channel policy yourself.
+- **Checking `net._http_response` on a schedule, instead of synchronously in the trigger, keeps the write path fast** — at the cost of a real detection delay (up to the schedule's own interval) between a webhook failing and anything noticing, which is the correct trade for a write path but a real number to put in an SLA, not zero.
+- **One shared client for auth and realtime is simpler and correct by default** — a second, purpose-built client can still make sense for genuinely separate concerns (a service-role admin client, for instance) as long as it is never asked to carry a real user's identity over time the way this review's bug did.
+
+## Common Misconceptions
+
+- **"A channel that reports `SUBSCRIBED` is receiving events."** Proven above, twice, for two different reasons: a table missing from the publication and a `broadcast_changes` payload landing on a public channel both produce a clean `SUBSCRIBED` status and then genuinely nothing, forever.
+- **"`pg_net`'s asynchronous design means a failed webhook is someone else's problem eventually."** Proven above: nothing in the generated code — or in `pg_net` itself — surfaces a failure unless something explicitly queries `net._http_response`; "eventually" only happens if that query exists.
+- **"If it worked in local testing, it'll work in production."** Proven above with the one bug in this review that depends entirely on load: a prepared statement over the transaction-mode pooler passes every low-concurrency local test by luck and fails specifically once real concurrent traffic contends for the same connection pool.
+
+<Mermaid title="Where each bug sits in one dashboard event's life" code={wr3Diagram} />
+
+export const wr3Diagram = `flowchart TD
+  A["insert into wr_dashboard_events"] --> B["postgres_changes: table not in publication"]
+  B -->|"1: silence"| B
+  A --> C["broadcast_changes trigger fires"]
+  C --> D["client on a PUBLIC channel"]
+  D -->|"3: silence, topic mismatch"| D
+  C --> E["private channel, no realtime.messages policy"]
+  E -->|"4: CHANNEL_ERROR"| E
+  A --> F["pg_net webhook, no result checked"]
+  F -->|"6: fails forever, unseen"| F
+  G["EdgeRuntime.waitUntil(bg); await bg"] -->|"7: response blocked anyway"| G
+  H["PREPARE / EXECUTE over transaction pooler"] -->|"8: fails under real contention"| H
+  I["pg_cron '*/5 minutes'"] -->|"9: invalid schedule"| I
+  J["second realtime-only client"] -->|"10: token never refreshes"| J
+`;
+
+<Callout title="The one-line takeaway">
+Half of this review's bugs (1, 3, 6, and the pooler bug under load, 8) produce no error anywhere in the stack under the exact conditions a fast manual test uses — a single subscriber, a single low-traffic insert, a webhook receiver that happens to be reachable that day, a job run once instead of under real concurrency. Reviewing realtime, async-delivery, and pooled-connection code specifically means asking "what does this look like at the subscriber count, the failure rate, and the concurrency this is actually built for" — not just "did the demo work."
+</Callout>
+
+export const quizWorkedReview3 = [
+  {
+    q: 'A channel subscription reported `SUBSCRIBED`, and a real insert into the subscribed table produced zero events over 3 real seconds of waiting. `alter publication supabase_realtime add table ...` was then run, and the identical insert was received immediately. What does the initial `SUBSCRIBED` status actually confirm?',
+    options: [
+      'That the table is correctly configured for Postgres Changes',
+      'Only that the WebSocket connection and channel itself are working -- it says nothing about whether the specific table has been added to the supabase_realtime publication, which is a separate, unchecked step',
+      'That RLS policies are correctly scoped for this subscriber',
+      'SUBSCRIBED is returned only after the first event is confirmed delivered',
+    ],
+    answer: 1,
+    explain: 'Proven directly above: the exact same subscription code reported SUBSCRIBED both before and after the publication fix -- the status describes the channel connection succeeding, not the table being wired into replication.',
+  },
+  {
+    q: 'Supabase\'s own docs state: "If you expect more than ~3,000 concurrent subscribers on the same changes, use Broadcast to stream database changes instead." Why does a dashboard feature specifically make this guidance relevant, versus a feature with one subscriber per row (like a user\'s own notifications)?',
+    options: [
+      'It does not matter -- postgres_changes performs identically regardless of subscriber count',
+      "postgres_changes re-authorizes every event against every individual subscriber's own RLS select policy, so a single change is one authorization check per open connection watching it -- a dashboard's whole premise (many viewers watching the same data) is exactly the shape that multiplies this cost, unlike a per-user feed where each change typically has very few subscribers",
+      'Broadcast is only needed for tables with more than 3,000 total rows',
+      'This limit only applies to hosted Supabase, never to self-hosted or local instances',
+    ],
+    answer: 1,
+    explain: "Cited directly from the docs, fetched fresh for this review -- the mechanism explanation (per-subscriber authorization cost) is what makes a many-viewers-one-feed feature like a dashboard the specific case this guidance is warning about.",
+  },
+  {
+    q: 'A trigger correctly calls `realtime.broadcast_changes()`, but a real subscription with no `{ config: { private: true } }` received zero events on a real insert. Adding `private: true` alone (with no other change) then made it receive the event. What does this prove about broadcast_changes?',
+    options: [
+      'broadcast_changes only works with service_role clients',
+      'broadcast_changes always writes its message as private = true, so a public-channel subscription is listening on a different, non-matching topic entirely -- not being denied, just never reaching the right place',
+      'private: true grants RLS bypass for the subscriber',
+      'This is a timing issue, not related to the private flag',
+    ],
+    answer: 1,
+    explain: 'Proven directly above: the identical trigger, the identical insert, and the only variable changed was the private flag on the subscribing client -- confirming broadcast_changes messages are unreachable from a public-channel subscription by design.',
+  },
+  {
+    q: 'A prepared statement (`PREPARE wr3_stmt AS ...`) executed fine when run immediately after being prepared over Supavisor\'s transaction-mode port, but failed with `ERROR: prepared statement "wr3_stmt" does not exist` once 25 concurrent sessions were competing for the same 20-connection pool. Why does concurrency specifically trigger this?',
+    options: [
+      'Prepared statements are never supported by Supavisor under any conditions',
+      "Transaction mode returns the backend Postgres connection to the pool after every autocommitted statement; under real contention for a limited number of backends, PREPARE and EXECUTE (sent over the same client connection to the pooler) can land on two different actual backend connections, and the second backend never saw the PREPARE",
+      'The prepared statement expired after a fixed timeout',
+      'This only happens when the query itself is syntactically invalid',
+    ],
+    answer: 1,
+    explain: 'Proven directly above, reproducing the exact mechanism from the Connection Pooling and Supavisor lesson: a lightly loaded pool often keeps landing on the same backend by luck (passing low-concurrency local tests), while genuine contention for the pool\'s 20 backends is what actually exposes the mismatch.',
+  },
+  {
+    q: 'Two `createClient()` instances existed: one used for sign-in (the app\'s real auth client) and a second, separate one constructed just for the realtime subscription, seeded once with `realtime.setAuth(originalToken)`. After a real, forced `refreshSession()` on the first client, its own realtime layer auto-updated to the new token -- but the second client\'s realtime layer still held the original, now-outdated token. Why does only one of the two update?',
+    options: [
+      'Both should update identically; this indicates a bug in supabase-js itself',
+      "The installed supabase-js client wires its own internal auth-state listener directly to that SAME client instance's realtime.setAuth() on every token change -- a second, independently-constructed client was never part of that listener chain, so nothing tells it a refresh happened at all",
+      'The second client\'s token only updates after a full page reload',
+      'realtime.setAuth() calls are shared globally across all client instances automatically',
+    ],
+    answer: 1,
+    explain: "Proven directly above with a real forced token refresh: the correctly-wired client's realtime.accessTokenValue matched the new token automatically with no manual call, while the separately-constructed client's matched the stale original -- confirming the auto-wiring is scoped to the one client instance that owns the auth session, not shared globally.",
+  },
+];
+
+<Quiz client:visible id="reading-supabase/worked-review-3" questions={quizWorkedReview3} />
+
+<ProgressTracker client:visible id="reading-supabase/worked-review-3" />
