@@ -1,8 +1,37 @@
 ---
-title: 'supabase-internals'
-description: 'placeholder — being written'
+title: 'Supabase ทำงานอย่างไรข้างใน'
+description: 'โมดูลนี้คืออะไร ลำดับการอ่าน และบทไหนใน Phase 3 ที่แต่ละบทของ internals ต่อยอดโดยตรง — Postgres roles, การแปล request เป็น SQL, edge-runtime isolate, WAL pipeline ของ Realtime, และวงจรชีวิตของ Auth token'
 sidebar:
   order: 0
 ---
 
-Placeholder.
+import Callout from '../../../../components/Callout.astro';
+
+ทุกโมดูลก่อนหน้านี้สอน Supabase จากมุมมอง "ข้างนอก" — เรียก `supabase.from('table').select()` เขียน policy เรียก function เปิด function invoke สมัคร subscribe channel แล้วเชื่อว่ามันทำงานถูกต้อง โมดูลนี้เปิดกล่องออกมาดู ทุก claim ด้านล่างมาจากคำสั่งจริงที่รันกับ local stack ของคอร์สนี้เอง (Postgres, PostgREST, GoTrue, Realtime, Edge Runtime) หรือไม่ก็อ้างอิงบรรทัดจริงจาก source/docs ของ Supabase — ไม่มีการเดาแล้วเล่าเป็นข้อเท็จจริง
+
+## ทำไมโมดูลนี้ถึงต้องมี
+
+มีสองอย่างที่มักพังตอนโปรเจกต์ Supabase ขึ้น production จริง และทั้งสองเป็นปัญหาระดับ internals ไม่ใช่ปัญหาระดับ API:
+
+- **"รันบนเครื่องผมได้ปกติ แต่ production ช้ากว่าหรือไม่ก็โยน permission error ที่ไม่มี tutorial ไหนพูดถึง"** Data API, RLS, และ connection pooler ทั้งหมดพฤติกรรมต่างออกไปภายใต้ concurrency จริงและ grant จริง เทียบกับการทดสอบมือครั้งเดียว
+- **โค้ด Supabase ที่ AI generate มาอ่านลื่นแต่ผิดตรงจุดที่โมดูลนี้ครอบคลุมพอดี** — `security definer` ที่ไม่ตั้ง `search_path`, ตารางที่ตกหล่นจาก publication, `filter` ของ `postgres_changes` ที่ถูกเข้าใจผิดว่าเป็นขอบเขตความปลอดภัย, สมมติฐานเรื่อง JWT signing key ที่ไม่จริงแล้วตั้งแต่ตุลาคม 2025 โค้ดที่อ่านลื่นแบบนี้แหละคือสิ่งที่ทำให้บั๊กพวกนี้รอดจาก code review ไปได้
+
+การเข้าใจกลไกจริง — ไม่ใช่ไดอะแกรมที่ใครสักคนวาดไว้ครั้งเดียว แต่เป็นคำสั่งที่รันซ้ำได้ — คือสิ่งที่ทำให้คุณทำนายความล้มเหลวทั้งสองแบบนี้ได้ก่อนที่มันจะ page คุณตอนตีสาม
+
+## ลำดับการอ่าน
+
+อ่านจากบนลงล่าง แต่ละบทพิงบทก่อนหน้า
+
+1. **[Postgres Roles and Grants](/supabase/th/supabase-internals/postgres-roles-and-grants/)** — สาย role `anon` / `authenticated` / `service_role` / `authenticator` ที่ PostgREST authenticate เป็นจริง ๆ และทำไมตารางใหม่เอี่ยมถึงมองเห็นได้จาก `anon` ก่อนที่คุณจะเขียน policy สักบรรทัด
+2. **[PostgREST: Request to SQL](/supabase/th/supabase-internals/postgrest-request-to-sql/)** — SQL ตัวจริงที่ `select`/`insert`/`rpc` แปลงเป็น อ่านย้อนกลับจาก `pg_stat_statements` บวก schema cache ที่ต้องรู้ก่อนว่า function ของคุณมีอยู่ก่อนมันจะ route ไปให้
+3. **[Edge Runtime Isolates](/supabase/th/supabase-internals/edge-runtime-isolates/)** — V8 isolate ข้างใน `supabase/edge-runtime` คืออะไรจริง ๆ, permission sandbox ของมัน, และตัวเลข cold/warm ที่คอร์สนี้วัดไปแล้ว อธิบายในระดับกลไก
+4. **[Realtime: the WAL Pipeline](/supabase/th/supabase-internals/realtime-wal-pipeline/)** — เส้นทางจริงจาก `INSERT` หนึ่งครั้งไปถึงแท็บเบราว์เซอร์ที่ subscribe อยู่: WAL, logical replication slot, ตาราง `realtime.subscription` ของ Realtime เอง, RLS ต่อ subscriber
+5. **[Auth Token Lifecycle](/supabase/th/supabase-internals/auth-token-lifecycle/)** — GoTrue เซ็น token ยังไง, PostgREST verify มันโดยไม่ต้องเรียกกลับไปที่ GoTrue ยังไง, refresh rotation กับการตรวจจับการ reuse ลงถึงระดับแถวจริงในตาราง, และจุด hook ที่โปรเจกต์เสียบเข้าไปได้
+
+<Callout title="สิ่งที่คุณควรรู้มาก่อนแล้ว">
+โมดูลนี้ถือว่าคุณผ่านเนื้อหา Phase 1–3 มาแล้ว — โดยเฉพาะ [Securing the Data API](/supabase/th/auto-generated-api/securing-the-data-api/), [Sessions and JWTs](/supabase/th/auth-and-row-level-security/sessions-and-jwts/), [What Are Edge Functions](/supabase/th/edge-functions/what-are-edge-functions/), และ [Postgres Changes](/supabase/th/realtime-and-storage/realtime-postgres-changes/) — แต่ละบทพิสูจน์ข้อเท็จจริงหนึ่งอย่างจากมุมมองข้างนอกไปแล้ว (grant แบบ auto-expose, token แบบ `ES256`, ตัวเลข cold vs warm, "ปิดโดยดีฟอลต์จนกว่าจะ publish") โมดูลนี้พิสูจน์กลไก *ข้างใน* ของแต่ละข้อเท็จจริงนั้นอีกครั้งเดียว แล้วลิงก์กลับไป แทนที่จะพิสูจน์ซ้ำ
+</Callout>
+
+## ทุกการพิสูจน์ในโมดูลนี้ทำยังไง
+
+ทุก fence SQL รันจริง ไม่ว่าจะอยู่ใน transaction ที่ rollback (ตรวจ syntax/semantics เท่านั้น) หรือ commit ด้วย `--apply` เมื่อการพิสูจน์ `curl`/`supabase-js` ถัดไปต้องการให้ object นั้นมีอยู่จริง ทุก `curl` รันกับ local stack ของคอร์สนี้เอง (`supabase status --workdir tools/probe -o env` สำหรับ URL/key จริง) ตัด JWT ของ anon/service-role และ UUID ดิบออกแล้ว object ที่โมดูลนี้สร้าง (ตาราง, function, publication) ตั้งชื่อ namespace `int_*` เพื่อไม่ให้ชนกับ schema local ของโมดูลอื่นบน shared stack เดียวกัน เวอร์ชันที่ใช้ตอนเขียนโมดูลนี้: **Postgres 17.6.1**, **PostgREST v16.2**, **GoTrue (Auth) v2.196.0**, **Realtime v2.130.0**, **Storage v1.72.1**, **Supavisor 2.9.12** — รัน `docker ps` และคำสั่ง curl เช็กเวอร์ชันในแต่ละบทใหม่เองถ้าคุณอ่านทีหลังและอยากได้ตัวเลขปัจจุบัน

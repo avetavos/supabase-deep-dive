@@ -1,8 +1,37 @@
 ---
-title: 'supabase-internals'
-description: 'placeholder — being written'
+title: 'How Supabase Works Underneath'
+description: 'What this module is, the reading order, and which Phase 3 lesson each internals lesson builds directly on top of — Postgres roles, the request-to-SQL translation, the edge-runtime isolate, the Realtime WAL pipeline, and the Auth token lifecycle.'
 sidebar:
   order: 0
 ---
 
-Placeholder.
+import Callout from '../../../../components/Callout.astro';
+
+Every earlier module in this course taught Supabase from the outside — call `supabase.from('table').select()`, write a policy, invoke a function, subscribe to a channel, and trust that it works. This module opens the box. Every claim below is either a real command run against this course's own local stack (Postgres, PostgREST, GoTrue, Realtime, the Edge Runtime) or a cited line from Supabase's own source or docs — never a guess about internals dressed up as fact.
+
+## Why this module exists
+
+Two things repeatedly go wrong once a Supabase project reaches production, and both are internals problems, not API problems:
+
+- **"It works on my machine, then production is either slower or throws a permission error no tutorial mentions."** The Data API, RLS, and the connection pooler all behave differently under real concurrency and real grants than a single manual test suggests.
+- **AI-generated Supabase code is fluent but wrong in exactly the places this module covers** — `security definer` without `search_path`, a table left out of a publication, a `postgrest_changes` filter mistaken for a security boundary, a JWT signing-key assumption that stopped being true after October 2025. Fluent-sounding code is exactly what makes these bugs survive code review.
+
+Understanding the actual mechanism — not a diagram someone drew once, but a command you can re-run — is what lets you predict both classes of failure before they page you.
+
+## Reading order
+
+Read top to bottom; each lesson leans on the one before it.
+
+1. **[Postgres Roles and Grants](/supabase/en/supabase-internals/postgres-roles-and-grants/)** — the `anon` / `authenticated` / `service_role` / `authenticator` role chain PostgREST actually authenticates as, and why a brand-new table is visible to `anon` before you've written a single policy.
+2. **[PostgREST: Request to SQL](/supabase/en/supabase-internals/postgrest-request-to-sql/)** — the literal SQL a `select`/`insert`/`rpc` call compiles to, read back from `pg_stat_statements`, plus the schema cache that has to know your function exists before it will route to it.
+3. **[Edge Runtime Isolates](/supabase/en/supabase-internals/edge-runtime-isolates/)** — what a V8 isolate actually is inside `supabase/edge-runtime`, its permission sandbox, and the cold/warm boot numbers this course already measured, explained mechanically.
+4. **[Realtime: the WAL Pipeline](/supabase/en/supabase-internals/realtime-wal-pipeline/)** — the real path from one `INSERT` to a subscribed browser tab: WAL, a logical replication slot, Realtime's own `realtime.subscription` table, per-subscriber RLS.
+5. **[Auth Token Lifecycle](/supabase/en/supabase-internals/auth-token-lifecycle/)** — how GoTrue signs a token, how PostgREST verifies it without calling GoTrue back, refresh rotation and reuse detection down to real table rows, and the hook points a project can plug into.
+
+<Callout title="What you should already know">
+This module assumes the Phase 1–3 material — especially [Securing the Data API](/supabase/en/auto-generated-api/securing-the-data-api/), [Sessions and JWTs](/supabase/en/auth-and-row-level-security/sessions-and-jwts/), [What Are Edge Functions](/supabase/en/edge-functions/what-are-edge-functions/), and [Postgres Changes](/supabase/en/realtime-and-storage/realtime-postgres-changes/) — each already proved a fact from the outside (auto-expose grants, `ES256` tokens, cold-vs-warm timing, "off by default until published"). This module proves the mechanism *underneath* each of those facts once, and links back rather than re-proving them.
+</Callout>
+
+## How every proof in this module was made
+
+Every SQL fence ran for real, either inside a rolled-back transaction (syntax/semantics only) or committed with `--apply` when a later `curl`/`supabase-js` proof needed the object to actually exist. Every `curl` ran against this course's own local stack (`supabase status --workdir tools/probe -o env` for the real URLs and keys), trimmed of the raw anon/service-role JWTs and UUIDs it printed. Objects this module creates are namespaced `int_*` (tables, functions, publications) so they never collide with another module's own local schema on the same shared stack. Versions in force while this module was written: **Postgres 17.6.1**, **PostgREST v16.2**, **GoTrue (Auth) v2.196.0**, **Realtime v2.130.0**, **Storage v1.72.1**, **Supavisor 2.9.12** — re-run `docker ps` and the version curls each lesson shows if you're reading this later and want current numbers.
