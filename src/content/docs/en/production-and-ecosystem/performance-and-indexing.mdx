@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
@@ -56,6 +57,44 @@ The output's top line names the plan Postgres chose. `Seq Scan on todos` means i
 
 Supabase Studio ships with built-in Query Performance and Advisor tooling that surfaces a lot of this automatically, without reaching for `explain analyze` by hand for routine checks. Query Performance in the dashboard lists your slowest and most frequently run queries directly from Postgres's own statistics, and the Advisors panel flags missing indexes and other common performance issues — including, specifically, unindexed columns referenced by RLS policies. It is not a replacement for understanding `explain analyze`, but it is the tool worth checking first for an ongoing, low-effort read on where a project's real bottlenecks are.
 
+## `pg_stat_statements`, the real source behind Query Performance
+
+Query Performance's numbers are not magic — they come from `pg_stat_statements`, a real Postgres extension enabled by default on this local stack, queryable directly:
+
+```text
+$ docker exec -i supabase_db_probe psql -U postgres -c \
+    "select query, calls, round(mean_exec_time::numeric, 3) as mean_ms, round(total_exec_time::numeric,2) as total_ms
+     from pg_stat_statements
+     where query ilike '%fnd_%'
+     order by total_exec_time desc limit 5;"
+                          query                          | calls | mean_ms | total_ms
+-----------------------------------------------------------+-------+---------+----------
+ create table public.fnd_courses (id uuid primary key ...) |     1 |   2.202 |     2.20
+ create table public.fnd_widgets (                        +|     1 |   0.939 |     0.94
+   id uuid primary key default gen_random_uuid(), ...      |       |         |
+ PREPARE fnd_stmt1 AS select $1                             |     7 |   0.004 |     0.03
+```
+
+Every statement this course's own proofs ran against this stack is tracked here — real `calls`, real `mean_exec_time`, aggregated per normalized query text (literal values like `$1` replace the actual parameters, which is why repeated calls with different arguments still roll up into one row). Filtering by `calls desc` instead surfaces the noisiest queries on the whole stack, not just this lesson's own — on a shared local stack that includes housekeeping traffic from the pooler and other services, which is itself a useful, honest reminder that `pg_stat_statements` reports on the whole database cluster, not just your application's queries.
+
+## Monitoring beyond one query: logs and the Log Explorer
+
+`pg_stat_statements` and `explain analyze` both operate at the level of one query at a time. For the operational question — *what happened on this project over the last hour* — Supabase's [Postgres logs guide](https://github.com/supabase/supabase/blob/master/apps/docs/content/guides/database/postgres/timeouts.mdx) documents querying structured log data directly through the dashboard's Log Explorer, an example built specifically for finding slow or timed-out statements:
+
+```sql
+select
+  timestamp, event_message,
+  log_attributes['parsed.query'] as query,
+  log_attributes['parsed.sql_state_code'] as sql_state_code
+from logs
+where source = 'postgres_logs'
+  and match(event_message, 'duration|statement timeout')
+order by timestamp desc
+limit 100;
+```
+
+This is a dashboard-only capability (the Log Explorer UI and its backing log storage are hosted-project features, not something a local `supabase start` stack reproduces), so it is cited here rather than run — the local proof above (`pg_stat_statements` via `psql`) is the closest local equivalent, aggregated rather than per-event.
+
 <Mermaid title="An unindexed RLS filter forces a sequential scan; an index on the same column turns it into an index scan" code={indexingDiagram} />
 
 export const indexingDiagram = `flowchart LR
@@ -66,8 +105,37 @@ export const indexingDiagram = `flowchart LR
   rls2 --> idx["Index on user_id"]
   idx --> iscan["Index scan - cost grows with matching rows only"]`;
 
+## Reading AI-generated code
+
+An AI assistant, asked to "make this table's queries faster," produced this:
+
+<SpotTheBug lang="sql" code={`-- An AI assistant's blanket "add indexes" suggestion
+create index on public.fnd_widgets (id);
+create index on public.fnd_widgets (name);
+create index on public.fnd_widgets (created_at);
+create index on public.fnd_widgets (id, name, created_at);
+`}>
+None of these is wrong syntax, and that is exactly what makes this the kind of AI-generated code that passes review by looking productive. The first index is pure waste — `id` is already the primary key, and a primary key always has an index backing its uniqueness constraint automatically; indexing it again duplicates storage and write overhead for zero read benefit. The fourth, a composite index on all three columns, only helps queries that filter or sort by that *exact* column order (or a matching prefix of it) — without seeing a single real query this table actually runs, an AI assistant cannot know whether `name` alone, `created_at` alone, or some combination is what queries actually filter on, so "index everything" is a guess dressed up as an optimization. Every index also has a real, ongoing cost this suggestion never mentions: each one must be updated on every `insert`/`update`/`delete` to the table, so four speculative indexes make writes measurably slower for read patterns that may never happen. The fix is the discipline this lesson opens with: look at the real queries (RLS policies included), run `explain analyze` on them, and add only the index that changes `Seq Scan` to `Index Scan` for a query that actually runs.
+</SpotTheBug>
+
+## Mental Model
+
+An index is not a blanket performance switch — it is a targeted trade: faster reads for a *specific* filter/sort/join shape, paid for with slower writes and more storage, on every single row, forever. The only way to know whether that trade is worth it for a given column is to already know what a real query does with it — which is exactly why this lesson insists on `explain analyze` against real queries (and, doubly, real RLS policies) rather than pattern-matching "this column looks important."
+
+## Trade-offs
+
+- **An index turns a linear table scan into something closer to logarithmic lookup time for the queries it actually serves** — **at the cost of write overhead and storage on every insert/update/delete**, proved above with the SpotTheBug's redundant primary-key index: a cost paid on every write, for a benefit that index specifically never delivers.
+- **`pg_stat_statements` aggregates every query automatically, with zero instrumentation code** — **at the cost of losing per-invocation detail**: it answers "which queries are slow on average, and how often do they run," not "why was this one specific request slow," which is what `explain analyze` on a single query is for.
+- **Supabase Studio's Advisors catch common missing-index patterns, including RLS policy columns, with no manual query required** — **at the cost of being pattern-based, not exhaustive**: they cannot know your application's actual query shapes the way a real `explain analyze` against a real query can.
+
+## Common Misconceptions
+
+- **"More indexes are always better, or at worst harmless."** Disproved directly above: an index on the primary key column duplicates work the primary key constraint already does, and every index — needed or not — slows down every write to the table.
+- **"pg_stat_statements shows exactly what a specific slow request did."** It aggregates by normalized query text across every call, proved above with literal values replaced by `$1` — for one specific slow occurrence, `explain analyze` on that exact query is still the right tool.
+- **"The Log Explorer is available locally, the same as Studio's other panels."** Stated honestly above: it is a hosted-project, dashboard-backed feature — this local stack's closest equivalent is `pg_stat_statements` queried directly, which is aggregated rather than per-event.
+
 <Callout title="The one-line takeaway">
-Index the columns your queries actually filter and join on, and treat any column referenced in a **Row Level Security policy** as a mandatory candidate, since that policy condition runs on every row candidate for every query and an unindexed one silently degrades into a sequential scan as the table grows. Use `explain analyze` to check whether Postgres chose an **index scan** or a **sequential scan** for a given query, and lean on Supabase **Studio's Query Performance and Advisor** tooling for an ongoing, low-effort view of slow queries and missing indexes without running `explain analyze` by hand for every routine check.
+Index the columns your queries actually filter and join on, and treat any column referenced in a **Row Level Security policy** as a mandatory candidate, since that policy condition runs on every row candidate for every query and an unindexed one silently degrades into a sequential scan as the table grows. Use `explain analyze` to check whether Postgres chose an **index scan** or a **sequential scan** for a given query, and lean on Supabase **Studio's Query Performance and Advisor** tooling — backed by the real `pg_stat_statements` extension proved above — for an ongoing, low-effort view of slow queries and missing indexes without running `explain analyze` by hand for every routine check. For fleet-wide log investigation the hosted Log Explorer goes further than this local stack can (cited, not run).
 </Callout>
 
 export const quizPerformanceIndexing = [
@@ -80,6 +148,7 @@ export const quizPerformanceIndexing = [
       'Indexing policy columns is required by Supabase for the Data API to work at all',
     ],
     answer: 1,
+    explain: 'The SpotTheBug above shows the flip side of this too much of a good thing: indexing columns no query actually filters on wastes write overhead for zero benefit.',
   },
   {
     q: 'What does `explain analyze` tell you that just running the query normally does not?',
@@ -90,6 +159,7 @@ export const quizPerformanceIndexing = [
       'It disables Row Level Security for that one query only',
     ],
     answer: 1,
+    explain: 'This is the tool for one specific query, in contrast to pg_stat_statements above, which aggregates across every call to a normalized query shape.',
   },
   {
     q: 'What can Supabase Studio surface without you manually running `explain analyze`?',
@@ -100,6 +170,7 @@ export const quizPerformanceIndexing = [
       'The ability to rewrite application code automatically to avoid slow queries',
     ],
     answer: 1,
+    explain: 'Proved above: those statistics come from a real, queryable extension, pg_stat_statements, not a Supabase-specific mechanism.',
   },
   {
     q: 'In the `todos` example, what does `create index idx_todos_user_id on public.todos (user_id);` change about the RLS-protected select query?',
@@ -110,6 +181,18 @@ export const quizPerformanceIndexing = [
       'It has no effect because RLS always forces a sequential scan regardless of indexes',
     ],
     answer: 1,
+    explain: 'RLS forces the policy condition to be checked, but does not force a sequential scan by itself — an index on the checked column still gets used, exactly as for any other filter.',
+  },
+  {
+    q: 'An AI assistant suggested four indexes on fnd_widgets, including one on the id column (already the primary key) and one composite index on all three columns, with no real query shown. What is the actual cost of adding indexes no real query needs?',
+    options: [
+      'No cost — extra indexes are always free to have around',
+      'Every index must be updated on every insert/update/delete to the table, so speculative indexes slow down writes for read benefits that may never be used, and the primary-key index specifically duplicates work the primary key constraint already does',
+      'Extra indexes only cost disk space, never write performance',
+      'Indexes only cost something if the table has RLS enabled',
+    ],
+    answer: 1,
+    explain: 'This is exactly what the Mental Model section above states: an index is a targeted trade, not a blanket performance switch, and this SpotTheBug is that trade paid for four times with no matching benefit shown.',
   },
 ];
 

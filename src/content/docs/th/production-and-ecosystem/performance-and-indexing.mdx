@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
@@ -56,7 +57,45 @@ select * from public.todos where user_id = auth.uid();
 
 Supabase Studio มี Query Performance และ Advisor tooling ในตัวที่โชว์เรื่องพวกนี้ให้อัตโนมัติ โดยไม่ต้องหยิบ `explain analyze` มาใช้เองสำหรับการเช็คทั่วไป Query Performance ใน dashboard จะ list query ที่ช้าที่สุดและถูกรันบ่อยที่สุดตรงจาก statistics ของ Postgres เอง ส่วน Advisors panel จะ flag index ที่หายไปและปัญหา performance ที่พบบ่อยอื่น ๆ — รวมถึง column ที่ RLS policy อ้างอิงถึงแต่ไม่มี index โดยเฉพาะ ไม่ได้มาแทนที่ความเข้าใจเรื่อง `explain analyze` แต่เป็นเครื่องมือที่ควรเช็คเป็นอันดับแรกสำหรับมุมมองต่อเนื่องแบบ low-effort ว่า bottleneck จริง ๆ ของ project อยู่ตรงไหน
 
-<Mermaid title="An unindexed RLS filter forces a sequential scan; an index on the same column turns it into an index scan" code={indexingDiagram} />
+## `pg_stat_statements` แหล่งข้อมูลจริงข้างหลัง Query Performance
+
+ตัวเลขของ Query Performance ไม่ใช่เวทมนตร์ — มันมาจาก `pg_stat_statements` extension จริงของ Postgres ที่เปิดโดย default บน local stack นี้ query ได้ตรง ๆ:
+
+```text
+$ docker exec -i supabase_db_probe psql -U postgres -c \
+    "select query, calls, round(mean_exec_time::numeric, 3) as mean_ms, round(total_exec_time::numeric,2) as total_ms
+     from pg_stat_statements
+     where query ilike '%fnd_%'
+     order by total_exec_time desc limit 5;"
+                          query                          | calls | mean_ms | total_ms
+-----------------------------------------------------------+-------+---------+----------
+ create table public.fnd_courses (id uuid primary key ...) |     1 |   2.202 |     2.20
+ create table public.fnd_widgets (                        +|     1 |   0.939 |     0.94
+   id uuid primary key default gen_random_uuid(), ...      |       |         |
+ PREPARE fnd_stmt1 AS select $1                             |     7 |   0.004 |     0.03
+```
+
+ทุก statement ที่ proof ของคอร์สนี้เองรันกับ stack นี้ถูก track ไว้ตรงนี้ — `calls` จริง, `mean_exec_time` จริง รวมกันตาม normalized query text (ค่า literal อย่าง `$1` แทนที่ parameter จริง ซึ่งเป็นเหตุผลที่ call ซ้ำ ๆ ด้วย argument ต่างกันยังรวมกันเป็น row เดียว) ถ้า filter ด้วย `calls desc` แทน จะเห็น query ที่ noisy ที่สุดของทั้ง stack ไม่ใช่แค่ของบทนี้เอง — บน local stack ที่แชร์กันซึ่งมี traffic housekeeping จาก pooler และ service อื่น ๆ ด้วย ซึ่งเป็นการเตือนที่ซื่อตรงและมีประโยชน์ว่า `pg_stat_statements` report ทั้ง database cluster ไม่ใช่แค่ query ของแอปคุณ
+
+## Monitoring ที่มากกว่าหนึ่ง query: logs กับ Log Explorer
+
+`pg_stat_statements` กับ `explain analyze` ทั้งคู่ทำงานที่ระดับ query เดียวต่อครั้ง สำหรับคำถามเชิง operation — *เกิดอะไรขึ้นกับ project นี้ในชั่วโมงที่ผ่านมา* — [คู่มือ Postgres logs](https://github.com/supabase/supabase/blob/master/apps/docs/content/guides/database/postgres/timeouts.mdx) ของ Supabase บันทึกวิธี query structured log data ตรง ๆ ผ่าน Log Explorer ของ dashboard ตัวอย่างที่สร้างมาเฉพาะสำหรับหา statement ที่ช้าหรือ timeout:
+
+```sql
+select
+  timestamp, event_message,
+  log_attributes['parsed.query'] as query,
+  log_attributes['parsed.sql_state_code'] as sql_state_code
+from logs
+where source = 'postgres_logs'
+  and match(event_message, 'duration|statement timeout')
+order by timestamp desc
+limit 100;
+```
+
+นี่คือ capability ที่มีแค่บน dashboard (UI ของ Log Explorer กับ log storage ที่รองรับมันเป็น feature ของ hosted project ไม่ใช่อะไรที่ local stack จาก `supabase start` จำลองได้) จึง cite ไว้ตรงนี้แทนที่จะรันจริง — proof local ข้างบน (`pg_stat_statements` ผ่าน `psql`) คือสิ่งที่ใกล้เคียงที่สุดบน local ซึ่งเป็นแบบ aggregate ไม่ใช่ per-event
+
+<Mermaid title="RLS filter ที่ไม่มี index บังคับ sequential scan; index บน column เดียวกันเปลี่ยนมันเป็น index scan" code={indexingDiagram} />
 
 export const indexingDiagram = `flowchart LR
   q1["select * from todos where user_id = auth.uid()"] --> rls1["RLS policy checks user_id on every row"]
@@ -66,8 +105,37 @@ export const indexingDiagram = `flowchart LR
   rls2 --> idx["Index on user_id"]
   idx --> iscan["Index scan - cost grows with matching rows only"]`;
 
+## อ่านโค้ดที่ AI สร้าง
+
+AI assistant ถูกขอให้ "make this table's queries faster" แล้วสร้างสิ่งนี้:
+
+<SpotTheBug lang="sql" code={`-- An AI assistant's blanket "add indexes" suggestion
+create index on public.fnd_widgets (id);
+create index on public.fnd_widgets (name);
+create index on public.fnd_widgets (created_at);
+create index on public.fnd_widgets (id, name, created_at);
+`}>
+ไม่มี syntax ไหนผิดเลยสักบรรทัด และนั่นแหละคือสิ่งที่ทำให้โค้ดที่ AI สร้างแบบนี้ผ่าน review ได้ง่ายเพราะดูเหมือนทำงานจริง index แรกคือความสูญเปล่าล้วน ๆ — `id` เป็น primary key อยู่แล้ว และ primary key มี index รองรับ uniqueness constraint ของมันอัตโนมัติเสมอ การ index ซ้ำแค่เพิ่ม storage และ write overhead โดยไม่ได้ประโยชน์ด้าน read เลย index ที่สี่ ซึ่งเป็น composite index บนทั้งสาม column ช่วยเฉพาะ query ที่ filter หรือ sort ตามลำดับ column *เป๊ะ ๆ* นั้น (หรือ prefix ที่ตรงกัน) — โดยไม่เห็น query จริงสักตัวที่ table นี้รันจริง AI assistant ไม่มีทางรู้เลยว่า `name` เดี่ยว ๆ, `created_at` เดี่ยว ๆ หรือ combination ไหนที่ query จริงใช้ filter ดังนั้น "index ทุกอย่าง" คือการเดาที่แต่งตัวเป็น optimization ทุก index ยังมีต้นทุนจริงต่อเนื่องที่ข้อเสนอนี้ไม่เคยพูดถึง: แต่ละตัวต้อง update ทุกครั้งที่มี `insert`/`update`/`delete` เข้า table ดังนั้น index สี่ตัวที่เดาไปเรื่อย ๆ ทำให้ write ช้าลงจริงเพื่อ read pattern ที่อาจไม่มีวันเกิดขึ้นเลย ทางแก้คือวินัยที่บทนี้เปิดเรื่องไว้: ดู query จริง (รวม RLS policy ด้วย) รัน `explain analyze` กับมัน แล้วเพิ่มแค่ index ที่เปลี่ยน `Seq Scan` เป็น `Index Scan` สำหรับ query ที่รันจริงเท่านั้น
+</SpotTheBug>
+
+## Mental Model
+
+index ไม่ใช่สวิตช์ performance แบบเหวี่ยงแห — มันคือ trade เฉพาะจุด: read เร็วขึ้นสำหรับ shape ของ filter/sort/join *เฉพาะแบบ* จ่ายด้วย write ที่ช้าลงและ storage ที่มากขึ้น ทุก row ตลอดไป วิธีเดียวที่จะรู้ว่า trade นั้นคุ้มไหมสำหรับ column หนึ่ง ๆ คือต้องรู้อยู่แล้วว่า query จริงทำอะไรกับมัน ซึ่งเป็นเหตุผลตรงที่บทนี้ยืนกรานให้ใช้ `explain analyze` กับ query จริง (และ RLS policy จริงด้วย ยิ่งสำคัญเป็นสองเท่า) แทนที่จะ pattern-match ว่า "column นี้ดูสำคัญ"
+
+## Trade-offs
+
+- **index เปลี่ยน linear table scan ให้ใกล้เคียง logarithmic lookup time สำหรับ query ที่มันรองรับจริง** — **แลกมาด้วย write overhead และ storage ทุก insert/update/delete** พิสูจน์ข้างบนด้วย index ซ้ำซ้อนบน primary key ของ SpotTheBug: ต้นทุนที่จ่ายทุก write เพื่อประโยชน์ที่ index ตัวนั้นไม่มีวันให้ได้เลย
+- **`pg_stat_statements` รวม query ทุกตัวอัตโนมัติ ไม่ต้องมี instrumentation code เลย** — **แลกมาด้วยเสีย detail ระดับ per-invocation**: มันตอบว่า "query ไหนช้าโดยเฉลี่ย และรันบ่อยแค่ไหน" ไม่ใช่ "ทำไม request เฉพาะตัวนี้ถึงช้า" ซึ่งเป็นหน้าที่ของ `explain analyze` กับ query เดียว
+- **Advisors ของ Supabase Studio จับ pattern index ที่หายไปที่พบบ่อย รวมถึง column ของ RLS policy โดยไม่ต้อง query เอง** — **แลกมาด้วยเป็นแบบ pattern-based ไม่ใช่ exhaustive**: มันไม่รู้ shape ของ query จริงของแอปคุณแบบที่ `explain analyze` จริงกับ query จริงรู้
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"index ยิ่งเยอะยิ่งดี หรืออย่างน้อยก็ไม่มีอันตราย"** ถูกหักล้างตรง ๆ ข้างบน: index บน column ของ primary key ทำงานซ้ำกับสิ่งที่ primary key constraint ทำอยู่แล้ว และทุก index — จำเป็นหรือไม่ก็ตาม — ทำให้ write ทุกครั้งเข้า table ช้าลง
+- **"pg_stat_statements โชว์สิ่งที่ request ที่ช้าตัวใดตัวหนึ่งทำจริง ๆ เป๊ะ ๆ"** มันรวมตาม normalized query text ข้าม call ทุกตัว พิสูจน์ข้างบนด้วยค่า literal ที่ถูกแทนด้วย `$1` — สำหรับเหตุการณ์ช้าเฉพาะตัวหนึ่ง `explain analyze` กับ query ตัวนั้นเป๊ะ ๆ ยังเป็นเครื่องมือที่ถูกต้อง
+- **"Log Explorer ใช้ได้บน local เหมือน panel อื่นของ Studio"** บอกตามตรงไว้ข้างบน: มันเป็น feature ของ hosted project ที่ backed ด้วย dashboard — สิ่งที่ใกล้เคียงที่สุดบน local stack นี้คือ `pg_stat_statements` ที่ query ตรง ๆ ซึ่งเป็นแบบ aggregate ไม่ใช่ per-event
+
 <Callout title="สรุปหนึ่งบรรทัด">
-ทำ index บน column ที่ query ของคุณใช้ filter และ join จริง ๆ และให้ column ไหนก็ตามที่ถูกอ้างอิงใน **Row Level Security policy** เป็นตัวเลือกที่ต้องทำเสมอ เพราะ policy condition นั้นรันกับ row candidate ทุกตัวในทุก query และ column ที่ไม่มี index จะค่อย ๆ กลายเป็น sequential scan เมื่อ table โตขึ้น ใช้ `explain analyze` เช็คว่า Postgres เลือก **index scan** หรือ **sequential scan** สำหรับ query หนึ่ง ๆ และอาศัย Supabase **Studio ตัว Query Performance กับ Advisor** สำหรับมุมมองต่อเนื่องแบบ low-effort เรื่อง query ที่ช้ากับ index ที่หายไป โดยไม่ต้องรัน `explain analyze` เองทุกครั้งที่เช็คทั่วไป
+ทำ index บน column ที่ query ของคุณใช้ filter และ join จริง ๆ และให้ column ไหนก็ตามที่ถูกอ้างอิงใน **Row Level Security policy** เป็นตัวเลือกที่ต้องทำเสมอ เพราะ policy condition นั้นรันกับ row candidate ทุกตัวในทุก query และ column ที่ไม่มี index จะค่อย ๆ กลายเป็น sequential scan เมื่อ table โตขึ้น ใช้ `explain analyze` เช็คว่า Postgres เลือก **index scan** หรือ **sequential scan** สำหรับ query หนึ่ง ๆ และอาศัย Supabase **Studio ตัว Query Performance กับ Advisor** — backed ด้วย extension `pg_stat_statements` จริงที่พิสูจน์ข้างบน — สำหรับมุมมองต่อเนื่องแบบ low-effort เรื่อง query ที่ช้ากับ index ที่หายไป โดยไม่ต้องรัน `explain analyze` เองทุกครั้งที่เช็คทั่วไป สำหรับการสืบสวน log ระดับ fleet Log Explorer แบบ hosted ไปได้ไกลกว่า local stack นี้ (cite ไว้ ไม่ได้รันจริง)
 </Callout>
 
 export const quizPerformanceIndexing = [
@@ -80,6 +148,7 @@ export const quizPerformanceIndexing = [
       'Supabase บังคับให้ต้องทำ index บน column ของ policy เพื่อให้ Data API ทำงานได้เท่านั้น',
     ],
     answer: 1,
+    explain: 'SpotTheBug ข้างบนแสดงด้านกลับของเรื่องนี้ด้วย: การ index column ที่ไม่มี query ไหน filter จริง ๆ เปลืองแค่ write overhead โดยไม่ได้ประโยชน์เลย',
   },
   {
     q: '`explain analyze` บอกอะไรที่การรัน query ปกติไม่บอก',
@@ -90,6 +159,7 @@ export const quizPerformanceIndexing = [
       'ปิด Row Level Security ให้กับ query นั้นตัวเดียว',
     ],
     answer: 1,
+    explain: 'นี่คือเครื่องมือสำหรับ query เฉพาะตัวหนึ่ง ตรงข้ามกับ pg_stat_statements ข้างบนที่รวมทุก call ของ query shape เดียวกัน',
   },
   {
     q: 'Supabase Studio โชว์อะไรให้ได้โดยไม่ต้องรัน `explain analyze` เอง',
@@ -100,6 +170,7 @@ export const quizPerformanceIndexing = [
       'ความสามารถในการ rewrite application code อัตโนมัติเพื่อเลี่ยง query ที่ช้า',
     ],
     answer: 1,
+    explain: 'พิสูจน์ข้างบนแล้ว: statistics พวกนั้นมาจาก extension จริงที่ query ได้ pg_stat_statements ไม่ใช่กลไกเฉพาะของ Supabase',
   },
   {
     q: 'ในตัวอย่าง `todos` การรัน `create index idx_todos_user_id on public.todos (user_id);` เปลี่ยนอะไรกับ query select ที่ถูก RLS ป้องกัน',
@@ -110,6 +181,18 @@ export const quizPerformanceIndexing = [
       'ไม่มีผลอะไรเลย เพราะ RLS บังคับให้เกิด sequential scan เสมอไม่ว่าจะมี index หรือไม่',
     ],
     answer: 1,
+    explain: 'RLS บังคับให้ policy condition ถูกเช็ค แต่ไม่ได้บังคับ sequential scan ด้วยตัวมันเอง — index บน column ที่ถูกเช็คยังถูกใช้ปกติ เหมือน filter อื่นทุกตัว',
+  },
+  {
+    q: 'AI assistant เสนอ index สี่ตัวบน fnd_widgets รวมถึงตัวหนึ่งบน column id (เป็น primary key อยู่แล้ว) และ composite index หนึ่งตัวบนทั้งสาม column โดยไม่เห็น query จริงเลย ต้นทุนจริงของการเพิ่ม index ที่ไม่มี query ไหนต้องการคืออะไร',
+    options: [
+      'ไม่มีต้นทุนเลย — index เพิ่มไม่มีอะไรเสีย',
+      'ทุก index ต้อง update ทุก insert/update/delete เข้า table ดังนั้น index ที่เดาไปเรื่อย ๆ ทำให้ write ช้าลงเพื่อประโยชน์ด้าน read ที่อาจไม่มีวันถูกใช้ และ index บน primary key โดยเฉพาะทำงานซ้ำกับสิ่งที่ primary key constraint ทำอยู่แล้ว',
+      'index เพิ่มเสียแค่พื้นที่ดิสก์ ไม่เคยเสีย write performance',
+      'index มีต้นทุนก็ต่อเมื่อ table เปิด RLS เท่านั้น',
+    ],
+    answer: 1,
+    explain: 'นี่คือสิ่งที่ section Mental Model ข้างบนบอกไว้เป๊ะ: index คือ trade เฉพาะจุด ไม่ใช่สวิตช์ performance แบบเหวี่ยงแห และ SpotTheBug นี้คือ trade ที่จ่ายไปสี่รอบโดยไม่มีประโยชน์อะไรมาคู่กันเลย',
   },
 ];
 
