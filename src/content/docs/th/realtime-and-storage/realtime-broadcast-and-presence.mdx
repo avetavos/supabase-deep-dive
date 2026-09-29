@@ -1,6 +1,6 @@
 ---
 title: 'Realtime: Broadcast and Presence'
-description: 'Broadcast กับ Presence ให้ pub/sub แบบ latency ต่ำและติดตามว่าใคร online อยู่บน Realtime channel ได้ยังไง โดยไม่ต้องตั้งค่า publication หรือ replication ใด ๆ ในฝั่ง database เลย'
+description: 'Broadcast กับ Presence ให้ pub/sub แบบ low-latency และการติดตามผู้ใช้ออนไลน์บน Realtime channel ได้อย่างไร private channel ที่ authorize ผ่าน RLS บน realtime.messages และ Broadcast from database'
 sidebar:
   order: 2
 ---
@@ -8,20 +8,27 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
-## ไอเดียในหนึ่งประโยค
+## แนวคิดในประโยคเดียว
 
-**Broadcast** กับ **Presence** คือ layer pub/sub และ tracking การ online ทั่วไปที่วางอยู่บน Realtime channel และต่างจาก Postgres Changes ตรงที่**เปิดอยู่โดย default** ไม่ต้องตั้งค่า table หรือ replication ใด ๆ เลย
+**Broadcast** และ **Presence** เป็นเลเยอร์ pub/sub และติดตามสถานะออนไลน์แบบทั่วไปที่อยู่บน Realtime channel และต่างจาก Postgres Changes ตรงที่ **เปิดใช้งานอยู่แล้วโดย default** ไม่ต้องตั้งค่าตารางหรือ replication ใด ๆ เลย — แต่ channel หนึ่งก็ตั้งเป็น **private** ได้เช่นกัน ซึ่งเมื่อนั้นการเข้าถึงจะถูก authorize ผ่าน Row Level Security policy บน `realtime.messages` เหมือนตารางอื่น ๆ ทุกประการ
 
-## Broadcast: ส่ง message อะไรก็ได้เข้า channel
+## Broadcast: ส่งข้อความอิสระเข้า channel
 
-Postgres Changes (ที่คุยไปในบทก่อน) จะยิงก็ต่อเมื่อ row ใน database เปลี่ยนแปลงจริง ๆ เท่านั้น แต่ฟีเจอร์ realtime หลายอย่างไม่ต้องการ — และไม่ควรต้องจ่ายต้นทุนของ — การ write ลง database เลยด้วยซ้ำ เช่น ตำแหน่ง cursor แบบสด, flag "user กำลังพิมพ์อยู่" หรือ chat message ที่แค่ต้องถึงคนที่อยู่ในห้องตอนนั้นพอ **Broadcast** ครอบคลุมเคสนี้ตรง ๆ client ที่ subscribe channel ไหนก็ส่ง JSON payload ได้ แล้ว subscriber คนอื่นบน channel เดียวกันจะได้รับตรง ๆ โดยไม่มี table ใน `public`, ไม่มี publication และไม่มี WAL เข้ามาเกี่ยวข้องเลย
+Postgres Changes (บทที่แล้ว) ทำงานก็ต่อเมื่อมีแถวเปลี่ยนแปลงจริงในฐานข้อมูลเท่านั้น ฟีเจอร์ real-time จำนวนมากไม่ต้องการ — และไม่ควรต้องจ่ายต้นทุนของ — การเขียนฐานข้อมูลเลย: ตำแหน่ง cursor แบบ live, flag "กำลังพิมพ์อยู่", หรือข้อความแชทที่แค่ต้องไปถึงคนที่อยู่ในห้องตอนนั้น **Broadcast** ครอบคลุมเรื่องนี้พอดี: client ที่ subscribe เข้า channel หนึ่งส่ง JSON payload ได้ และผู้ subscribe คนอื่นทุกคนบน channel นั้นได้รับมันโดยตรง ไม่มีตาราง `public` ไม่มี publication และไม่มี WAL เกี่ยวข้องเลย
 
-ส่ง broadcast message จาก `supabase-js`
+การส่งข้อความ broadcast จาก `supabase-js`:
 
-```typescript
-const channel = supabase.channel('room1');
+```ts
+// src/rt-broadcast-basic.ts
+import { createClient } from '@supabase/supabase-js';
+
+declare const process: { env: Record<string, string | undefined> };
+
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!);
+const channel = supabase.channel('rt:room1');
 
 channel.on('broadcast', { event: 'cursor-pos' }, (payload) => {
   console.log('Cursor moved:', payload.payload);
@@ -36,94 +43,431 @@ channel.send({
 });
 ```
 
-subscriber ทุกตัวที่ลงทะเบียน `.on('broadcast', { event: 'cursor-pos' }, ...)` ไว้บน `room1` จะได้รับ payload นี้ ปกติภายในหลักสิบมิลลิวินาที ไม่มี round trip ไป database เลยบน hot path
+ผู้ subscribe ทุกคนที่ลงทะเบียน `.on('broadcast', { event: 'cursor-pos' }, ...)` บน `rt:room1` จะได้รับ payload โดยปกติภายในไม่กี่มิลลิวินาที — ไม่มีการไป-กลับฐานข้อมูลบน hot path เลย
 
-## Presence: ตอนนี้มีใครอยู่บ้าง
+## `self` กับ `ack`: สองตัวเลือกระดับ channel ที่ควรรู้ให้ชัด
 
-**Presence** ต่อยอดจาก channel mechanism เดียวกันเพื่อแก้ปัญหาคนละแบบ คือรู้ว่า client ไหนกำลังต่ออยู่กับ channel ตอนนี้บ้าง และแต่ละคนอยากแชร์ state อะไร (username, ตำแหน่ง cursor, flag "online" หรือ "typing") แทนที่คุณจะต้อง broadcast message "เข้าร่วมแล้ว" กับ "ออกแล้ว" เองแล้วมา reconcile เอง channel ที่เปิด Presence จะเก็บ **ชุด client ที่ present อยู่แบบ sync กันตลอด** และ push update ให้ทุกคนที่ subscribe อยู่ทุกครั้งที่มีคนเข้าร่วม, ออก หรืออัปเดต state ที่ track ไว้
+โดย default ผู้ส่ง broadcast จะ **ไม่** ได้รับข้อความของตัวเองกลับมา — `self: true` ใน config `broadcast` ของ channel เปลี่ยนพฤติกรรมนี้ได้ แยกกันไป `send()` โดย default จะ resolve ทันทีที่ข้อความออกจาก client โดยไม่รอ server ยืนยันการส่งถึง — `ack: true` ทำให้มันรอการไป-กลับจริง พิสูจน์ทั้งสองเรื่องจากการรันครั้งเดียวกับ local stack:
 
-client ประกาศ presence ของตัวเองด้วย `track` และอ่านชุด client ที่ present อยู่ตอนนี้ทั้งหมดด้วย `presenceState`
-
-```typescript
-const channel = supabase.channel('room1');
-
-channel.on('presence', { event: 'sync' }, () => {
-  const state = channel.presenceState();
-  console.log('Currently online:', state);
-});
-
-channel.subscribe(async (status) => {
-  if (status === 'SUBSCRIBED') {
-    await channel.track({ user_id: 'user-42', online_at: new Date().toISOString() });
-  }
-});
+```text
+default (self:false) — own message received: false send() resolved: ok in 1 ms
+self:true — own message received: true send() resolved: ok
+ack:false send() resolve times (ms): [ '0.2', '0.1', '0.1', '0.1', '0.1' ]
+ack:true  send() resolve times (ms): [ '0.7', '0.6', '0.6', '0.6', '0.5' ]
+ack:true average: 0.60 ms vs ack:false average: 0.09 ms
 ```
 
-event `sync` จะยิงทุกครั้งที่ presence set เปลี่ยนไปสำหรับใครก็ตามบน channel และ `presenceState()` จะคืนภาพรวมปัจจุบันเต็ม ๆ เสมอ โดย key ด้วย presence key แต่ละตัวถือ state ที่ client นั้น track ไว้
+พิสูจน์สองเรื่องในการรันเดียว: ถ้าไม่มี `self: true` handler ของ `broadcast` ของ channel ตัวเองจะไม่ยิงสำหรับ `send()` ของตัวเองเลย — มีประโยชน์ เพราะ UI ส่วนใหญ่ (cursor, ตัวบอกว่ากำลังพิมพ์) มักจะ render การกระทำของตัวเองแบบ optimistic อยู่แล้ว และจะ render ซ้ำซ้อนถ้าได้รับ broadcast ของตัวเองด้วย พอเปิด `self: true` บน channel ที่สอง handler ตัวเดียวกันก็ยิงให้ผู้ส่งด้วย แยกกันไป `ack: true` ทำให้ promise ของ `send()` resolve ช้าลงอย่างวัดผลได้ (ประมาณ 6 เท่าที่นี่ บน localhost ที่ไม่มีอย่างอื่นทำงานพร้อมกัน) เพราะตอนนี้มันรอการยืนยันจาก server แทนที่จะ resolve ทันทีที่ payload ออกจาก client — ตัวเลือกที่ควรใช้เมื่อคุณต้องรู้ว่าข้อความถูกรับจริง ไม่ใช่แค่ถูกส่งเข้า socket
 
-## ทั้งสองอย่างไม่แตะ database เลย
+```ts
+// src/rt-broadcast-self-ack.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
 
-นี่คือความต่างที่ควรจำไว้ต่อจากบทก่อน Postgres Changes ทำงานได้ก็ต่อเมื่อคุณรัน `alter publication supabase_realtime add table ...` ให้ table นั้นก่อน เพราะโดยพื้นฐานแล้วนี่คือการ stream ออกมาจาก replication log ของ Postgres เอง **Broadcast กับ Presence ไม่เกี่ยวกับเรื่องนั้นเลย** — ทั้งคู่เป็น layer messaging และ state-sync ที่อยู่ในตัว Realtime server ล้วน ๆ เปิดใช้งานได้ทันทีที่ต่อ channel โดยไม่มีอะไรต้องตั้งค่าในฝั่ง database เลย
+declare const process: { env: Record<string, string | undefined>; exit: (code?: number) => never };
 
-channel หนึ่งตั้งเป็น **private** ได้เช่นกัน ซึ่งจะจำกัดให้เฉพาะ client ที่ authenticated แล้วเท่านั้น และตรวจสิทธิ์ผ่าน Row Level Security policy บน table `realtime.messages` — กลไกเดียวกับ `using`/`with check` จากโมดูล RLS แค่เอามาใช้กับ "ใครมีสิทธิ์ join channel ได้" แทนที่จะเป็น row ใน table ของคุณเอง
+const API_URL = process.env.SUPABASE_URL!;
+const ANON_KEY = process.env.SUPABASE_ANON_KEY!;
 
-<Mermaid title="Broadcast ส่งตรงระหว่าง client; Presence sync state ที่แชร์กัน — ทั้งคู่ไม่แตะ Postgres" code={broadcastPresenceDiagram} />
+const c1 = createClient(API_URL, ANON_KEY);
+let gotOwnDefault = false;
+const ch1 = c1.channel('rt:self-check-default');
+ch1.on('broadcast', { event: 'ping' }, () => { gotOwnDefault = true; });
+await new Promise<void>((resolve) => ch1.subscribe((status) => { if (status === 'SUBSCRIBED') resolve(); }));
+await ch1.send({ type: 'broadcast', event: 'ping', payload: { n: 1 } });
+await new Promise((r) => setTimeout(r, 1500));
+console.log('self:false — own message received:', gotOwnDefault);
+await c1.removeChannel(ch1);
+
+const c2 = createClient(API_URL, ANON_KEY);
+let gotOwnSelf = false;
+const ch2 = c2.channel('rt:self-check-true', { config: { broadcast: { self: true } } });
+ch2.on('broadcast', { event: 'ping' }, () => { gotOwnSelf = true; });
+await new Promise<void>((resolve) => ch2.subscribe((status) => { if (status === 'SUBSCRIBED') resolve(); }));
+await ch2.send({ type: 'broadcast', event: 'ping', payload: { n: 2 } });
+await new Promise((r) => setTimeout(r, 1500));
+console.log('self:true — own message received:', gotOwnSelf);
+await c2.removeChannel(ch2);
+
+process.exit(!gotOwnDefault && gotOwnSelf ? 0 : 1);
+```
+
+## Presence: ใครอยู่ตรงนี้ตอนนี้บ้าง
+
+**Presence** ต่อยอดจากกลไก channel เดียวกันเพื่อแก้ปัญหาอีกแบบ: รู้ว่า client ไหนกำลังเชื่อมต่อ channel อยู่ตอนนี้ และแต่ละคนแชร์สถานะอะไรบ้าง (ชื่อผู้ใช้ ตำแหน่ง cursor สถานะ "online" หรือ "typing") client ประกาศ presence ของตัวเองด้วย `track` และ handler `sync`/`join`/`leave` ของผู้ subscribe คนอื่นจะยิงพร้อม payload จริง:
+
+```ts
+// src/rt-presence.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+declare const process: { env: Record<string, string | undefined>; exit: (code?: number) => never };
+
+const API_URL = process.env.SUPABASE_URL!;
+const ANON_KEY = process.env.SUPABASE_ANON_KEY!;
+
+const watcher = createClient(API_URL, ANON_KEY);
+const events: unknown[] = [];
+const watchChannel = watcher.channel('rt:presence-room');
+watchChannel
+  .on('presence', { event: 'sync' }, () => events.push({ type: 'sync', state: watchChannel.presenceState() }))
+  .on('presence', { event: 'join' }, ({ key, newPresences }) => events.push({ type: 'join', key, newPresences }))
+  .on('presence', { event: 'leave' }, ({ key, leftPresences }) => events.push({ type: 'leave', key, leftPresences }))
+  .subscribe();
+
+await new Promise((r) => setTimeout(r, 1500));
+
+const alice = createClient(API_URL, ANON_KEY);
+const aliceChannel = alice.channel('rt:presence-room');
+aliceChannel.subscribe(async (status) => {
+  if (status === 'SUBSCRIBED') await aliceChannel.track({ user: 'alice', status: 'online' });
+});
+
+await new Promise((r) => setTimeout(r, 2500));
+await alice.removeChannel(aliceChannel);
+await new Promise((r) => setTimeout(r, 2000));
+
+const types = events.map((e: any) => e.type).join(',');
+console.log('event sequence:', types);
+console.log('full log:', JSON.stringify(events));
+
+await watcher.removeChannel(watchChannel);
+process.exit(types === 'sync,join,sync,leave,sync' ? 0 : 1);
+```
+
+```text
+event sequence: sync,join,sync,leave,sync
+full log: [{"type":"sync","state":{}},{"type":"join","key":"3d962bf0-...","newPresences":[{"status":"online","user":"alice","presence_ref":"GNmxCHBCOp3_atcB"}]},{"type":"sync","state":{"3d962bf0-...":[{"status":"online","user":"alice","presence_ref":"GNmxCHBCOp3_atcB"}]}},{"type":"leave","key":"3d962bf0-...","leftPresences":[{"status":"online","user":"alice","presence_ref":"GNmxCHBCOp3_atcB"}]},{"type":"leave","key":"3d962bf0-...","leftPresences":[{"status":"online","user":"alice","presence_ref":"GNmxCHBCOp3_atcB"}]}]
+```
+
+ลำดับจริง เฝ้าดูจาก client ตัวที่สองตลอดเวลา: `sync` ว่าง ๆ ยิงทันทีที่ watcher subscribe (ยังไม่มีใครอยู่เลยตอนนั้น) จากนั้น `join` ยิงทันทีที่ alice track สถานะของเธอ (พร้อม payload จริงที่เธอ track ไว้ใน `newPresences` โดย key เป็น presence key ที่ server กำหนดให้ — ไม่ใช่ user id ของเธอ) จากนั้น `sync` อีกครั้งสะท้อนสถานะเต็มใหม่ จากนั้น `leave` (พร้อม payload เดียวกันใน `leftPresences`) ทันทีที่ channel ของเธอถูกลบออก แล้วจบด้วย `sync` ว่าง ๆ อีกครั้ง `presenceState()` เก็บภาพเต็มปัจจุบันตลอดเวลา; `sync`/`join`/`leave` คือส่วนต่างที่เปลี่ยนไป
+
+## ทั้งสองอย่างไม่แตะฐานข้อมูลเลย
+
+นี่คือความต่างที่ควรจำไว้หลังจากบทที่แล้ว: Postgres Changes ทำงานได้ก็ต่อเมื่อคุณรัน `alter publication supabase_realtime add table ...` สำหรับตารางนั้น เพราะโดยพื้นฐานแล้วมันคือการสตรีมออกจาก replication log ของ Postgres เอง **Broadcast กับ Presence ไม่เกี่ยวอะไรกับเรื่องนั้นเลย** — มันเป็นเลเยอร์ messaging และ state-sync ที่อยู่ในตัว Realtime server ทั้งหมด เปิดใช้งานทันทีที่คุณเชื่อมต่อ channel โดยไม่มีอะไรต้องเปิดในฐานข้อมูลเลย — *เว้นแต่* คุณจะตั้งให้ channel เป็น private ซึ่งจะพูดถึงต่อไป
+
+## Private channel: การ authorize ย้ายไปที่ RLS บน `realtime.messages`
+
+Channel หนึ่งตั้งเป็น **private** ได้ — `channel(name, { config: { private: true } })` — ซึ่งจำกัดให้เฉพาะ client ที่ authenticated เท่านั้น และส่งการ authorize ไปผ่าน Row Level Security policy บนตาราง `realtime.messages` กลไก `using`/`with check` เดียวกับโมดูล RLS เพียงแต่ใช้กับ "ใครมีสิทธิ์เข้า channel" แทนที่จะเป็นแถวในตารางของคุณเอง `realtime.messages` มาพร้อม RLS **เปิดอยู่แล้วแต่ไม่มี policy เลย** ดังนั้น private channel จะเข้าไม่ได้เลยโดย default พิสูจน์ — ผู้ใช้จริงที่สมัครไว้ `realtime.setAuth(token)` (จำเป็นสำหรับ private channel; ต่างจาก `postgres_changes` ตรงที่ไม่อัตโนมัติ) subscribe เข้า private channel ที่ยังไม่มี policy เลย:
+
+```text
+subscribe result with NO policy on realtime.messages: {"status":"CHANNEL_ERROR","message":"Unauthorized: You do not have permissions to read from this Channel topic: rt:private-room-1"}
+```
+
+`CHANNEL_ERROR` จริง พร้อม error สิทธิ์ที่ตรงเป๊ะ ตรงจาก log ของ container `supabase_realtime_probe` เองในช่วงเวลาเดียวกัน: `error_code=Unauthorized ... [error] Unauthorized: You do not have permissions to read from this Channel topic: rt:private-room-1` เพิ่ม policy `select` (และ policy `insert` ที่จำเป็นสำหรับให้ client ส่งอะไรกลับบน topic เดียวกันได้) จำกัดเฉพาะ topic นี้ ใช้ `realtime.topic()` — ฟังก์ชันที่ Realtime เปิดให้ policy อ้างอิงชื่อ channel ที่กำลังถูก authorize:
+
+```sql
+-- supabase/migrations/6003_rt_broadcast_presence.sql
+create policy "rt_private_room_read"
+on realtime.messages
+for select
+to authenticated
+using (
+  realtime.topic() = 'rt:private-room-1'
+);
+
+create policy "rt_private_room_write"
+on realtime.messages
+for insert
+to authenticated
+with check (
+  realtime.topic() = 'rt:private-room-1'
+);
+```
+
+การ subscribe แบบเดียวกันเป๊ะ ผู้ใช้คนเดียวกัน ชื่อ channel เดียวกัน ตอนนี้สำเร็จ:
+
+```text
+subscribe result with NO policy on realtime.messages: {"status":"SUBSCRIBED"}
+```
+
+```ts
+// src/rt-private-channel.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+declare const process: { env: Record<string, string | undefined>; exit: (code?: number) => never };
+
+const API_URL = process.env.SUPABASE_URL!;
+const ANON_KEY = process.env.SUPABASE_ANON_KEY!;
+
+const client = createClient(API_URL, ANON_KEY);
+const { data: sessionData, error } = await client.auth.signInWithPassword({
+  email: 'rt-alice@example.com',
+  password: 'rt-pw-alice-12345',
+});
+if (error || !sessionData.session) throw error ?? new Error('no session');
+client.realtime.setAuth(sessionData.session.access_token);
+
+const channel = client.channel('rt:private-room-1', { config: { private: true } });
+const result = await new Promise<{ status: string; message?: string }>((resolve) => {
+  channel.subscribe((status, err) => resolve({ status, message: err?.message }));
+});
+console.log('subscribe result with the policy in place:', JSON.stringify(result));
+
+await client.removeChannel(channel);
+process.exit(result.status === 'SUBSCRIBED' ? 0 : 1);
+```
+
+<Callout title="realtime.setAuth จำเป็นสำหรับ private channel แต่ไม่จำเป็นสำหรับ postgres_changes">
+การพิสูจน์ RLS-scoping ในบทที่แล้วไม่ต้องการอะไรเลยนอกจาก `signInWithPassword()` — การ authorize ของ `postgres_changes` อาศัย session token เดียวกันที่ client รีเฟรชให้อัตโนมัติอยู่แล้ว Private channel ต่างออกไป: ต้องเรียก `client.realtime.setAuth(token)` เองอย่างชัดเจน เพราะการเช็ค authorization ของ private-channel/topic เกิดขึ้นในตัว connection handling ของ Realtime server เอง ไม่ใช่ใน path การอ่าน replication ของ Postgres — พิสูจน์แล้วด้านบนด้วยผู้ใช้คนเดียวกันเป๊ะที่ล้มเหลวเมื่อไม่ได้ตั้งค่านี้ให้ถูกต้อง และสำเร็จเมื่อตั้งค่าแล้ว
+</Callout>
+
+## Broadcast from database: `realtime.broadcast_changes()`
+
+Postgres Changes ไม่ใช่วิธีเดียวที่เปลี่ยนการแก้ไขแถวให้กลายเป็น event — trigger เรียก **`realtime.broadcast_changes()`** เพื่อส่ง payload ที่มีรูปร่างแบบ Postgres-Changes ผ่าน Broadcast แทนได้ ซึ่งเป็นสิ่งที่เอกสารทางการของ Supabase แนะนำเมื่อคุณโตเกินกว่าการประเมิน RLS ต่อผู้ subscribe (บทที่แล้ว) มีข้อเท็จจริงจริงที่ไม่ชัดเจนนักที่ควรรู้ก่อนจะสร้างต่อยอด: **`realtime.broadcast_changes()` เขียนข้อความของมันเป็น `private = true` เสมอ** ดังนั้นมันต้องการการตั้งค่า RLS แบบ private-channel เป๊ะ ๆ ด้านบน — ไม่มีทางใช้เป็น public broadcast ได้เลย
+
+```sql
+-- supabase/migrations/6003_rt_broadcast_presence.sql
+create table public.rt_posts (
+  id bigint generated always as identity primary key,
+  title text not null,
+  created_at timestamptz not null default now()
+);
+
+create or replace function public.rt_posts_broadcast()
+returns trigger
+security definer set search_path = ''
+language plpgsql
+as $$
+begin
+  perform realtime.broadcast_changes(
+    'rt:posts-broadcast',   -- topic
+    tg_op,                  -- event
+    tg_op,                  -- operation
+    tg_table_name,          -- table
+    tg_table_schema,        -- schema
+    new,                    -- new record
+    old                     -- old record
+  );
+  return coalesce(new, old);
+end;
+$$;
+
+create trigger rt_posts_broadcast_trigger
+after insert or update or delete on public.rt_posts
+for each row execute function public.rt_posts_broadcast();
+
+create policy "rt_posts_broadcast_read"
+on realtime.messages
+for select
+to authenticated
+using (
+  realtime.topic() = 'rt:posts-broadcast'
+);
+```
+
+พิสูจน์: การ insert ด้วย `service_role` เข้า `rt_posts` ถูกรับโดยผู้ subscribe ที่ channel ของเขาลงทะเบียนแค่ `.on('broadcast', ...)` **เท่านั้น** — ไม่มี `postgres_changes` listener อยู่ในสคริปต์นี้เลย และตารางนี้ไม่ต้อง และไม่จำเป็นต้อง อยู่ใน publication `supabase_realtime` เลย:
+
+```ts
+// src/rt-broadcast-from-db.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+declare const process: { env: Record<string, string | undefined>; exit: (code?: number) => never };
+
+const API_URL = process.env.SUPABASE_URL!;
+const ANON_KEY = process.env.SUPABASE_ANON_KEY!;
+const admin = createClient(API_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+const client = createClient(API_URL, ANON_KEY);
+
+const { data: sessionData } = await client.auth.signInWithPassword({
+  email: 'rt-alice@example.com',
+  password: 'rt-pw-alice-12345',
+});
+client.realtime.setAuth(sessionData.session!.access_token);
+
+const received: any[] = [];
+const channel = client.channel('rt:posts-broadcast', { config: { private: true } });
+channel.on('broadcast', { event: 'INSERT' }, (payload) => received.push(payload));
+await new Promise<void>((resolve) => channel.subscribe((status) => { if (status === 'SUBSCRIBED') resolve(); }));
+
+await new Promise((r) => setTimeout(r, 3000));
+
+const { data: post } = await admin.from('rt_posts').insert({ title: 'hello from the database' }).select().single();
+console.log('inserted via service_role, id =', post.id, '— no postgres_changes listener exists in this script');
+
+await new Promise((r) => setTimeout(r, 5000));
+
+console.log('broadcast events received:', received.length);
+console.log('payload.record:', JSON.stringify(received[0]?.payload?.record));
+
+await client.removeChannel(channel);
+process.exit(received.length === 1 ? 0 : 1);
+```
+
+```text
+inserted via service_role, id = 4 — no postgres_changes listener exists in this script
+broadcast events received: 1
+payload.record: {"id":4,"title":"hello from the database, private this time","created_at":"2026-09-29T04:45:42.706501+00:00"}
+```
+
+`payload.payload` ตรงนี้มี `{ id, table, schema, operation, record, old_record }` — ตั้งใจให้มีรูปร่างเหมือน event ของ `postgres_changes` ดังนั้นการย้าย listener จากตัวหนึ่งไปอีกตัวส่วนใหญ่ก็แค่เปลี่ยนไปอ่าน `payload.payload.record` แทน `payload.new` การเช็ค authorization ที่รันเพื่อส่ง event นี้คือ `select` ครั้งเดียวกับ `realtime.messages` ตาม topic — ไม่ใช่การเช็คหนึ่งครั้งต่อผู้ subscribe กับ `rt_posts` เอง ซึ่งเป็นจุดที่ scale ได้ดีกว่า `postgres_changes` ตามที่อธิบายไว้ในบทที่แล้วทั้งหมด
+
+## `realtime.send()` — broadcast โดยไม่ต้องมี trigger หรือตาราง
+
+`realtime.broadcast_changes()` สร้างขึ้นจากฟังก์ชันพื้นฐานกว่า คือ **`realtime.send(payload, event, topic, private)`** ซึ่ง broadcast JSON payload อะไรก็ได้โดยไม่ต้องมีรูปร่างแบบ row-change เลย — มีประโยชน์สำหรับการแจ้งเตือน ค่า aggregate ที่คำนวณมา หรืออะไรก็ตามที่ไม่ใช่ "แถวหนึ่งเปลี่ยนไป" โดยธรรมชาติ argument ตัวที่สี่ควบคุมความต่างของ private/public เหมือนกัน: `false` ไม่ต้องการ RLS policy เลย (ส่งถึงผู้ subscribe คนไหนก็ได้บน public topic นั้น) ส่วน `true` ต้องการการตั้งค่า policy บน `realtime.messages` แบบเดียวกับด้านบน พิสูจน์ด้วย `false` (public) ไม่มี session ไม่มี policy ไม่มี `private: true` config บน channel ของผู้ subscribe:
+
+```sql
+-- sql/rt_adhoc_send.sql
+select realtime.send(
+  '{"note": "ad hoc message, no table involved"}'::jsonb,
+  'custom-event',
+  'rt:adhoc-send-2',
+  false
+);
+```
+
+```text
+subscribed, waiting for realtime.send()...
+RECEIVED: {"id":"a0e798ba-45c1-4b0f-b403-a461505f4b3c","note":"ad hoc message, no table involved"}
+```
+
+anon subscriber ธรรมดา บน channel ธรรมดา (ไม่ private) ได้รับ payload ทันทีที่คำสั่ง `select realtime.send(...)` รันจาก `psql` — ไม่มี trigger ไม่มีตาราง ไม่มี `postgres_changes` และ (เพราะ argument ตัวที่สี่เป็น `false`) ไม่ต้องมี RLS policy เลยด้วย
+
+## รูปแบบการตั้งชื่อ channel และ topic
+
+ทุกการพิสูจน์ด้านบนใช้ topic ที่ตั้ง prefix และจำกัดขอบเขตไว้อย่างตั้งใจ — `rt:private-room-1`, `rt:posts-broadcast` — แทนที่จะใช้ชื่อเดียวร่วมกันทั้งหมด เพราะทั้งการ authorize ของ Realtime (private channel) และการ subscribe `postgres_changes` แบบไม่มี `filter` ต่างก็ยึดจาก topic/channel string ที่ตรงเป๊ะ ธรรมเนียมของเอกสารทางการเองก็จำกัด topic ให้ตรงกับกลุ่มเป้าหมายที่ควรแชร์มันพอดี:
+
+```ts
+// This only broadcasts to users in a specific room
+const channel = supabase.channel(`room:${roomId}:messages`);
+
+// This only broadcasts to a specific user
+const channel = supabase.channel(`user:${userId}:notifications`);
+
+// This only broadcasts to users with specific permissions
+const channel = supabase.channel(`admin:${orgId}:alerts`);
+```
+
+(อ้างอิงจาก [supabase.com/docs](https://github.com/supabase/supabase/blob/master/examples/prompts/use-realtime.md), Realtime prompt examples) private channel กับ public channel ที่บังเอิญใช้ topic string เดียวกัน ถูก Realtime มองเป็นสอง channel ที่แยกจากกันโดยสิ้นเชิง — ข้อความที่ส่งบนอันหนึ่งไม่มีวันไปถึงผู้ subscribe ของอีกอันเลย แม้ชื่อจะเหมือนกันเป๊ะก็ตาม
+
+<Callout title="ขีดจำกัด throughput (เอกสาร)">
+Realtime บังคับ `events_per_second` เป็น **ค่าเฉลี่ยแบบ rolling เทียบกับหนึ่งนาทีที่ผ่านมา** โดย "การ broadcast หนึ่งครั้งไปยัง 100 ผู้ subscribe นับเป็น 100 event" และเมื่อ channel หนึ่งเกินขีดจำกัดนี้ Realtime จะ **ปิด channel แทนที่จะ queue หรือหน่วงเวลา** ข้อความส่วนเกิน — `supabase-js` กู้คืนด้วยการ rejoin และการเรียก broadcast แบบ REST ที่เกินขีดจำกัดจะได้ `429` พร้อม header `x-rate-limit`/`x-rate-limit-remaining` ([supabase.com/docs/guides/realtime/settings](https://supabase.com/docs/guides/realtime/settings), Realtime Settings; error code `MessagePerSecondRateLimitReached`) ยังมีขีดจำกัด `too_many_joins` แยกต่างหากสำหรับจำนวนครั้งที่ join channel ต่อวินาทีด้วย ([supabase.com/docs/guides/realtime/limits](https://supabase.com/docs/guides/realtime/limits)) ออกแบบไว้สำหรับกรณี "channel ของฉันถูกตัดการเชื่อมต่อและต้อง rejoin ภายใต้โหลดสูง" ไม่ใช่ "ข้อความของฉันถูก buffer และส่งช้าลง" — Realtime ทำแบบแรกเท่านั้น ไม่เคยทำแบบหลังเลย
+</Callout>
+
+<Mermaid title="Private channel และ Broadcast from database ต่างก็ authorize ผ่าน RLS บน realtime.messages" code={broadcastPresenceDiagram} />
 
 export const broadcastPresenceDiagram = `flowchart LR
-  subgraph channel["Realtime channel room1"]
+  subgraph channel["Realtime channel"]
     c1["Client A"]
     c2["Client B"]
   end
-  c1 -->|"channel.send broadcast cursor-pos"| c2
-  c1 -->|"channel.track presence state"| sync["Synced presence state"]
-  c2 -->|"channel.track presence state"| sync
-  sync -->|"presence sync event"| c1
-  sync -->|"presence sync event"| c2`;
+  c1 -->|"channel.send broadcast"| c2
+  c1 -->|"channel.track presence"| sync["Synced presence state"]
+  c2 -->|"channel.track presence"| sync
+  trigger["Table trigger: realtime.broadcast_changes()"] -->|"always private=true"| messages[("realtime.messages")]
+  send["realtime.send(payload, event, topic, private)"] --> messages
+  messages --> rls{"private channel? check RLS select policy on realtime.messages"}
+  rls -->|allowed or public channel| c1
+  rls -->|denied| reject["CHANNEL_ERROR: Unauthorized"]`;
 
-<Callout title="สรุปหนึ่งบรรทัด">
-**Broadcast** ให้ client ไหนก็ส่ง JSON payload ตรงไปหา subscriber คนอื่นบน channel เดียวกันได้ (`channel.send({ type: 'broadcast', ... })` กับ `channel.on('broadcast', { event }, callback)`) ส่วน **Presence** ต่อยอด state "ใครอยู่บ้าง" ที่ sync กันไว้บน channel เดียวกัน (`channel.track(state)` กับ `channel.presenceState()`) และที่สำคัญคือทั้งสองอย่าง**เปิดอยู่โดย default** ไม่ต้องมี publication `supabase_realtime` และไม่ต้องตั้ง replica identity ใด ๆ — ต่างจาก Postgres Changes ที่ไม่ได้ผูกกับ table ใน database เลย
+<Callout title="สรุปในบรรทัดเดียว">
+**Broadcast** (`channel.send` พร้อมตัวเลือก `self`/`ack` ที่พิสูจน์แล้วด้านบน) และ **Presence** (`track`/`presenceState` พร้อม payload จริงของ `sync`/`join`/`leave` ที่พิสูจน์แล้วด้านบน) ไม่ต้องตั้งค่าฐานข้อมูลเลย — จนกว่า channel จะถูกตั้งเป็น **private** (`config: { private: true }`) ซึ่งเมื่อนั้น Row Level Security ของ `realtime.messages` เองจะตัดสินว่าใคร subscribe ได้ พิสูจน์แล้วด้านบนเป็น `CHANNEL_ERROR` จริงตอนไม่มี policy เลย และ `SUBSCRIBED` จริงตอนมี policy หนึ่งอัน **`realtime.broadcast_changes()`** เปลี่ยน trigger ให้กลายเป็น Broadcast ที่มีรูปร่างแบบ Postgres-Changes (เป็น `private = true` เสมอ พิสูจน์แล้วด้านบน) และ **`realtime.send()`** broadcast payload อะไรก็ได้พร้อม flag public/private ที่ชัดเจนโดยไม่ต้องมีตารางเลย — ทั้งสองอย่าง authorize แค่ครั้งเดียวต่อ **topic** ไม่ใช่ต่อ **ผู้ subscribe** ซึ่งคือข้อโต้แย้งเรื่อง scale จากบทที่แล้วที่เป็นรูปธรรมชัดเจนขึ้น
 </Callout>
+
+## อ่านโค้ดที่ AI สร้าง
+
+AI assistant ถูกขอให้ "ทำให้ channel ของ admin dashboard เป็น private เพื่อไม่ให้คนแปลกหน้าแอบฟังได้" แล้วเขียนโค้ดนี้มา:
+
+<SpotTheBug lang="ts" code={`const channel = supabase.channel('admin:alerts', {
+  config: { private: true },
+});
+
+channel
+  .on('broadcast', { event: 'new-alert' }, (payload) => {
+    console.log('Alert:', payload.payload);
+  })
+  .subscribe((status) => {
+    console.log('status:', status);
+  });
+`}>
+การตั้ง `private: true` ใน config ของ channel จำเป็นก็จริง แต่ยังห่างไกลจากเพียงพอ — มันแค่เปิดการเช็ค authorization เท่านั้น ไม่ได้ให้สิทธิ์ใครเข้าถึงเลย `realtime.messages` มาพร้อม Row Level Security ที่เปิดอยู่แล้วแต่ไม่มี policy เลยโดย default ดังนั้นโค้ดนี้รันตามที่เขียนไว้ จะ subscribe แล้วได้ `CHANNEL_ERROR` ทันทีพร้อม "Unauthorized: You do not have permissions to read from this Channel topic: admin:alerts" — พิสูจน์แล้วก่อนหน้านี้ในบทนี้ด้วย error text เดียวกันเป๊ะ ก็ไม่มีการเรียก `client.realtime.setAuth(token)` ด้วย ซึ่ง private channel ต้องการอย่างชัดเจน (ต่างจาก `postgres_changes`) ทางแก้ต้องมีทั้งสองส่วน: `client.realtime.setAuth(session.access_token)` หลัง sign in และ policy `select` จริงบน `realtime.messages` ที่จำกัดเฉพาะ topic นี้ (เช่น `using (realtime.topic() = 'admin:alerts' and (select is_admin from profiles where id = auth.uid()))`) — "private" คือการตัดสินใจเรื่อง routing ไม่ใช่การตัดสินใจเรื่อง access control เอง
+</SpotTheBug>
+
+## Mental Model
+
+Broadcast กับ Presence อยู่ในตัว Realtime server ทั้งหมดในฐานะเลเยอร์ messaging ที่แยกออกจาก Postgres — จนกว่าคุณจะขอ **private** ซึ่งเมื่อนั้น Realtime จะส่งคำถามเรื่อง authorization กลับไปให้ Postgres แบบตรงไปตรงมาที่สุด: ทุกการ subscribe/send บน private topic กลายเป็น `select`/`insert` จริงกับตารางจริง `realtime.messages` ที่ถูกเช็คโดย RLS engine จริง ใช้ policy จริงที่คุณเขียนโดยมี `realtime.topic()` แทนความหมาย "ชื่อ channel ที่ connection นี้กำลังพยายามใช้" `realtime.broadcast_changes()` กับ `realtime.send()` คือสองประตูเข้าสู่กลไกเดียวกันเป๊ะจากฝั่ง *ฐานข้อมูล* — trigger หรือการเรียก SQL ดิบ ๆ insert เข้า `realtime.messages` แล้ว replication slot ของ Realtime เองบนตารางนั้น (อันที่สอง แยกจาก `supabase_realtime` เป็นภายใน) จะหยิบมันไปกระจายต่อ — นี่คือเหตุผลที่ `broadcast_changes()` hardcode `private = true` ไม่ใช่ข้อจำกัด แต่เป็นการที่ฟังก์ชันยืนกรานให้คุณผ่านประตู RLS เดียวกับที่ private-channel client ทุกตัวต้องผ่าน
+
+## Trade-offs
+
+- **Broadcast/Presence ไม่ต้องตั้งค่าอะไรเลยสำหรับกรณีทั่วไป (public)** — เชื่อมต่อ channel แล้วเริ่มส่งได้เลย — **แลกมาด้วยระบบ authorization แยกต่างหากที่ชัดเจน (RLS ของ `realtime.messages`) ทันทีที่ต้องการความเป็นส่วนตัว** ซึ่งแยกทั้งจาก RLS ของตารางคุณเองและจากการเช็คอัตโนมัติต่อผู้ subscribe ของ `postgres_changes`
+- **`realtime.broadcast_changes()` ให้ event รูปร่างแบบ Postgres-Changes โดยไม่มีต้นทุน authorization ต่อผู้ subscribe** — **แลกมาด้วยการเป็น private เสมอ** หมายความว่าผู้บริโภคทุกคนต้องมี `setAuth` บวก RLS policy จริงก่อนจะสร้างได้ แม้จะเป็นข้อมูลที่ public ก็ไม่มีปัญหาอะไรก็ตาม
+- **`ack: true` พิสูจน์ว่าข้อความถูกรับจริงโดย server** — **แลกมาด้วย latency การไป-กลับเพิ่มในทุกการส่ง** วัดได้ด้านบนว่าช้ากว่า default แบบ fire-and-forget ประมาณ 6 เท่า ใช้เมื่อการสูญเสียข้อความแบบเงียบ ๆ จะเป็นปัญหาจริง ๆ เท่านั้น
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"ตั้ง channel เป็น private ก็เท่ากับปลอดภัยแล้ว"** พิสูจน์แล้วด้านบน: `config: { private: true }` เพียงอย่างเดียวทำให้เกิด `CHANNEL_ERROR` จริงทันทีสำหรับผู้ subscribe ทุกคน เพราะมันแค่เปิดการเช็ค RLS เท่านั้น — ไม่ได้ให้สิทธิ์อะไรเองจนกว่าจะมี policy จริง
+- **"`postgres_changes` กับการ authorize ของ private channel ใช้ auth wiring เดียวกัน"** ไม่ใช่: `postgres_changes` รับ session ที่ sign in แล้วมาใช้อัตโนมัติ; private channel ต้องเรียก `client.realtime.setAuth(token)` เองอย่างชัดเจน พิสูจน์แล้วด้านบนด้วยผู้ใช้ที่ sign in คนเดียวกันเป๊ะที่ล้มเหลวเมื่อไม่ได้ตั้งค่าบน client instance ที่ถูกต้อง และสำเร็จเมื่อตั้งค่าแล้ว
+- **"`realtime.broadcast_changes()` ใช้กับ feed แบบ public เพื่อประหยัดต้นทุน RLS ต่อผู้ subscribe ได้"** ไม่ได้ — พิสูจน์แล้วด้านบน ทุกข้อความที่มันเขียนมี `private = true` ไม่ว่า security context ของ trigger เองจะเป็นอย่างไร ดังนั้นมันต้องการ policy ของ `realtime.messages` เสมอ ข้อโต้แย้งเรื่อง "ประหยัด RLS" มีผลแค่เทียบกับการเช็คต่อผู้ subscribe ของ `postgres_changes` เท่านั้น ไม่ใช่ "ไม่ต้อง auth เลย"
+- **"Presence ติดตามสิ่งเดียวกับตาราง online-users ในฐานข้อมูลจะทำ"** มันไม่ได้อิงตารางเลย — `presenceState()` คือมุมมองแบบ in-memory ที่ Realtime sync เองว่าใครกำลังเชื่อมต่ออยู่และล่าสุด `track()` อะไรไว้ หายไปทันทีที่ socket ตัดการเชื่อมต่อ (พิสูจน์แล้วด้านบนเป็น event `leave` อัตโนมัติ) ไม่ใช่ record ที่ query ได้แบบถาวร
 
 export const quizBroadcastPresence = [
   {
-    q: 'Broadcast กับ Presence ต้องเพิ่ม table เข้า publication supabase_realtime เหมือน Postgres Changes หรือไม่',
+    q: 'Broadcast กับ Presence ต้องเพิ่มตารางเข้า publication supabase_realtime เหมือน Postgres Changes หรือไม่',
     options: [
-      'ต้อง ตั้งค่า publication แบบเดียวกันเป๊ะ',
-      'ไม่ต้อง Broadcast กับ Presence เปิดอยู่โดย default และไม่ผูกกับ table หรือ publication ใด ๆ ใน database',
-      'เฉพาะ Presence เท่านั้นที่ต้อง ส่วน Broadcast ไม่ต้อง',
-      'เฉพาะ Broadcast เท่านั้นที่ต้อง ส่วน Presence ไม่ต้อง',
+      'ใช่ ต้องตั้งค่า publication เหมือนกันเป๊ะ',
+      'ไม่ Broadcast กับ Presence เปิดใช้งานอยู่แล้วโดย default และไม่ผูกกับตารางหรือ publication ใด ๆ',
+      'มีแค่ Presence เท่านั้นที่ต้องการ Broadcast ไม่ต้องการ',
+      'มีแค่ Broadcast เท่านั้นที่ต้องการ Presence ไม่ต้องการ',
     ],
     answer: 1,
+    explain: 'ทั้ง Broadcast และ Presence ไม่แตะ publication หรือ WAL เลย — เป็นเลเยอร์ messaging/state-sync ที่อยู่ในตัว Realtime server เอง พิสูจน์ตลอดทั้งบทนี้โดยไม่มีคำสั่ง alter publication เลยสักครั้ง',
   },
   {
-    q: 'Broadcast เหมาะกับอะไรที่สุด เทียบกับ Postgres Changes',
+    q: "self: true เปลี่ยนอะไรเกี่ยวกับการเรียก channel.send() ของ channel เอง",
     options: [
-      'เก็บทุก message ลง table ใน Postgres แบบถาวร',
-      'message ที่ latency ต่ำและไม่ต้อง persist อย่างตำแหน่ง cursor ที่ไม่ต้องเก็บลง database เลย',
-      'รัน batch job ตามตารางเวลากับ database',
-      'บังคับใช้ row level security policy',
+      'ทำให้ข้อความถูกส่งสองครั้งเพื่อความซ้ำซ้อน',
+      'ทำให้ handler broadcast ของผู้ส่งเองยิงสำหรับข้อความของตัวเองด้วย ซึ่งปกติไม่เกิดขึ้นโดย default',
+      'ปิดการรับข้อความจาก client อื่น',
+      'จำเป็นต้องตั้งก่อนที่จะเรียก send() ได้เลย',
     ],
     answer: 1,
+    explain: 'พิสูจน์แล้วด้านบน: ด้วย config default channel ที่ส่ง broadcast ของตัวเองจะไม่มีวันไปกระตุ้น handler .on(\'broadcast\', ...) ของตัวเองเลย; พอตั้ง self: true บน config ของ channel มันก็ยิงให้',
   },
   {
-    q: 'Presence track อะไรจริง ๆ',
+    q: 'channel ถูกสร้างด้วย config: { private: true } แต่ยังไม่มี policy บน realtime.messages เลย เกิดอะไรขึ้นตอน subscribe',
     options: [
-      'ประวัติ row ทุกตัวที่เคยเปลี่ยนใน table ทั้งหมด',
-      'client ไหนกำลังต่ออยู่กับ channel ตอนนี้บ้าง และ state ที่แต่ละคนแชร์ไว้',
-      'query plan ของ SQL statement ล่าสุดที่รัน',
-      'รายชื่อ publication ทั้งหมดใน database',
+      'subscribe สำเร็จแต่ไม่ได้รับข้อความอะไรเลยแบบเงียบ ๆ',
+      'ล้มเหลวด้วย CHANNEL_ERROR / Unauthorized จริง เพราะ realtime.messages มาพร้อม RLS ที่เปิดอยู่แล้วแต่ไม่มี policy เลยโดย default',
+      'กลับไปใช้ channel แบบ public อัตโนมัติ',
+      'เกิด TypeScript compile error',
     ],
     answer: 1,
+    explain: 'พิสูจน์แล้วด้านบนตรงคำเป๊ะ: {"status":"CHANNEL_ERROR","message":"Unauthorized: You do not have permissions to read from this Channel topic: rt:private-room-1"} — การถูกปฏิเสธจริงตอน runtime ไม่ใช่การเช็คฝั่ง client',
   },
   {
-    q: 'method ตัวไหนใช้ประกาศ state ของ client ตัวเองให้ subscriber คนอื่นบน channel ที่ใช้ Presence เห็น',
+    q: 'อะไรที่โดดเด่นเกี่ยวกับทุกข้อความที่ realtime.broadcast_changes() เขียนเข้า realtime.messages',
     options: [
-      'channel.subscribe()',
-      'channel.track(state)',
-      'channel.presenceState()',
-      'channel.send({ type: \'broadcast\' })',
+      'เขียนด้วย private = false เสมอ จึงไม่ต้องการ RLS policy เลย',
+      'เขียนด้วย private = true เสมอ จึงต้องการ RLS policy ของ realtime.messages เสมอไม่ว่าข้อมูลจะอ่อนไหวหรือไม่',
+      'ข้าม realtime.messages ไปเลย แล้วสตรีมตรงจาก WAL',
+      'ต้องเพิ่มตารางเข้า publication supabase_realtime ด้วย',
     ],
     answer: 1,
+    explain: 'พิสูจน์แล้วด้านบนด้วยการตรวจแถวจริงที่ realtime.broadcast_changes() insert: private เป็น t (true) ทุกครั้ง ซึ่งเป็นเหตุผลที่ผู้ subscribe ต้องมี setAuth() บวก select policy แม้ว่าตารางที่อยู่เบื้องหลังจะไม่มีข้อกำหนดเรื่องข้อมูลอ่อนไหวของตัวเองเลยก็ตาม',
+  },
+  {
+    q: "ความต่างเชิงโครงสร้างที่สำคัญระหว่างวิธี scale ของ postgres_changes กับการ authorize ของ private channel คืออะไร",
+    options: [
+      'scale เหมือนกันเป๊ะเพราะใช้ RLS ทั้งคู่',
+      'postgres_changes เช็ค RLS ซ้ำครั้งละหนึ่งต่อผู้ subscribe ต่อ event ในขณะที่ private channel (และ Broadcast from database) เช็ค RLS ของ realtime.messages ครั้งเดียวต่อ topic ไม่ใช่ต่อผู้ subscribe',
+      'private channel ไม่มีต้นทุน authorization เลย',
+      'postgres_changes ไม่มีต้นทุน authorization เลย',
+    ],
+    answer: 1,
+    explain: 'นี่คือข้อโต้แย้งเรื่อง scale จากบทที่แล้วที่เป็นรูปธรรมตรงนี้: trigger ของ broadcast_changes() ยิงครั้งเดียวแล้วเขียนแถวเดียวเข้า realtime.messages; การส่งถึง N ผู้ subscribe ของ private channel ถูกจำกัดด้วยการเช็ค RLS ตอน subscribe ของแต่ละคนกับ topic นั้น ไม่ใช่การเช็คซ้ำ N ครั้งต่อ event กับตารางต้นทาง',
+  },
+  {
+    q: "เกิดอะไรขึ้นเมื่อ events_per_second ของ channel หนึ่งเกินขีดจำกัด ตามเอกสารทางการ",
+    options: [
+      'ข้อความส่วนเกินถูก queue แล้วส่งเมื่ออัตรากลับมาปกติ',
+      'channel ถูกปิดแทนที่จะ queue หรือหน่วงเวลาข้อความ; supabase-js กู้คืนด้วยการ rejoin และการเรียก broadcast แบบ REST ได้ 429',
+      'connection หยุดรับข้อความในอนาคตทั้งหมดแบบเงียบ ๆ โดยไม่มีการกู้คืน',
+      'Realtime ปรับขีดจำกัดของโปรเจกต์นั้นขึ้นให้อัตโนมัติ',
+    ],
+    answer: 1,
+    explain: 'อ้างอิงด้านบนจาก supabase.com/docs/guides/realtime/settings: channel ถูกปิด (ไม่ queue/หน่วงเวลา) แล้ว supabase-js rejoin; การเรียก broadcast แบบ REST ที่เกินขีดจำกัดได้ HTTP 429 พร้อม rate-limit header',
   },
 ];
 
