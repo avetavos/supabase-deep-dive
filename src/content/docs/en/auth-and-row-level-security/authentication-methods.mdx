@@ -1,6 +1,6 @@
 ---
 title: 'Authentication Methods'
-description: 'The sign-in methods Supabase Auth supports out of the box, from email and password to magic links, phone OTP, and OAuth providers.'
+description: 'The sign-in methods Supabase Auth supports out of the box, from email and password to magic links, phone OTP, anonymous sign-ins, and OAuth providers — proven end to end against a real local GoTrue server.'
 sidebar:
   order: 1
 ---
@@ -8,116 +8,298 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
 
-Supabase Auth is built on the open-source **GoTrue** server and supports several ways for a user to prove who they are — password, magic link, phone OTP, or OAuth — and every one of them ends the same way: a row is created or matched in the built-in `auth.users` table.
+Supabase Auth is built on the open-source **GoTrue** server and supports several ways for a user to prove who they are — password, magic link, phone OTP, anonymous, or OAuth — and every one of them ends the same way: a row is created or matched in the built-in `auth.users` table.
 
-## The main sign-in methods
+## Email + password: real sign-up, real sign-in
 
-`supabase-js` exposes each sign-in method as a method on `supabase.auth`. Email and password is the classic flow. A magic link sends the user a one-time sign-in link by email instead of asking for a password — the user clicks it and is signed in, nothing to type or forget. Phone OTP works the same way but delivers a one-time code by SMS. OAuth hands the user off to a third-party provider (Google, GitHub, and others) and Supabase handles the redirect dance and token exchange for you.
+`supabase-js` exposes each method as a call on `supabase.auth`, but underneath every one of them is a plain HTTP request to GoTrue's own `/auth/v1/*` endpoints — visible directly with `curl` against this course's local stack:
+
+```bash
+# scripts/rls-signup-proof.sh
+curl -s -X POST "$API_URL/auth/v1/signup" \
+  -H "apikey: $ANON_KEY" -H "Content-Type: application/json" \
+  -d '{"email":"rls-alice@example.com","password":"rls-pw-alice-12345"}'
+```
+
+```text
+{"id":"64721d1e-dd1d-4672-bdb0-519dcde3c455","aud":"authenticated","role":"authenticated","email":"rls-alice@example.com","email_confirmed_at":"2026-09-29T04:21:53.558415Z","confirmed_at":"2026-09-29T04:21:53.558415Z","last_sign_in_at":"2026-09-29T04:21:53.560Z","app_metadata":{"provider":"email","providers":["email"]},"user_metadata":{"email_verified":true},"identities":[{"identity_id":"e1c473ec-...","id":"64721d1e-...","user_id":"64721d1e-...","identity_data":{"email":"rls-alice@example.com","email_verified":true,"sub":"64721d1e-..."},"provider":"email"}],"created_at":"2026-09-29T04:21:53.548435Z","updated_at":"2026-09-29T04:21:53.560Z","is_anonymous":false}
+```
+
+Signing in later is a separate endpoint, `/auth/v1/token`, with `grant_type=password`:
+
+```bash
+# scripts/rls-signin-proof.sh
+curl -s -X POST "$API_URL/auth/v1/token?grant_type=password" \
+  -H "apikey: $ANON_KEY" -H "Content-Type: application/json" \
+  -d '{"email":"rls-alice@example.com","password":"rls-pw-alice-12345"}'
+```
+
+```text
+{"access_token":"eyJhbGciOiJFUzI1NiIs...(trimmed)","token_type":"bearer","expires_in":3600,"expires_at":1790659357,"refresh_token":"...(trimmed)","user":{"id":"64721d1e-dd1d-4672-bdb0-519dcde3c455","email":"rls-alice@example.com", "role":"authenticated", "..." : "..."}}
+```
+
+<Callout title="Why the response above has no confirmation step">
+This response includes a real `access_token` immediately — no email confirmation click happened first. That is not a course-only shortcut: the local stack's `supabase/config.toml` has `[auth.email] enable_confirmations = false`, matching how most local development is configured. With `enable_confirmations = true` (the hosted default for a new project), the response to `/auth/v1/signup` still returns a user object, but `email_confirmed_at` is `null` and no session is issued until the user clicks the confirmation link emailed to them — the same email-sending and token-verification mechanism proven with the magic link below, just gating sign-up instead of sign-in.
+</Callout>
+
+## Where the user actually lives: `auth.users` and `auth.identities`
+
+Every sign-up or sign-in, regardless of method, creates or authenticates a row in `auth.users` — a real row, inspected directly:
+
+```text
+=# select id, email, role, aud, email_confirmed_at, created_at, raw_app_meta_data, raw_user_meta_data
+   from auth.users where email = 'rls-alice@example.com';
+                  id                  |         email         |     role      |      aud      |      email_confirmed_at       |          created_at
+--------------------------------------+------------------------+---------------+---------------+--------------------------------+-------------------------------
+ 64721d1e-dd1d-4672-bdb0-519dcde3c455 | rls-alice@example.com | authenticated | authenticated | 2026-09-29 04:21:53.558415+00 | 2026-09-29 04:21:53.548435+00
+```
+
+`raw_app_meta_data` is `{"provider": "email", "providers": ["email"]}` and `raw_user_meta_data` is `{"sub": "64721d1e-...", "email": "rls-alice@example.com", "email_verified": true, "phone_verified": false}` — the metadata `auth.jwt()` surfaces inside RLS policies via `app_metadata`/`user_metadata` claims. A **separate** table, `auth.identities`, tracks which *provider* authenticated this user — one user can have multiple identities (email + GitHub + Google, for instance), each a separate row:
+
+```text
+=# select id, email, provider from auth.identities where user_id = '64721d1e-dd1d-4672-bdb0-519dcde3c455';
+                  id                  |         email         | provider
+--------------------------------------+------------------------+----------
+ e1c473ec-4af4-44d5-8e94-51a1a17a40a0 | rls-alice@example.com | email
+(1 row)
+```
+
+`auth.users` is not meant to be extended directly with app columns — the common pattern is a `public.profiles` table whose primary key references `auth.users(id)`, holding whatever app-specific data Auth itself does not store.
+
+## Magic link / OTP: the real email, end to end
+
+A magic link needs no password — GoTrue emails a one-time sign-in link, and (unlike password sign-up, which skips confirmation entirely on this local config) it **always** sends a real email, captured by the local stack's Mailpit inbox:
+
+```bash
+# scripts/rls-magiclink-request.sh
+curl -s -X POST "$API_URL/auth/v1/otp" -H "apikey: $ANON_KEY" -H "Content-Type: application/json" \
+  -d '{"email":"rls-charlie@example.com"}'
+```
+
+```text
+{}
+```
+
+The request itself returns an empty object — no token, on purpose, since the whole point is that only the email inbox has it. Fetching the real message from Mailpit's own API (`http://127.0.0.1:55324`, found via `supabase status`'s `INBUCKET_URL`/`MAILPIT_URL`):
+
+```bash
+# scripts/rls-magiclink-fetch.sh
+curl -s "http://127.0.0.1:55324/api/v1/messages"
+curl -s "http://127.0.0.1:55324/api/v1/message/<message-id-from-above>"
+```
+
+```text
+Your sign-in link
+-----------------
+Follow the link below to sign in. This link expires shortly and can only be used once.
+Sign in ( http://127.0.0.1:55321/auth/v1/verify?token=8480714a...(trimmed)&type=magiclink&redirect_to=http://127.0.0.1:3000 )
+```
+
+That `/auth/v1/verify?token=...&type=magiclink` link is the entire mechanism: GoTrue generated a one-time token, emailed a URL containing it, and visiting that URL (a `GET`, so it works as a plain email link with no JavaScript) exchanges the token for a real session — the same shape a phone OTP flow uses, except the one-time code is delivered by SMS instead of email and exchanged via `verifyOtp({ phone, token, type: 'sms' })` instead of a clicked link.
+
+## Anonymous sign-ins
+
+An anonymous sign-in creates a real `auth.users` row — `is_anonymous = true`, no email or password at all — useful for letting someone use an app before committing to an account, then linking a real identity later. It is gated by its own config flag, `enable_anonymous_sign_ins`, which is `false` on this course's local stack:
+
+```bash
+# scripts/rls-anon-signin-proof.sh
+curl -s -X POST "$API_URL/auth/v1/signup" -H "apikey: $ANON_KEY" -H "Content-Type: application/json" -d '{}'
+```
+
+```text
+{"code":422,"error_code":"anonymous_provider_disabled","msg":"Anonymous sign-ins are disabled"}
+```
+
+A real, specific error — not a silent no-op — confirming the flag is off rather than the feature being broken. With `enable_anonymous_sign_ins = true`, the identical request (an empty body to `/auth/v1/signup`) returns a full session for a brand-new anonymous user, and `auth.jwt() ->> 'is_anonymous'` reads `"true"` inside RLS policies, letting a policy explicitly exclude anonymous users from write access on real production data ([supabase.com/docs/guides/auth/auth-anonymous](https://supabase.com/docs/guides/auth/auth-anonymous)).
+
+## OAuth providers
+
+OAuth hands the user off to a third-party provider (Google, GitHub, and others) and Supabase handles the redirect dance and token exchange:
 
 ```typescript
-import { createClient } from '@supabase/supabase-js';
-
-const supabase = createClient(
-  process.env.SUPABASE_URL!,
-  process.env.SUPABASE_ANON_KEY!
-);
-
-// Email + password
-const { data, error } = await supabase.auth.signUp({
-  email: 'jane@example.com',
-  password: 'correct-horse-battery-staple',
-});
-
-// Magic link — no password, just a one-time sign-in link emailed to the user
-const { error: otpError } = await supabase.auth.signInWithOtp({
-  email: 'jane@example.com',
-});
-
-// OAuth — Supabase handles the redirect dance with the provider for you
-const { error: oauthError } = await supabase.auth.signInWithOAuth({
+const { error } = await supabase.auth.signInWithOAuth({
   provider: 'github',
 });
 ```
 
-## Where the user actually lives: `auth.users`
+There is no real OAuth provider reachable from this local, credential-free stack — `[auth.external.<provider>]` blocks in `config.toml` are all `enabled = false` locally, and wiring one up needs a real client ID/secret registered with that provider ([supabase.com/docs/guides/auth/social-login](https://supabase.com/docs/guides/auth/social-login)). Mechanically, the result lands in exactly the same two tables proven above: a new `auth.identities` row with `provider = 'github'` (or whichever provider), linked to either a new or an existing `auth.users` row if the returned email matches one already on the account.
 
-Every sign-up or sign-in, regardless of method, creates or authenticates a row in `auth.users`. That table lives in a separate `auth` schema, not `public` — it is managed by Supabase Auth itself and holds only what Auth needs (email, phone, hashed password, provider metadata, and so on). It is not meant to be extended directly with your own app columns.
+## The admin API: service_role can act as GoTrue itself
 
-The common pattern is a `public.profiles` table whose primary key references `auth.users(id)`, holding whatever app-specific data Auth itself does not store — a username, an avatar URL, a subscription tier, anything your product needs.
+`service_role` unlocks an entirely separate set of endpoints under `/auth/v1/admin/*` — the same operations `supabase.auth.admin.*` calls from a trusted server context, never a browser:
 
-```sql
--- public.profiles holds app-specific data auth.users does not store
-create table public.profiles (
-  id uuid primary key references auth.users (id) on delete cascade,
-  username text unique,
-  avatar_url text,
-  created_at timestamptz default now()
-);
+```bash
+# scripts/rls-admin-create-user.sh
+curl -s -X POST "$API_URL/auth/v1/admin/users" \
+  -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" -H "Content-Type: application/json" \
+  -d '{"email":"rls-dave@example.com","password":"rls-pw-dave-123456","email_confirm":true}'
 ```
 
-A trigger on `auth.users` that inserts a matching `public.profiles` row on sign-up is a common way to keep the two in sync, though the details of that trigger are outside this lesson.
+```text
+{"id":"34d3e503-febc-4e37-9d5f-40c91efded40","email":"rls-dave@example.com","email_confirmed_at":"2026-09-29T04:40:50.086462384Z","role":"authenticated"}
+```
+
+`email_confirm: true` creates Dave already confirmed — no email round trip needed at all, useful for seed scripts and admin-created accounts. The same request with the `anon` key instead of `service_role` is rejected outright:
+
+```bash
+curl -s -X POST "$API_URL/auth/v1/admin/users" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY" -H "Content-Type: application/json" \
+  -d '{"email":"rls-eve@example.com","password":"rls-pw-eve-1234567"}'
+```
+
+```text
+{"code":403,"error_code":"not_admin","msg":"User not allowed"}
+```
+
+`supabase.auth.admin.createUser()` in `supabase-js` is a thin wrapper over exactly this endpoint — it only works when the client was constructed with the `service_role` key, which is why it must never run in code that ships to a browser.
+
+## Rate limits (docs)
+
+GoTrue rate-limits every auth endpoint by default, documented with exact numbers ([supabase.com/docs/guides/deployment/going-into-prod#rate-limits](https://supabase.com/docs/guides/deployment/going-into-prod), [supabase.com/docs/guides/auth/rate-limits](https://supabase.com/docs/guides/auth/rate-limits)):
+
+| Endpoint(s) | Limited by | Default |
+| --- | --- | --- |
+| `/auth/v1/signup`, `/auth/v1/recover`, `/auth/v1/user` (email-sending) | combined requests | project's email-sending quota (inbuilt SMTP), configurable with custom SMTP |
+| `/auth/v1/otp` (OTP/magic link send) | combined requests | 360 per hour |
+| `/auth/v1/otp`, `/auth/v1/signup`, `/auth/v1/recover` (repeat request) | last request | 60 second cooldown |
+| `/auth/v1/verify` | IP address | 360/hour, bursts to 30 |
+| `/auth/v1/token` (refresh) | IP address | 1800/hour, bursts to 30 |
+| Anonymous sign-ins | IP address | 30/hour, bursts to 30 |
+
+The local CLI stack's own `config.toml` mirrors this same shape under `[auth.rate_limit]` (`token_refresh = 150`, `anonymous_users = 30` on this probe) — the mechanism is real and always on, even in local dev, just with CLI-friendly defaults rather than the hosted project's.
 
 <Mermaid title="Every sign-in method converges on the same auth.users row" code={authMethodsDiagram} />
 
 export const authMethodsDiagram = `flowchart LR
   user["User"] --> pw["Email + password"]
-  user --> magic["Magic link"]
-  user --> otp["Phone OTP"]
+  user --> magic["Magic link / phone OTP"]
+  user --> anon["Anonymous sign-in"]
   user --> oauth["OAuth provider"]
   pw --> gotrue["Supabase Auth (GoTrue)"]
   magic --> gotrue
-  otp --> gotrue
+  anon --> gotrue
   oauth --> gotrue
-  gotrue --> table[("auth.users row created/matched")]`;
+  gotrue --> table[("auth.users row created/matched")]
+  gotrue --> ident[("auth.identities row per provider")]`;
 
 <Callout title="The one-line takeaway">
-Supabase Auth (**GoTrue**) supports **password**, **magic link**, **phone OTP**, and **OAuth** sign-in out of the box, and no matter which one a user chooses, the result is the same: a row created or matched in **`auth.users`** — a separate `auth` schema you extend by referencing it from your own **`public.profiles`** table rather than editing directly.
+Every Supabase Auth method — **password**, **magic link/OTP**, **anonymous**, **OAuth** — is a plain HTTP call to a real GoTrue server (proved directly with `curl` above) that ends in the same two tables: a matched or created **`auth.users`** row, and one **`auth.identities`** row per provider that has ever authenticated that user. `enable_confirmations`, `enable_anonymous_sign_ins`, and OAuth provider blocks in `config.toml` are real gates, each proven above with its own real error or real email when off/on; the `service_role`-only `/auth/v1/admin/*` endpoints (proved: `anon` gets a real `403 not_admin`) are what `supabase.auth.admin.*` wraps, and rate limits apply to every one of these endpoints by default, locally and hosted alike.
 </Callout>
+
+## Reading AI-generated code
+
+An AI assistant asked to "let an admin panel create user accounts without sending confirmation emails" produced this:
+
+<SpotTheBug lang="ts" code={`// src/lib/admin-users.ts
+import { createClient } from '@supabase/supabase-js';
+
+const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.NEXT_PUBLIC_SUPABASE_SERVICE_ROLE_KEY!
+);
+
+export async function createUserFromAdminPanel(email: string, password: string) {
+  const { data, error } = await supabase.auth.admin.createUser({
+    email,
+    password,
+    email_confirm: true,
+  });
+  if (error) throw error;
+  return data.user;
+}
+`}>
+The `admin.createUser()` call itself is correct — this is exactly the real, proven `/auth/v1/admin/users` endpoint, and it needs `service_role` to work at all. The bug is the env var name: `NEXT_PUBLIC_*` (or any client-exposed prefix — `VITE_*`, `PUBLIC_*`) is bundled straight into the JavaScript shipped to every visitor's browser. This function would only ever be safe running in a server context (a Next.js Server Action, an API route, an Edge Function) — as written, with a `NEXT_PUBLIC_` service_role key, the browser bundle now contains a key proven above to bypass RLS entirely on every table and create/delete/ban any user via the admin API, reachable by anyone who opens devtools. The fix is not a code change to this function at all — it is never letting a service_role key exist under a client-exposed env var name, and calling this function only from a file that never ships to the browser.
+</SpotTheBug>
+
+## Mental Model
+
+Every one of these sign-in methods is really just GoTrue answering one question — "can I create or match a row in `auth.users` for this request, and if so, what should the resulting session's claims be?" — through a different verification mechanism: a password checked against a hash, a one-time token proven by controlling an inbox, a one-time code proven by controlling a phone number, an authorization code proven by a third-party redirect, or (anonymous) no verification at all, just an explicit account created with nothing to verify yet. `auth.identities` exists because "how was this user verified" and "who is this user" are different questions — the same person can prove who they are multiple different ways over time, and every one of those proofs is its own row, all pointing at one `auth.users` row.
+
+## Trade-offs
+
+- **Password sign-in needs no external service and works offline-first (compared to a magic link)** — at the cost of the classic password hygiene burden: strength requirements, breach-list checking, reset flows, all of which the client, GoTrue, and often the user's own habits all have to cooperate on.
+- **Magic link/OTP removes password management entirely** — at the cost of requiring the user actually has access to their inbox or phone *at the moment they try to sign in*, which is a real availability dependency password sign-in does not have.
+- **Anonymous sign-in lets a product delay the signup wall** — at the cost of a real `auth.users` row and session existing for someone who may never convert, plus the app needing an explicit linking flow (`updateUser`/`linkIdentity`) to convert that anonymous account into a real one without losing its data.
+- **The admin API can do anything a superuser-equivalent auth operation needs in one call** — at the cost of being exactly as dangerous as the `service_role` key it requires; there is no finer-grained "admin, but only for user creation" role.
+
+## Common Misconceptions
+
+- **"Every sign-up requires clicking a confirmation email."** Proven false locally: with `enable_confirmations = false`, `/auth/v1/signup` returns a full session immediately, no email involved at all. Confirmation is a configurable gate, not an inherent part of the flow.
+- **"Magic link and OTP are the same mechanism, just email vs SMS."** Close, but the proof and exchange mechanics differ: a magic link is a clickable `GET` URL containing the token baked in; a phone OTP is a short code the user types back in, exchanged via `verifyOtp` — no clickable link, since SMS has no browser context to click into.
+- **"`admin.createUser()` and `signUp()` are interchangeable, just with different names."** `signUp()` is a public, `anon`-key endpoint anyone can call for themselves; `admin.createUser()` requires `service_role` and is meant for a trusted server creating accounts *for* other people — mixing them up (using the admin call reachable from a browser) is a direct path to the SpotTheBug above.
+- **"Anonymous sign-in is the same as not being signed in (like the anon role)."** An anonymous sign-in is a real, distinct `authenticated`-role session with its own `auth.users` row and `is_anonymous: true` — RLS policies see a real `auth.uid()`, unlike a genuinely unauthenticated `anon`-role request.
 
 export const quizAuthenticationMethods = [
   {
-    q: 'Which of these does Supabase Auth support as a built-in sign-in method?',
+    q: 'A real curl POST to /auth/v1/signup on this local stack returns an access_token immediately, with no confirmation email. Why?',
     options: [
-      'Only email and password, nothing else',
-      'Email and password, magic links, phone OTP, and OAuth providers',
-      'Only OAuth providers',
-      'Only phone OTP',
+      'Supabase never requires email confirmation for any project',
+      'The local config.toml has enable_confirmations = false under [auth.email] — a real, inspectable gate, not a hardcoded behavior',
+      'The anon key bypasses confirmation automatically',
+      'Confirmation only applies to magic link sign-ins, never password sign-ups',
     ],
     answer: 1,
+    explain: 'Proved directly by reading config.toml and the real signup response — with enable_confirmations = true (the hosted default for new projects), the same request would return email_confirmed_at: null and no session until the emailed link is clicked.',
   },
   {
-    q: 'What table does Supabase Auth create or update on every sign-up or sign-in?',
+    q: 'What is the relationship between auth.users and auth.identities?',
     options: [
-      'public.users',
-      'auth.users',
-      'public.profiles',
-      'auth.sessions',
+      'They are the same table under two different names',
+      'auth.users is one row per person; auth.identities is one row per (provider, person) pair, since one person can authenticate via multiple providers',
+      'auth.identities replaces auth.users entirely in newer Supabase projects',
+      'auth.identities only exists for OAuth sign-ins, never for email/password',
     ],
     answer: 1,
+    explain: 'Proved live: Alice has one auth.users row and one auth.identities row with provider = "email" — a second identity (e.g. GitHub) would add a second identities row for the same user_id, not a second users row.',
   },
   {
-    q: 'Why is a separate public.profiles table a common pattern instead of storing everything in auth.users?',
+    q: 'Requesting a magic link via /auth/v1/otp returns an empty {} response. Why does it return nothing useful?',
     options: [
-      'auth.users cannot store any data at all',
-      'auth.users is managed by Supabase Auth itself and holds only what Auth needs, so app-specific data belongs in a table you own that references it',
-      'public.profiles is required for OAuth to function',
-      'It has no real benefit, it is just a convention',
+      'The request failed silently',
+      'The token is deliberately only ever delivered via the email itself (proved by fetching the real message from Mailpit) — the API response must not leak it',
+      'Magic links do not actually send an email in local development',
+      'The response always contains the full session token for convenience',
     ],
     answer: 1,
+    explain: 'Proved live: the API call itself returns {}, and the real one-time token only appears inside the actual email fetched from Mailpit\'s own API — leaking it in the API response would defeat the entire "only the inbox owner can sign in" guarantee.',
   },
   {
-    q: 'What does a magic link sign-in avoid needing?',
+    q: 'Anonymous sign-ins are disabled on this local stack. What is the real, specific response to an anonymous sign-in attempt?',
     options: [
-      'An email address',
-      'A password',
-      'An internet connection',
-      'A Supabase project',
+      'A generic network timeout',
+      'A real 422 response with error_code "anonymous_provider_disabled"',
+      'A successful sign-in anyway, since anon key requests are never blocked',
+      'The local stack crashes',
     ],
     answer: 1,
+    explain: 'Proved directly via curl: {"code":422,"error_code":"anonymous_provider_disabled","msg":"Anonymous sign-ins are disabled"} — a specific, real error naming the exact disabled feature, not a generic failure.',
+  },
+  {
+    q: 'Why does calling the /auth/v1/admin/users endpoint with the anon key fail, even though the same call succeeds with service_role?',
+    options: [
+      'The endpoint checks the request body, not the key, for admin privileges',
+      'GoTrue checks the calling role from the key\'s own JWT claim, and only service_role (which carries BYPASSRLS-equivalent admin trust) is allowed to reach /auth/v1/admin/*',
+      'anon requests are rate-limited more aggressively, causing the failure',
+      'The endpoint only works over HTTPS, not local HTTP',
+    ],
+    answer: 1,
+    explain: 'Proved live: the identical request with anon returns {"code":403,"error_code":"not_admin"} — the admin API is gated on the role claim itself, exactly like RLS\'s own service_role bypass in the earlier lesson.',
+  },
+  {
+    q: 'What makes a NEXT_PUBLIC_SUPABASE_SERVICE_ROLE_KEY environment variable a critical security bug, as opposed to just an unconventional naming choice?',
+    options: [
+      'It is purely a style issue with no functional effect',
+      'The NEXT_PUBLIC_ prefix causes the value to be bundled into client-side JavaScript, shipping a key that bypasses RLS and unlocks the admin API to every visitor\'s browser',
+      'It only matters if the app is deployed to Vercel specifically',
+      'NEXT_PUBLIC_ variables are automatically encrypted at build time, so this is actually safe',
+    ],
+    answer: 1,
+    explain: 'Proved in this lesson that service_role unlocks the full admin API (create/ban/delete any user) and RLS-bypassing table access — a client-exposed env var prefix ships that exact key to every browser that loads the page.',
   },
 ];
 

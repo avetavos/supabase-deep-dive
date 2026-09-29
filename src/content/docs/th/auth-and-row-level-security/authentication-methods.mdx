@@ -1,6 +1,6 @@
 ---
 title: 'Authentication Methods'
-description: 'วิธี sign-in ที่ Supabase Auth รองรับมาให้เลย ตั้งแต่ email กับ password, magic link, phone OTP ไปจนถึง OAuth provider'
+description: 'วิธี sign-in ที่ Supabase Auth รองรับมาให้เลย ตั้งแต่ email กับ password, magic link, phone OTP, anonymous sign-in ไปจนถึง OAuth provider — พิสูจน์จริงกับ GoTrue server บน local stack'
 sidebar:
   order: 1
 ---
@@ -8,116 +8,298 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
 
-Supabase Auth สร้างขึ้นบน **GoTrue** server แบบ open-source และรองรับวิธีพิสูจน์ตัวตนของ user หลายแบบ — password, magic link, phone OTP หรือ OAuth — และทุกวิธีจบลงที่จุดเดียวกันคือ row ที่ถูกสร้างหรือ match ใน table `auth.users` ที่มีมาให้
+Supabase Auth สร้างขึ้นบน **GoTrue** server แบบ open-source และรองรับวิธีพิสูจน์ตัวตนของ user หลายแบบ — password, magic link, phone OTP, anonymous หรือ OAuth — และทุกวิธีจบลงที่จุดเดียวกันคือ row ที่ถูกสร้างหรือ match ใน table `auth.users` ที่มีมาให้
 
-## วิธี sign-in หลัก ๆ
+## Email + password: sign-up จริง, sign-in จริง
 
-`supabase-js` เปิด method สำหรับแต่ละวิธี sign-in ไว้ที่ `supabase.auth` แบบ email กับ password คือ flow คลาสสิก ส่วน magic link จะส่งลิงก์ sign-in แบบใช้ครั้งเดียวไปทาง email แทนการถาม password — user กดลิงก์แล้ว sign-in เข้าได้เลย ไม่ต้องพิมพ์หรือกลัวลืม phone OTP ทำงานคล้ายกันแต่ส่งรหัสแบบใช้ครั้งเดียวผ่าน SMS แทน ส่วน OAuth จะส่ง user ไปให้ third-party provider (Google, GitHub และอื่น ๆ) จัดการ และ Supabase ดูแลขั้นตอน redirect กับการแลก token ให้ทั้งหมด
+`supabase-js` เปิด method แต่ละอันไว้ที่ `supabase.auth` แต่ข้างใต้ทุกอันคือ HTTP request ธรรมดาไปที่ endpoint `/auth/v1/*` ของ GoTrue เอง — เห็นได้ตรง ๆ ด้วย `curl` กับ local stack ของคอร์สนี้:
+
+```bash
+# scripts/rls-signup-proof.sh
+curl -s -X POST "$API_URL/auth/v1/signup" \
+  -H "apikey: $ANON_KEY" -H "Content-Type: application/json" \
+  -d '{"email":"rls-alice@example.com","password":"rls-pw-alice-12345"}'
+```
+
+```text
+{"id":"64721d1e-dd1d-4672-bdb0-519dcde3c455","aud":"authenticated","role":"authenticated","email":"rls-alice@example.com","email_confirmed_at":"2026-09-29T04:21:53.558415Z","confirmed_at":"2026-09-29T04:21:53.558415Z","last_sign_in_at":"2026-09-29T04:21:53.560Z","app_metadata":{"provider":"email","providers":["email"]},"user_metadata":{"email_verified":true},"identities":[{"identity_id":"e1c473ec-...","id":"64721d1e-...","user_id":"64721d1e-...","identity_data":{"email":"rls-alice@example.com","email_verified":true,"sub":"64721d1e-..."},"provider":"email"}],"created_at":"2026-09-29T04:21:53.548435Z","updated_at":"2026-09-29T04:21:53.560Z","is_anonymous":false}
+```
+
+sign-in ทีหลังเป็น endpoint คนละอัน `/auth/v1/token` ด้วย `grant_type=password`:
+
+```bash
+# scripts/rls-signin-proof.sh
+curl -s -X POST "$API_URL/auth/v1/token?grant_type=password" \
+  -H "apikey: $ANON_KEY" -H "Content-Type: application/json" \
+  -d '{"email":"rls-alice@example.com","password":"rls-pw-alice-12345"}'
+```
+
+```text
+{"access_token":"eyJhbGciOiJFUzI1NiIs...(trimmed)","token_type":"bearer","expires_in":3600,"expires_at":1790659357,"refresh_token":"...(trimmed)","user":{"id":"64721d1e-dd1d-4672-bdb0-519dcde3c455","email":"rls-alice@example.com", "role":"authenticated", "..." : "..."}}
+```
+
+<Callout title="ทำไม response ข้างบนไม่มีขั้นตอนยืนยัน">
+response นี้มี `access_token` จริงกลับมาทันที — ไม่มีการกดยืนยัน email เลย นี่ไม่ใช่ทางลัดของคอร์สเท่านั้น: `supabase/config.toml` ของ local stack ตั้ง `[auth.email] enable_confirmations = false` ตรงกับที่ local development ส่วนใหญ่ตั้งค่าไว้ ถ้า `enable_confirmations = true` (ค่า default ของ project ใหม่บน hosted) response ของ `/auth/v1/signup` จะยังคืน user object แต่ `email_confirmed_at` จะเป็น `null` และไม่มี session ออกให้จนกว่า user จะกดลิงก์ยืนยันที่ส่งไปทาง email — กลไกส่ง email กับตรวจ token แบบเดียวกับที่พิสูจน์ด้วย magic link ด้านล่าง แค่คุม sign-up แทน sign-in
+</Callout>
+
+## user จริง ๆ อยู่ที่ไหน: `auth.users` กับ `auth.identities`
+
+ไม่ว่าจะ sign-up หรือ sign-in ด้วยวิธีไหนก็ตาม ผลลัพธ์คือ row ใน `auth.users` ถูกสร้างหรือใช้ยืนยันตัวตน ตรวจสอบ row จริงตรง ๆ:
+
+```text
+=# select id, email, role, aud, email_confirmed_at, created_at, raw_app_meta_data, raw_user_meta_data
+   from auth.users where email = 'rls-alice@example.com';
+                  id                  |         email         |     role      |      aud      |      email_confirmed_at       |          created_at
+--------------------------------------+------------------------+---------------+---------------+--------------------------------+-------------------------------
+ 64721d1e-dd1d-4672-bdb0-519dcde3c455 | rls-alice@example.com | authenticated | authenticated | 2026-09-29 04:21:53.558415+00 | 2026-09-29 04:21:53.548435+00
+```
+
+`raw_app_meta_data` คือ `{"provider": "email", "providers": ["email"]}` และ `raw_user_meta_data` คือ `{"sub": "64721d1e-...", "email": "rls-alice@example.com", "email_verified": true, "phone_verified": false}` — metadata พวกนี้คือสิ่งที่ `auth.jwt()` เอามาให้ RLS policy อ่านผ่าน claim `app_metadata`/`user_metadata` table **แยกต่างหาก** คือ `auth.identities` เก็บว่า *provider* ไหนยืนยันตัวตน user คนนี้ — user คนเดียวมีได้หลาย identity (email + GitHub + Google เป็นต้น) แต่ละอันเป็น row แยกกัน:
+
+```text
+=# select id, email, provider from auth.identities where user_id = '64721d1e-dd1d-4672-bdb0-519dcde3c455';
+                  id                  |         email         | provider
+--------------------------------------+------------------------+----------
+ e1c473ec-4af4-44d5-8e94-51a1a17a40a0 | rls-alice@example.com | email
+(1 row)
+```
+
+`auth.users` ไม่ได้ออกแบบมาให้เพิ่ม column ของแอปเข้าไปตรง ๆ — pattern ที่นิยมคือ table `public.profiles` ที่ primary key อ้างอิงกลับไปที่ `auth.users(id)` เก็บข้อมูลเฉพาะของแอปที่ Auth เองไม่เก็บให้
+
+## Magic link / OTP: email จริง ครบทุกขั้นตอน
+
+magic link ไม่ต้องใช้ password เลย — GoTrue ส่ง sign-in link แบบใช้ครั้งเดียวทาง email และ (ต่างจาก password sign-up ที่ข้ามการยืนยันไปเลยบน config นี้) มัน **ส่ง email จริงเสมอ** ถูกจับไว้ที่ Mailpit inbox ของ local stack:
+
+```bash
+# scripts/rls-magiclink-request.sh
+curl -s -X POST "$API_URL/auth/v1/otp" -H "apikey: $ANON_KEY" -H "Content-Type: application/json" \
+  -d '{"email":"rls-charlie@example.com"}'
+```
+
+```text
+{}
+```
+
+request เองคืน object ว่างเปล่า — ไม่มี token เลย ตั้งใจแบบนั้น เพราะประเด็นทั้งหมดคือมีแค่ inbox เท่านั้นที่มี token จริง ดึง message จริงจาก API ของ Mailpit เอง (`http://127.0.0.1:55324` หาได้จาก `INBUCKET_URL`/`MAILPIT_URL` ของ `supabase status`):
+
+```bash
+# scripts/rls-magiclink-fetch.sh
+curl -s "http://127.0.0.1:55324/api/v1/messages"
+curl -s "http://127.0.0.1:55324/api/v1/message/<message-id-from-above>"
+```
+
+```text
+Your sign-in link
+-----------------
+Follow the link below to sign in. This link expires shortly and can only be used once.
+Sign in ( http://127.0.0.1:55321/auth/v1/verify?token=8480714a...(trimmed)&type=magiclink&redirect_to=http://127.0.0.1:3000 )
+```
+
+ลิงก์ `/auth/v1/verify?token=...&type=magiclink` นั้นคือกลไกทั้งหมด: GoTrue สร้าง token แบบใช้ครั้งเดียว ส่ง URL ที่มี token ฝังอยู่ทาง email และการเปิด URL นั้น (เป็น `GET` เลยทำงานได้แม้เป็นลิงก์ email ธรรมดาไม่ต้องมี JavaScript) จะแลก token เป็น session จริง — หน้าตาเดียวกับ phone OTP flow เป๊ะ ต่างกันแค่รหัสแบบใช้ครั้งเดียวถูกส่งทาง SMS แทน email และแลกด้วย `verifyOtp({ phone, token, type: 'sms' })` แทนการกดลิงก์
+
+## Anonymous sign-ins
+
+anonymous sign-in สร้าง row จริงใน `auth.users` — `is_anonymous = true` ไม่มี email หรือ password เลย มีประโยชน์สำหรับให้คนใช้แอปได้ก่อนตัดสินใจสมัครสมาชิกจริง แล้วค่อยผูก identity จริงทีหลัง มันถูกคุมด้วย config flag ของตัวเอง `enable_anonymous_sign_ins` ซึ่งเป็น `false` บน local stack ของคอร์สนี้:
+
+```bash
+# scripts/rls-anon-signin-proof.sh
+curl -s -X POST "$API_URL/auth/v1/signup" -H "apikey: $ANON_KEY" -H "Content-Type: application/json" -d '{}'
+```
+
+```text
+{"code":422,"error_code":"anonymous_provider_disabled","msg":"Anonymous sign-ins are disabled"}
+```
+
+error จริง เฉพาะเจาะจง — ไม่ใช่การเงียบไม่ทำอะไร ยืนยันว่า flag ถูกปิดไว้ ไม่ใช่ฟีเจอร์พัง ถ้า `enable_anonymous_sign_ins = true` request เดียวกันเป๊ะ (body ว่างไปที่ `/auth/v1/signup`) จะคืน session เต็มสำหรับ anonymous user คนใหม่ และ `auth.jwt() ->> 'is_anonymous'` จะอ่านได้ `"true"` ภายใน RLS policy ทำให้ policy กันไม่ให้ anonymous user เขียนข้อมูล production จริงได้อย่างชัดเจน ([supabase.com/docs/guides/auth/auth-anonymous](https://supabase.com/docs/guides/auth/auth-anonymous))
+
+## OAuth providers
+
+OAuth ส่ง user ไปให้ third-party provider (Google, GitHub และอื่น ๆ) จัดการ และ Supabase ดูแลขั้นตอน redirect กับการแลก token ให้ทั้งหมด:
 
 ```typescript
-import { createClient } from '@supabase/supabase-js';
-
-const supabase = createClient(
-  process.env.SUPABASE_URL!,
-  process.env.SUPABASE_ANON_KEY!
-);
-
-// Email + password
-const { data, error } = await supabase.auth.signUp({
-  email: 'jane@example.com',
-  password: 'correct-horse-battery-staple',
-});
-
-// Magic link — no password, just a one-time sign-in link emailed to the user
-const { error: otpError } = await supabase.auth.signInWithOtp({
-  email: 'jane@example.com',
-});
-
-// OAuth — Supabase handles the redirect dance with the provider for you
-const { error: oauthError } = await supabase.auth.signInWithOAuth({
+const { error } = await supabase.auth.signInWithOAuth({
   provider: 'github',
 });
 ```
 
-## user จริง ๆ อยู่ที่ไหน: `auth.users`
+ไม่มี OAuth provider จริงให้เข้าถึงได้จาก local stack ที่ไม่มี credential นี้เลย — block `[auth.external.<provider>]` ใน `config.toml` ทั้งหมด `enabled = false` บน local และการต่อสายจริงต้องมี client ID/secret จริงที่ลงทะเบียนกับ provider นั้น ๆ ([supabase.com/docs/guides/auth/social-login](https://supabase.com/docs/guides/auth/social-login)) ในทางกลไก ผลลัพธ์ลงเอยที่ table เดียวกันสองใบที่พิสูจน์แล้วข้างบนเป๊ะ: row ใหม่ใน `auth.identities` ที่ `provider = 'github'` (หรือ provider ไหนก็ตาม) ผูกกับ `auth.users` row ใหม่หรือที่มีอยู่แล้ว ถ้า email ที่ได้กลับมาตรงกับ account ที่มีอยู่แล้ว
 
-ไม่ว่าจะ sign-up หรือ sign-in ด้วยวิธีไหนก็ตาม ผลลัพธ์คือ row ใน `auth.users` ถูกสร้างหรือถูกใช้ยืนยันตัวตน table นี้อยู่ใน schema แยกต่างหากชื่อ `auth` ไม่ใช่ `public` — Supabase Auth จัดการ table นี้เองและเก็บแค่สิ่งที่ Auth ต้องใช้ (email, phone, password ที่ hash แล้ว, ข้อมูล provider และอื่น ๆ) ไม่ได้ออกแบบมาให้เพิ่ม column ของแอปเราเข้าไปตรง ๆ
+## Admin API: service_role ทำตัวแทน GoTrue เองได้
 
-pattern ที่พบบ่อยคือ table `public.profiles` ที่ primary key อ้างอิงกลับไปที่ `auth.users(id)` เก็บข้อมูลเฉพาะของแอปที่ Auth เองไม่เก็บให้ — username, avatar URL, subscription tier หรืออะไรก็ตามที่โปรดักต์ต้องการ
+`service_role` เปิด endpoint อีกชุดแยกต่างหากใต้ `/auth/v1/admin/*` — operation เดียวกับที่ `supabase.auth.admin.*` เรียกจาก server context ที่เชื่อถือได้เท่านั้น ไม่ใช่ browser:
 
-```sql
--- public.profiles holds app-specific data auth.users does not store
-create table public.profiles (
-  id uuid primary key references auth.users (id) on delete cascade,
-  username text unique,
-  avatar_url text,
-  created_at timestamptz default now()
-);
+```bash
+# scripts/rls-admin-create-user.sh
+curl -s -X POST "$API_URL/auth/v1/admin/users" \
+  -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" -H "Content-Type: application/json" \
+  -d '{"email":"rls-dave@example.com","password":"rls-pw-dave-123456","email_confirm":true}'
 ```
 
-trigger บน `auth.users` ที่ insert row `public.profiles` ที่ match กันตอน sign-up คือวิธีที่นิยมใช้เพื่อให้สอง table ตรงกันเสมอ แต่รายละเอียดของ trigger นั้นอยู่นอกเหนือบทนี้
+```text
+{"id":"34d3e503-febc-4e37-9d5f-40c91efded40","email":"rls-dave@example.com","email_confirmed_at":"2026-09-29T04:40:50.086462384Z","role":"authenticated"}
+```
 
-<Mermaid title="Every sign-in method converges on the same auth.users row" code={authMethodsDiagram} />
+`email_confirm: true` สร้าง Dave ให้ยืนยันแล้วเลย — ไม่ต้องผ่าน email เลยแม้แต่นิดเดียว มีประโยชน์สำหรับ seed script และ account ที่ admin สร้างเอง request เดียวกันเป๊ะแต่ใช้ key `anon` แทน `service_role` จะถูกปฏิเสธตรง ๆ:
+
+```bash
+curl -s -X POST "$API_URL/auth/v1/admin/users" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY" -H "Content-Type: application/json" \
+  -d '{"email":"rls-eve@example.com","password":"rls-pw-eve-1234567"}'
+```
+
+```text
+{"code":403,"error_code":"not_admin","msg":"User not allowed"}
+```
+
+`supabase.auth.admin.createUser()` ใน `supabase-js` เป็น wrapper บาง ๆ ทับ endpoint นี้เป๊ะ — ทำงานได้ก็ต่อเมื่อ client ถูกสร้างด้วย key `service_role` เท่านั้น นี่คือเหตุผลที่มันต้องไม่รันในโค้ดที่ส่งไปถึง browser เด็ดขาด
+
+## Rate limits (docs)
+
+GoTrue ตั้ง rate limit ให้ทุก auth endpoint โดย default พร้อมตัวเลขจริง ([supabase.com/docs/guides/deployment/going-into-prod#rate-limits](https://supabase.com/docs/guides/deployment/going-into-prod), [supabase.com/docs/guides/auth/rate-limits](https://supabase.com/docs/guides/auth/rate-limits)):
+
+| Endpoint(s) | จำกัดตาม | ค่า default |
+| --- | --- | --- |
+| `/auth/v1/signup`, `/auth/v1/recover`, `/auth/v1/user` (ส่ง email) | รวม request ทั้งหมด | โควต้าส่ง email ของ project (inbuilt SMTP) ปรับได้ด้วย custom SMTP |
+| `/auth/v1/otp` (ส่ง OTP/magic link) | รวม request ทั้งหมด | 360 ครั้งต่อชั่วโมง |
+| `/auth/v1/otp`, `/auth/v1/signup`, `/auth/v1/recover` (ส่งซ้ำ) | request ล่าสุด | cooldown 60 วินาที |
+| `/auth/v1/verify` | IP address | 360/ชั่วโมง burst ได้ถึง 30 |
+| `/auth/v1/token` (refresh) | IP address | 1800/ชั่วโมง burst ได้ถึง 30 |
+| Anonymous sign-ins | IP address | 30/ชั่วโมง burst ได้ถึง 30 |
+
+`config.toml` ของ local CLI stack เองก็สะท้อนรูปแบบเดียวกันนี้ใต้ `[auth.rate_limit]` (`token_refresh = 150`, `anonymous_users = 30` บน probe นี้) — กลไกเป็นของจริงและเปิดใช้เสมอ แม้ใน local dev ก็ตาม แค่ default ต่างจากของ hosted project เพราะเป็นค่าที่เหมาะกับ CLI
+
+<Mermaid title="ทุกวิธี sign-in ลงเอยที่ auth.users row เดียวกัน" code={authMethodsDiagram} />
 
 export const authMethodsDiagram = `flowchart LR
   user["User"] --> pw["Email + password"]
-  user --> magic["Magic link"]
-  user --> otp["Phone OTP"]
+  user --> magic["Magic link / phone OTP"]
+  user --> anon["Anonymous sign-in"]
   user --> oauth["OAuth provider"]
   pw --> gotrue["Supabase Auth (GoTrue)"]
   magic --> gotrue
-  otp --> gotrue
+  anon --> gotrue
   oauth --> gotrue
-  gotrue --> table[("auth.users row created/matched")]`;
+  gotrue --> table[("auth.users row created/matched")]
+  gotrue --> ident[("auth.identities row per provider")]`;
 
 <Callout title="สรุปหนึ่งบรรทัด">
-Supabase Auth (**GoTrue**) รองรับ sign-in แบบ **password**, **magic link**, **phone OTP** และ **OAuth** มาให้เลย ไม่ว่า user จะเลือกวิธีไหน ผลลัพธ์เหมือนกันคือ row ที่ถูกสร้างหรือ match ใน **`auth.users`** — schema `auth` แยกต่างหากที่คุณต่อยอดด้วยการอ้างอิงจาก table **`public.profiles`** ของตัวเอง แทนที่จะไปแก้ `auth.users` ตรง ๆ
+ทุกวิธีของ Supabase Auth — **password**, **magic link/OTP**, **anonymous**, **OAuth** — คือ HTTP call ธรรมดาไปที่ GoTrue server จริง (พิสูจน์ตรง ๆ ด้วย `curl` ข้างบน) ที่ลงเอยที่ table เดียวกันสองใบเสมอ: row **`auth.users`** ที่ match หรือถูกสร้าง และ row **`auth.identities`** หนึ่งอันต่อ provider ที่เคยยืนยันตัวตน user คนนั้น `enable_confirmations`, `enable_anonymous_sign_ins` และ block ของ OAuth provider ใน `config.toml` คือ gate จริง แต่ละอันพิสูจน์แล้วด้วย error จริงหรือ email จริงของตัวเองตอนปิด/เปิด endpoint `/auth/v1/admin/*` ที่ต้องใช้ `service_role` เท่านั้น (พิสูจน์แล้ว: `anon` ได้ `403 not_admin` จริง) คือสิ่งที่ `supabase.auth.admin.*` ห่ออยู่ และ rate limit ใช้กับทุก endpoint พวกนี้โดย default ทั้ง local และ hosted
 </Callout>
+
+## อ่านโค้ดที่ AI สร้าง
+
+AI assistant ถูกขอให้ "ให้ admin panel สร้าง user account ได้โดยไม่ต้องส่ง email ยืนยัน" แล้วสร้างโค้ดนี้มา:
+
+<SpotTheBug lang="ts" code={`// src/lib/admin-users.ts
+import { createClient } from '@supabase/supabase-js';
+
+const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.NEXT_PUBLIC_SUPABASE_SERVICE_ROLE_KEY!
+);
+
+export async function createUserFromAdminPanel(email: string, password: string) {
+  const { data, error } = await supabase.auth.admin.createUser({
+    email,
+    password,
+    email_confirm: true,
+  });
+  if (error) throw error;
+  return data.user;
+}
+`}>
+การเรียก `admin.createUser()` เองถูกต้อง — นี่คือ endpoint `/auth/v1/admin/users` จริงที่พิสูจน์แล้วข้างบนเป๊ะ และต้องใช้ `service_role` ถึงจะทำงานได้ บั๊กอยู่ที่ชื่อ env var: `NEXT_PUBLIC_*` (หรือ prefix ที่ expose ให้ client แบบไหนก็ตาม — `VITE_*`, `PUBLIC_*`) จะถูก bundle เข้าไปใน JavaScript ที่ส่งให้ผู้เข้าชมทุกคนตรง ๆ function นี้ปลอดภัยแค่ตอนรันใน server context เท่านั้น (Next.js Server Action, API route, Edge Function) — ตามที่เขียนไว้ พร้อม `NEXT_PUBLIC_` service_role key ตัว browser bundle จะมี key ที่พิสูจน์แล้วข้างบนว่าข้าม RLS ได้ทุก table และเปิด admin API สร้าง/ลบ/แบน user ไหนก็ได้ ให้ทุกคนที่เปิด devtools เข้าถึงได้ ทางแก้ไม่ใช่การแก้โค้ดของ function นี้เลย — คือห้ามให้ service_role key อยู่ใต้ชื่อ env var ที่ expose ให้ client เด็ดขาด และเรียก function นี้จากไฟล์ที่ไม่ส่งไปถึง browser เท่านั้น
+</SpotTheBug>
+
+## Mental Model
+
+ทุกวิธี sign-in พวกนี้คือ GoTrue กำลังตอบคำถามเดียวกันจริง ๆ — "ฉันสร้างหรือ match row ใน `auth.users` ให้ request นี้ได้ไหม และถ้าได้ claims ของ session ที่ได้ควรเป็นอะไร" — ผ่านกลไกยืนยันตัวตนคนละแบบ: password ที่เช็คกับ hash, token แบบใช้ครั้งเดียวที่พิสูจน์ด้วยการควบคุม inbox, รหัสแบบใช้ครั้งเดียวที่พิสูจน์ด้วยการควบคุมเบอร์โทร, authorization code ที่พิสูจน์ด้วยการ redirect จาก third-party หรือ (anonymous) ไม่ต้องยืนยันอะไรเลย แค่สร้าง account ที่ยังไม่มีอะไรให้ยืนยัน `auth.identities` มีอยู่เพราะ "user คนนี้ถูกยืนยันตัวตนยังไง" กับ "user คนนี้คือใคร" เป็นคำถามคนละคำถาม — คนเดียวกันพิสูจน์ตัวตนได้หลายแบบต่างเวลากัน และการพิสูจน์แต่ละแบบเป็น row ของตัวเอง ทั้งหมดชี้ไปที่ `auth.users` row เดียวกัน
+
+## Trade-offs
+
+- **Password sign-in ไม่ต้องพึ่ง service ภายนอกและใช้ offline-first ได้ (เทียบกับ magic link)** — แลกกับภาระ password hygiene แบบคลาสสิก: ข้อกำหนดความแข็งแรง, การเช็ค breach-list, flow reset ที่ต้องให้ client, GoTrue และนิสัยของ user เองร่วมมือกันทั้งหมด
+- **Magic link/OTP ตัด password management ออกไปทั้งหมด** — แลกกับการต้องพึ่ง inbox หรือเบอร์โทรที่ user เข้าถึงได้ *ตอนที่พยายาม sign-in จริง ๆ* ซึ่งเป็น dependency ด้าน availability ที่ password sign-in ไม่มี
+- **Anonymous sign-in ทำให้โปรดักต์เลื่อนกำแพง signup ออกไปได้** — แลกกับ row และ session จริงใน `auth.users` ที่มีอยู่สำหรับคนที่อาจไม่เคย convert เลย บวกกับแอปต้องมี flow ผูก account ชัดเจน (`updateUser`/`linkIdentity`) เพื่อแปลง anonymous account เป็น account จริงโดยไม่เสียข้อมูล
+- **Admin API ทำ auth operation ระดับ superuser ได้ทุกอย่างในเรียกเดียว** — แลกกับความอันตรายพอ ๆ กับ key `service_role` ที่มันต้องใช้ ไม่มี role แบบละเอียดกว่านี้เช่น "admin แต่สร้าง user ได้อย่างเดียว"
+
+## Common Misconceptions
+
+- **"ทุก sign-up ต้องกดยืนยัน email เสมอ"** พิสูจน์แล้วว่าไม่จริงบน local: พอ `enable_confirmations = false`, `/auth/v1/signup` คืน session เต็มทันที ไม่มี email เข้ามาเกี่ยวเลย การยืนยันเป็น gate ที่ตั้งค่าได้ ไม่ใช่ส่วนที่ติดมากับ flow เสมอ
+- **"Magic link กับ OTP คือกลไกเดียวกัน ต่างกันแค่ email กับ SMS"** ใกล้เคียงแต่กลไกพิสูจน์และแลกต่างกันจริง: magic link คือ URL แบบ `GET` ที่กดได้ มี token ฝังอยู่ในตัว; phone OTP คือรหัสสั้น ๆ ที่ user พิมพ์กลับมา แลกด้วย `verifyOtp` — ไม่มีลิงก์ให้กด เพราะ SMS ไม่มี browser context ให้กด
+- **"`admin.createUser()` กับ `signUp()` ใช้แทนกันได้ แค่ชื่อต่างกัน"** `signUp()` เป็น endpoint public ที่ใช้ key `anon` ใครก็เรียกให้ตัวเองได้; `admin.createUser()` ต้องใช้ `service_role` และตั้งใจให้ server ที่เชื่อถือได้สร้าง account *ให้คนอื่น* — เอาสองอันมาสับสนกัน (เรียก admin call จาก browser ได้) คือทางตรงไปสู่ SpotTheBug ข้างบนเป๊ะ
+- **"Anonymous sign-in เหมือนกับการไม่ signed-in เลย (แบบ role anon)"** anonymous sign-in คือ session role `authenticated` จริง แยกต่างหาก มี `auth.users` row ของตัวเองและ `is_anonymous: true` — RLS policy เห็น `auth.uid()` จริง ต่างจาก request ที่ role `anon` แบบไม่ signed-in เลยจริง ๆ
 
 export const quizAuthenticationMethods = [
   {
-    q: 'ข้อใดคือวิธี sign-in ที่ Supabase Auth รองรับมาให้เลย',
+    q: 'curl POST ไปที่ /auth/v1/signup จริงบน local stack คืน access_token กลับมาทันที ไม่มี email ยืนยันเลย ทำไม',
     options: [
-      'มีแค่ email กับ password เท่านั้น',
-      'Email กับ password, magic link, phone OTP และ OAuth provider',
-      'มีแค่ OAuth provider เท่านั้น',
-      'มีแค่ phone OTP เท่านั้น',
+      'Supabase ไม่เคยบังคับยืนยัน email เลยไม่ว่า project ไหน',
+      'config.toml ของ local ตั้ง enable_confirmations = false ใต้ [auth.email] — gate จริงที่ตรวจสอบได้ ไม่ใช่พฤติกรรม hardcode',
+      'key anon ข้ามการยืนยันอัตโนมัติ',
+      'การยืนยันใช้แค่กับ magic link sign-in เท่านั้น ไม่เกี่ยวกับ password sign-up',
     ],
     answer: 1,
+    explain: 'พิสูจน์ตรง ๆ ด้วยการอ่าน config.toml กับ response จริงของ signup — ถ้า enable_confirmations = true (default ของ project ใหม่บน hosted) request เดียวกันจะคืน email_confirmed_at: null และไม่มี session จนกว่าจะกดลิงก์ที่ส่งไปทาง email',
   },
   {
-    q: 'Supabase Auth สร้างหรืออัปเดต table ไหนทุกครั้งที่มีการ sign-up หรือ sign-in',
+    q: 'ความสัมพันธ์ระหว่าง auth.users กับ auth.identities คืออะไร',
     options: [
-      'public.users',
-      'auth.users',
-      'public.profiles',
-      'auth.sessions',
+      'เป็น table เดียวกัน แค่ชื่อต่างกันสองชื่อ',
+      'auth.users คือหนึ่ง row ต่อคน; auth.identities คือหนึ่ง row ต่อคู่ (provider, คน) เพราะคนเดียวกันยืนยันตัวตนผ่านหลาย provider ได้',
+      'auth.identities มาแทน auth.users ทั้งหมดใน Supabase project ใหม่',
+      'auth.identities มีอยู่แค่สำหรับ OAuth sign-in เท่านั้น ไม่มีสำหรับ email/password',
     ],
     answer: 1,
+    explain: 'พิสูจน์จริง: Alice มี auth.users row เดียวและ auth.identities row เดียวที่ provider = "email" — identity ที่สอง (เช่น GitHub) จะเพิ่ม identities row ที่สองสำหรับ user_id เดียวกัน ไม่ใช่ users row ที่สอง',
   },
   {
-    q: 'ทำไม table public.profiles แยกต่างหากถึงเป็น pattern ที่นิยม แทนที่จะเก็บทุกอย่างไว้ใน auth.users',
+    q: 'ขอ magic link ผ่าน /auth/v1/otp คืน response {} ว่างเปล่า ทำไมไม่มีอะไรที่ใช้ได้เลย',
     options: [
-      'auth.users เก็บข้อมูลอะไรไม่ได้เลย',
-      'auth.users ถูกจัดการโดย Supabase Auth เองและเก็บแค่สิ่งที่ Auth ต้องใช้ ข้อมูลเฉพาะของแอปจึงควรอยู่ใน table ที่เราคุมเองและอ้างอิงกลับไป',
-      'public.profiles จำเป็นต่อการทำงานของ OAuth',
-      'ไม่มีประโยชน์จริงจัง เป็นแค่ธรรมเนียมปฏิบัติ',
+      'request พังแบบเงียบ ๆ',
+      'token ถูกส่งทาง email เท่านั้นโดยตั้งใจ (พิสูจน์ด้วยการดึง message จริงจาก Mailpit) — response ของ API ต้องไม่รั่ว token ออกมา',
+      'magic link ไม่ได้ส่ง email จริงตอน local development',
+      'response มี session token เต็มติดมาด้วยเพื่อความสะดวกเสมอ',
     ],
     answer: 1,
+    explain: 'พิสูจน์จริง: การเรียก API เองคืน {} และ token แบบใช้ครั้งเดียวจริงโผล่แค่ใน email จริงที่ดึงจาก API ของ Mailpit เท่านั้น — ถ้ารั่วออกมาใน response ของ API จะทำลายการันตี "มีแค่คนที่เข้า inbox ได้เท่านั้นที่ sign-in ได้" ทั้งหมด',
   },
   {
-    q: 'Magic link sign-in ช่วยให้ไม่ต้องใช้อะไร',
+    q: 'Anonymous sign-in ถูกปิดบน local stack นี้ response จริงเฉพาะเจาะจงตอนพยายาม anonymous sign-in คืออะไร',
     options: [
-      'email address',
-      'password',
-      'การเชื่อมต่ออินเทอร์เน็ต',
-      'Supabase project',
+      'network timeout ทั่วไป',
+      'response 422 จริงพร้อม error_code "anonymous_provider_disabled"',
+      'sign-in สำเร็จอยู่ดี เพราะ request ด้วย key anon ไม่เคยถูกบล็อก',
+      'local stack crash',
     ],
     answer: 1,
+    explain: 'พิสูจน์ตรง ๆ ผ่าน curl: {"code":422,"error_code":"anonymous_provider_disabled","msg":"Anonymous sign-ins are disabled"} — error จริง เฉพาะเจาะจง ระบุฟีเจอร์ที่ปิดตรง ๆ ไม่ใช่ความล้มเหลวทั่วไป',
+  },
+  {
+    q: 'ทำไมการเรียก endpoint /auth/v1/admin/users ด้วย key anon ถึง fail ทั้งที่ request เดียวกันสำเร็จด้วย service_role',
+    options: [
+      'endpoint เช็ค request body ไม่ได้เช็ค key สำหรับสิทธิ์ admin',
+      'GoTrue เช็ค role ที่เรียกจาก claim ของ JWT ใน key เอง มีแค่ service_role เท่านั้น (ที่มี trust ระดับ admin เทียบเท่า BYPASSRLS) ที่เข้าถึง /auth/v1/admin/* ได้',
+      'request ด้วย anon ถูก rate-limit หนักกว่าจนทำให้ fail',
+      'endpoint ทำงานผ่าน HTTPS เท่านั้น ไม่รองรับ HTTP local',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์จริง: request เดียวกันเป๊ะด้วย anon คืน {"code":403,"error_code":"not_admin"} — admin API ถูก gate ด้วย role claim เองเป๊ะ ๆ เหมือนกับ service_role bypass ของ RLS ในบทก่อนหน้า',
+  },
+  {
+    q: 'อะไรทำให้ environment variable ชื่อ NEXT_PUBLIC_SUPABASE_SERVICE_ROLE_KEY เป็นบั๊กความปลอดภัยร้ายแรง ไม่ใช่แค่การตั้งชื่อที่ไม่ธรรมดา',
+    options: [
+      'เป็นแค่เรื่อง style ไม่มีผลด้านการทำงานเลย',
+      'prefix NEXT_PUBLIC_ ทำให้ค่านั้นถูก bundle เข้าไปใน client-side JavaScript ส่ง key ที่ข้าม RLS ได้และเปิด admin API ให้ browser ของผู้เข้าชมทุกคน',
+      'มีผลแค่ตอน deploy ไป Vercel เท่านั้น',
+      'ตัวแปร NEXT_PUBLIC_ ถูก encrypt อัตโนมัติตอน build เลยปลอดภัยจริง ๆ',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วในบทนี้ว่า service_role เปิด admin API เต็ม (สร้าง/แบน/ลบ user ไหนก็ได้) และเข้าถึง table ข้าม RLS ได้ — env var prefix ที่ expose ให้ client จะส่ง key ตัวนั้นเป๊ะไปให้ browser ทุกตัวที่โหลดหน้านั้น',
   },
 ];
 
