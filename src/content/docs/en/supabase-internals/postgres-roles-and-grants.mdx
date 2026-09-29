@@ -1,0 +1,281 @@
+---
+title: 'Postgres Roles and Grants'
+description: 'The real role chain PostgREST authenticates as — authenticator, anon, authenticated, service_role — proven with \du, pg_roles, and an RPC that reports current_user/session_user/JWT claims per call, plus why a brand-new table is visible to anon before you write a single policy.'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+Every request that reaches PostgREST authenticates to Postgres as one single login role, `authenticator`, which then does a real `SET LOCAL ROLE` to `anon`, `authenticated`, or `service_role` for the duration of that one transaction — `session_user` never changes, `current_user` does, and that switch is the entire authorization mechanism everything else in this course (RLS, grants, `security definer`) sits on top of.
+
+## Proof: the real role chain, from `\du`
+
+This course's local stack, queried directly (`docker exec -i supabase_db_probe psql -U postgres -c '\du'`):
+
+```text
+                                      List of roles
+         Role name          |                         Attributes
+----------------------------+------------------------------------------------------------
+ anon                       | Cannot login
+ authenticated              | Cannot login
+ authenticator              | No inheritance
+ dashboard_user             | Create role, Create DB, Cannot login, Replication
+ pgbouncer                  |
+ postgres                   | Create role, Create DB, Replication, Bypass RLS
+ service_role               | Cannot login, Bypass RLS
+ supabase_admin             | Superuser, Create role, Create DB, Replication, Bypass RLS
+ supabase_auth_admin        | No inheritance, Create role
+ supabase_etl_admin         | Replication, Bypass RLS
+ supabase_functions_admin   | No inheritance, Create role
+ supabase_privileged_role   | Cannot login
+ supabase_read_only_user    | Bypass RLS
+ supabase_realtime_admin    | No inheritance, Cannot login
+ supabase_replication_admin | Replication
+ supabase_storage_admin     | No inheritance, Create role
+```
+
+`anon`, `authenticated`, and `service_role` all say **Cannot login** — none of them is a role PostgREST (or anything else) actually opens a database connection as. `authenticator` is the opposite: it says **No inheritance** but nothing about login rights, because the default (can-login) is what makes it interesting — it is the one role in this list that *is* used to open the connection. Membership confirms the chain directly (`pg_auth_members` joined back to role names):
+
+```text
+    member     |   member_of
+---------------+---------------
+ authenticator | anon
+ authenticator | authenticated
+ authenticator | service_role
+```
+
+`authenticator` is a member of all three, and because it has **No inheritance** (`rolinherit = false`, confirmed below), being a member buys it nothing automatically — it must explicitly `SET ROLE` to one of them before that role's privileges apply. This is the load-bearing design decision: if `authenticator` inherited, every connection would silently carry the union of `anon` + `authenticated` + `service_role` privileges (including `service_role`'s `BYPASSRLS`) on every request, whether or not PostgREST meant to switch into it.
+
+```sql
+-- sql/int_role_attrs.sql
+select rolname, rolinherit, rolcanlogin, rolbypassrls
+from pg_roles
+where rolname in ('anon','authenticated','service_role','authenticator','postgres')
+order by rolname;
+```
+
+```text
+    rolname    | rolinherit | rolcanlogin | rolbypassrls
+----------------+------------+-------------+--------------
+ anon           | t          | f           | f
+ authenticated  | t          | f           | f
+ authenticator  | f          | t           | f
+ postgres       | t          | t           | t
+ service_role   | t          | f           | t
+```
+
+Note the asymmetry `rolbypassrls` reveals early — `service_role` has `BYPASSRLS = true`, `anon` and `authenticated` do not. Proof of what that means for actual queries is below, after the RPC.
+
+<Mermaid title="One login role, three privilege roles, switched per request" code={roleChainDiagram} />
+
+export const roleChainDiagram = `flowchart LR
+  client["Client request (apikey + Authorization header)"] --> kong["Kong gateway"]
+  kong --> pgrst["PostgREST"]
+  pgrst -->|"single DB login, always"| authenticator["authenticator (NOINHERIT, can login)"]
+  authenticator -->|"SET LOCAL ROLE anon"| anon["anon"]
+  authenticator -->|"SET LOCAL ROLE authenticated"| authenticated["authenticated"]
+  authenticator -->|"SET LOCAL ROLE service_role"| service_role["service_role (BYPASSRLS)"]
+  pgrst -->|"set_config('request.jwt.claims', jwt_json, true)"| gucs["session-local GUC: request.jwt.claims"]`;
+
+## Proof: PostgREST's per-request `SET LOCAL ROLE` and JWT claims, from an RPC
+
+An RPC that reports exactly what the current transaction sees, applied to this module's own namespaced table and function (`security invoker` is the default, made explicit; `set search_path = ''` follows this course's own [`database-functions-as-rpc`](/supabase/en/auto-generated-api/database-functions-as-rpc/) rule against schema injection):
+
+```sql
+-- supabase/migrations/9501_int_roles_whoami.sql
+create table public.int_orders (
+  id uuid primary key default gen_random_uuid(),
+  note text
+);
+
+create or replace function public.int_whoami()
+returns table (current_user_ text, session_user_ text, jwt_claims text)
+language sql
+security invoker
+set search_path = ''
+as $$
+  select
+    current_user::text,
+    session_user::text,
+    current_setting('request.jwt.claims', true);
+$$;
+
+grant execute on function public.int_whoami() to anon, authenticated, service_role;
+```
+
+Calling the same `int_whoami()` RPC three times — once per key, no code changes, only the `Authorization` header differs:
+
+```text
+$ curl -s -X POST "$API_URL/rest/v1/rpc/int_whoami" -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY" -H "Content-Type: application/json" -d '{}'
+[{"current_user_":"anon","session_user_":"authenticator","jwt_claims":"{\"exp\":1983812996,\"iss\":\"supabase-demo\",\"role\":\"anon\"}"}]
+
+$ curl -s -X POST "$API_URL/rest/v1/rpc/int_whoami" -H "apikey: $ANON_KEY" -H "Authorization: Bearer <a real signed-in user's access_token>" -H "Content-Type: application/json" -d '{}'
+[{"current_user_":"authenticated","session_user_":"authenticator","jwt_claims":"{\"aal\":\"aal1\",\"amr\":[{\"method\":\"password\",\"timestamp\":1790667710}],\"app_metadata\":{...},\"aud\":\"authenticated\",\"email\":\"int-roles+demo2@example.com\",\"exp\":1790671310,\"iat\":1790667710,\"is_anonymous\":false,\"iss\":\"http://127.0.0.1:55321/auth/v1\",\"phone\":\"\",\"role\":\"authenticated\",\"session_id\":\"b170be4a-e1ce-4231-8e51-8f283bd94907\",\"sub\":\"3a307b8b-1a47-4671-a197-a2a31af06052\",\"user_metadata\":{...}}"}]
+
+$ curl -s -X POST "$API_URL/rest/v1/rpc/int_whoami" -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" -H "Content-Type: application/json" -d '{}'
+[{"current_user_":"service_role","session_user_":"authenticator","jwt_claims":"{\"exp\":1983812996,\"iss\":\"supabase-demo\",\"role\":\"service_role\"}"}]
+```
+
+Read `session_user_` down that column: it says `authenticator` in all three responses — every one of these was the *same* login role's connection, likely even the same pooled backend. `current_user_` is what actually changed, per call, to match the `role` claim inside the JWT PostgREST decoded from the `Authorization` header. This is not PostgREST filtering rows in its own process and pretending to be a database role — it is a real `SET LOCAL ROLE <role>` issued inside the transaction before your query runs, confirmed independently by `pg_stat_activity`:
+
+```text
+$ docker exec -i supabase_db_probe psql -U postgres -c "select usename, count(*) from pg_stat_activity where usename is not null group by usename order by 1;"
+        usename         | count
+------------------------+-------
+ authenticator          |     2
+ postgres               |    32
+ supabase_admin         |    29
+ supabase_storage_admin |     1
+```
+
+Every PostgREST-owned backend connection in `pg_stat_activity` shows `usename = authenticator` — the pool PostgREST holds is a pool of `authenticator` connections, never a pool of `anon`/`authenticated`/`service_role` connections. `LOCAL` in `SET LOCAL ROLE` matters here: the role switch is scoped to the current transaction and reverts automatically when it ends, which is exactly why the pooled connection can be handed to the *next*, differently-authenticated request without manually resetting anything.
+
+`jwt_claims` above also answers where `auth.jwt()`, `auth.uid()`, and `auth.role()` (used throughout the Auth & RLS module) get their data: `current_setting('request.jwt.claims', true)` is the literal session-local GUC PostgREST populates with `set_config('request.jwt.claims', <jwt-json>, true)` before your query runs — those helper functions are thin wrappers around this same setting, not a separate mechanism.
+
+## Proof: `BYPASSRLS` is a role attribute, not a grant
+
+`service_role`'s `rolbypassrls = t` from the `\du`/`pg_roles` output above is not decorative. Enabling RLS on `int_orders` with **zero policies** (the default-deny state) and inserting one row as `postgres`:
+
+```sql
+-- sql/int_orders_rls_on.sql
+alter table public.int_orders enable row level security;
+insert into public.int_orders (note) values ('secret-order-1');
+```
+
+```text
+$ curl -s "$API_URL/rest/v1/int_orders?select=*" -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY"
+[]
+
+$ curl -s "$API_URL/rest/v1/int_orders?select=*" -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY"
+[{"id":"48af4473-246e-4e13-8e8b-5d34fc439c33","note":"secret-order-1"}]
+```
+
+Same table, same row, zero policies written. `anon`'s request obeys RLS's own default (no policy ⇒ no rows), and returns an empty array — not an error, `int_orders` is a perfectly visible, perfectly empty-looking table from `anon`'s side. `service_role`'s request skips row security entirely because Postgres checks `rolbypassrls` *before* it ever evaluates a policy — this is why the Edge Functions module could tell you "use `service_role` inside a function, never the client" as a rule, without yet showing the mechanism: this is the mechanism.
+
+## Proof: why `int_orders` was visible to `anon` at all, before any grant
+
+The `select`/`insert` proof above worked because of `pg_default_acl`, queried directly against `public`:
+
+```text
+$ docker exec -i supabase_db_probe psql -U postgres -c "select defaclrole::regrole, defaclobjtype, defaclacl from pg_default_acl where defaclnamespace::regnamespace::text='public';"
+ defaclrole |  defaclobjtype  |                                                                 defaclacl
+------------+-----------------+---------------------------------------------------------------------------------------------------------------------------------------------
+ postgres   | r (tables)      | {postgres=arwdDxtm/postgres,anon=arwdDxtm/postgres,authenticated=arwdDxtm/postgres,service_role=arwdDxtm/postgres}
+ postgres   | f (functions)   | {postgres=X/postgres,anon=X/postgres,authenticated=X/postgres,service_role=X/postgres}
+```
+
+`ALTER DEFAULT PRIVILEGES` for role `postgres` in schema `public` already grants `arwdDxtm` (select/insert/update/delete/... — full DML) on **every future table**, and `X` (execute) on **every future function**, to `anon`, `authenticated`, and `service_role` automatically — before this lesson's migration ever ran an explicit `grant`. This is the exact mechanism behind the local-stack auto-expose behavior [Securing the Data API](/supabase/en/auto-generated-api/securing-the-data-api/) already proved from the outside ("a brand-new table is reachable with zero configuration") — that lesson showed *that* it happens and the phased-rollout dates that are changing it on hosted projects; this default ACL entry is *why* it happens today on any project (hosted or local) that still has it: `postgres` (or `supabase_admin`, which carries an identical default ACL of its own, shown in the raw query above) owns `public` and pre-authorized these three roles for anything created there.
+
+<Callout title="This default ACL is exactly what auto_expose_new_tables removes">
+Setting `auto_expose_new_tables = false` in `config.toml` (covered in Securing the Data API) does not change RLS, and does not change this `pg_default_acl` entry either — Supabase's tooling adds an explicit `revoke` step alongside it so a *new* table stops inheriting these default grants even though the default ACL rule itself is unchanged. Query `pg_default_acl` yourself after flipping that setting and re-creating a project if you want to see whether the entry moved or a revoke was layered on top — this lesson's proof above is against the CLI's un-flipped default.
+</Callout>
+
+## Reading AI-generated code
+
+<SpotTheBug lang="sql" code={`-- AI-generated "make this function safely admin-only"
+create or replace function public.int_admin_only_report()
+returns setof public.int_orders
+language plpgsql
+security definer
+as $$
+begin
+  if current_user <> 'service_role' then
+    raise exception 'admins only';
+  end if;
+  return query select * from public.int_orders;
+end;
+$$;
+
+grant execute on function public.int_admin_only_report() to authenticated;`}>
+Two independent bugs stack here. First, this lesson's own RPC proof already showed `current_user` changing to whichever role's JWT signed the request — but this function is `security definer`, which makes it run with the **function owner's** privileges (the role that ran `create function`, typically `postgres` locally), not the caller's. `current_user` inside this function body is `postgres`, on every single call, regardless of whether `anon`, `authenticated`, or `service_role` invoked it — so `current_user <> 'service_role'` is `true` unconditionally, and the exception fires for every caller, including a genuine admin. Second, even fixing the identity check (checking the caller's real role via a JWT claim, or dropping `security definer` back to the invoker default) leaves the schema-injection hole this course's own [RPC lesson](/supabase/en/auto-generated-api/database-functions-as-rpc/) already proved: no `set search_path = ''`, so a `security definer` function resolves unqualified names (`public.int_orders` here is qualified, but a same-shaped function calling an unqualified helper would not be) against whatever `search_path` the calling session had, not a fixed one. The fix for *this* lesson's specific bug: check identity from `current_setting('request.jwt.claims', true)::json->>'role'` (proven above to reliably report the caller's real switched-into role) instead of `current_user`, which `security definer` has already made meaningless for this purpose.
+</SpotTheBug>
+
+## Mental Model
+
+Think of `authenticator` as a bouncer who is only ever, personally, "on the payroll" (logged in) — the bouncer never inherits VIP access automatically (`NOINHERIT`), and for every single request checks the wristband (the JWT's `role` claim) and steps, just for that one transaction, into whichever roped-off area (`anon`/`authenticated`/`service_role`) the wristband says, then steps back out the moment the transaction ends. `session_user` is "who is the bouncer" (always the same); `current_user` is "which roped-off area is currently in effect" (changes every request). Grants and RLS policies are written against the roped-off areas, never against the bouncer.
+
+## Trade-offs
+
+| Choice | Benefit | Cost |
+|---|---|---|
+| `authenticator` with `NOINHERIT` + per-request `SET LOCAL ROLE` | One pooled login role, connection reuse across completely different callers, zero risk of accidental privilege inheritance | An extra `SET LOCAL ROLE` + `set_config` on every single request (measured overhead is real but small; it's the price of one shared connection pool serving every auth state) |
+| `service_role`'s `BYPASSRLS` as a role attribute, not a grant per table | Trivial to reason about ("this key skips RLS, full stop") — no per-table exceptions to audit | It skips **every** table's RLS at once; a `service_role` key leaked to a client is a total RLS bypass, not a scoped one (this is exactly why Edge Functions keeps it server-side only) |
+| Default ACLs (`ALTER DEFAULT PRIVILEGES`) pre-granting `anon`/`authenticated`/`service_role` on new objects | Zero-config Data API reachability while prototyping locally | The exact footgun the hosted phased rollout (Securing the Data API) is walking back — a forgotten table is reachable the instant it's created, RLS or not |
+
+## Common Misconceptions
+
+- **"PostgREST opens a different database connection per role."** Disproved above by `pg_stat_activity`: every pooled backend's `usename` is `authenticator`. One login role, `SET LOCAL ROLE` per transaction — not a pool per privilege level.
+- **"`security definer` makes a function run as whichever role called it, just with extra permissions."** Disproved in the SpotTheBug: `security definer` makes a function run as its **owner**, which is the opposite of the caller — this is precisely why checking `current_user` inside one for authorization is backwards.
+- **"A new table needs an explicit grant before `anon` can touch it."** Disproved above: `pg_default_acl` already grants `anon`/`authenticated`/`service_role` full DML on every new `public` table by default on this (and any un-flipped) stack — RLS, not a missing grant, is what actually gates access day to day.
+- **"`BYPASSRLS` only skips RLS for tables the role has been explicitly told to bypass."** Disproved above: it's a boolean role attribute (`rolbypassrls`) with no per-table scope at all — on or off, for every table, everywhere.
+
+## Quiz
+
+export const quizPostgresRolesAndGrants = [
+  {
+    q: 'In the real `\\du` output above, `anon`, `authenticated`, and `service_role` all say "Cannot login." What does that prove about how PostgREST actually connects to Postgres?',
+    options: [
+      'PostgREST never uses these roles at all',
+      'PostgREST must authenticate as a different, login-capable role and switch into these for privileges — proven to be `authenticator`',
+      'These roles can log in, the CLI output is misleading',
+      'Each of these roles gets its own dedicated connection pool',
+    ],
+    answer: 1,
+    explain: 'Proven above: `pg_stat_activity` shows every PostgREST-owned backend as `usename = authenticator`, and `authenticator` is the only one of the four marked can-login in `\\du`.',
+  },
+  {
+    q: 'The whoami RPC proof showed `session_user_` staying `authenticator` across anon/authenticated/service_role calls while `current_user_` changed each time. What Postgres mechanism does that prove PostgREST is using?',
+    options: [
+      'A separate physical connection per role',
+      'SET ROLE at the database cluster level, permanent until manually reset',
+      'SET LOCAL ROLE, scoped to the current transaction and auto-reverted after it',
+      'A Kong-layer header rewrite with no database-level role change at all',
+    ],
+    answer: 2,
+    explain: 'session_user never changes (same login role) while current_user does, per request, on a pooled connection reused across totally different callers — that combination is exactly what SET LOCAL ROLE inside a transaction produces; a permanent SET ROLE would leak into the next pooled request.',
+  },
+  {
+    q: 'Why does `authenticator` need `NOINHERIT` specifically, given it is a member of anon, authenticated, and service_role?',
+    options: [
+      'NOINHERIT is required for any role that can log in',
+      'Without it, every authenticator connection would automatically carry the union of all three roles\' privileges — including service_role\'s BYPASSRLS — without an explicit SET ROLE',
+      'NOINHERIT is only a performance optimization with no security effect',
+      'It has no effect because PostgREST always calls SET ROLE explicitly anyway',
+    ],
+    answer: 1,
+    explain: "Membership alone would grant inherited privileges automatically if authenticator could inherit — NOINHERIT is what forces the explicit SET LOCAL ROLE step to matter at all; without it BYPASSRLS would apply to every request regardless of which JWT role claim it carried.",
+  },
+  {
+    q: 'The BYPASSRLS proof showed anon getting `[]` and service_role getting the real row from the same RLS-enabled, zero-policy table. What does the empty array for anon actually mean?',
+    options: [
+      'The table does not exist for anon',
+      'anon hit a permission error that PostgREST silently swallowed',
+      'anon is fully authorized to query the table (default ACL grant), but RLS with no policies denies every row by default — an empty result, not an error',
+      'RLS was not actually enabled',
+    ],
+    answer: 2,
+    explain: 'Proven above: the same query with the service_role key returns the row, and no error was ever returned to anon — RLS\'s documented default-deny with zero policies produces a successful, empty response, not a permission error.',
+  },
+  {
+    q: 'Per the real `pg_default_acl` query above, what does the local stack grant to anon/authenticated/service_role on a brand-new `public` table, before any explicit `grant` statement runs?',
+    options: [
+      'Nothing — a manual grant is always required first',
+      'SELECT only',
+      'Full DML (arwdDxtm — select/insert/update/delete/etc.) via ALTER DEFAULT PRIVILEGES owned by postgres/supabase_admin',
+      'Only EXECUTE, which applies to functions not tables',
+    ],
+    answer: 2,
+    explain: 'The raw defaclacl output above shows `anon=arwdDxtm/postgres` etc. for object type r (relations/tables) — full DML, pre-granted by default privileges, which is the real mechanism behind this course\'s local auto-expose behavior.',
+  },
+];
+
+<Quiz client:visible id="supabase-internals/postgres-roles-and-grants" questions={quizPostgresRolesAndGrants} />
+
+<ProgressTracker client:visible id="supabase-internals/postgres-roles-and-grants" />

@@ -1,0 +1,281 @@
+---
+title: 'Postgres Roles and Grants'
+description: 'สาย role จริงที่ PostgREST authenticate เป็น — authenticator, anon, authenticated, service_role — พิสูจน์ด้วย \du, pg_roles, และ RPC ที่รายงาน current_user/session_user/JWT claims ต่อการเรียกแต่ละครั้ง บวกเหตุผลว่าทำไมตารางใหม่เอี่ยมถึงมองเห็นได้จาก anon ก่อนที่คุณจะเขียน policy สักบรรทัด'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ใจความสำคัญในหนึ่งประโยค
+
+ทุก request ที่ไปถึง PostgREST authenticate เข้า Postgres ด้วย login role เดียวเท่านั้นคือ `authenticator` ซึ่งจากนั้นจะทำ `SET LOCAL ROLE` จริง ๆ ไปเป็น `anon`, `authenticated`, หรือ `service_role` เฉพาะช่วง transaction นั้น — `session_user` ไม่เคยเปลี่ยน แต่ `current_user` เปลี่ยนทุกครั้ง และการสลับนี้คือกลไกทั้งหมดที่ RLS, grant, `security definer` ในคอร์สนี้ยืนอยู่บน
+
+## พิสูจน์: สาย role จริง จาก `\du`
+
+Local stack ของคอร์สนี้ ถาม query ตรง ๆ (`docker exec -i supabase_db_probe psql -U postgres -c '\du'`):
+
+```text
+                                      List of roles
+         Role name          |                         Attributes
+----------------------------+------------------------------------------------------------
+ anon                       | Cannot login
+ authenticated              | Cannot login
+ authenticator              | No inheritance
+ dashboard_user             | Create role, Create DB, Cannot login, Replication
+ pgbouncer                  |
+ postgres                   | Create role, Create DB, Replication, Bypass RLS
+ service_role               | Cannot login, Bypass RLS
+ supabase_admin             | Superuser, Create role, Create DB, Replication, Bypass RLS
+ supabase_auth_admin        | No inheritance, Create role
+ supabase_etl_admin         | Replication, Bypass RLS
+ supabase_functions_admin   | No inheritance, Create role
+ supabase_privileged_role   | Cannot login
+ supabase_read_only_user    | Bypass RLS
+ supabase_realtime_admin    | No inheritance, Cannot login
+ supabase_replication_admin | Replication
+ supabase_storage_admin     | No inheritance, Create role
+```
+
+`anon`, `authenticated`, และ `service_role` ทั้งหมดขึ้น **Cannot login** — ไม่มีตัวไหนเลยเป็น role ที่ PostgREST (หรืออะไรก็ตาม) เปิด connection ฐานข้อมูลเป็นตัวมันจริง ๆ `authenticator` ตรงกันข้าม — ขึ้น **No inheritance** แต่ไม่มีข้อความเรื่อง login rights เลย เพราะค่า default (login ได้) คือสิ่งที่น่าสนใจตรงนี้ — มันคือ role เดียวในรายการนี้ที่ *ถูกใช้* เปิด connection จริง สมาชิกภาพยืนยันสายนี้ตรง ๆ (join `pg_auth_members` กลับไปที่ชื่อ role):
+
+```text
+    member     |   member_of
+---------------+---------------
+ authenticator | anon
+ authenticator | authenticated
+ authenticator | service_role
+```
+
+`authenticator` เป็นสมาชิกของทั้งสามตัว และเพราะมัน **No inheritance** (`rolinherit = false` ยืนยันด้านล่าง) การเป็นสมาชิกอย่างเดียวไม่ให้อะไรอัตโนมัติเลย — มันต้อง `SET ROLE` ไปเป็นตัวใดตัวหนึ่งก่อนสิทธิ์ของ role นั้นจะมีผล นี่คือการตัดสินใจออกแบบที่แบกทุกอย่างไว้: ถ้า `authenticator` inherit ได้ ทุก connection จะแบก union ของสิทธิ์ `anon` + `authenticated` + `service_role` (รวมถึง `BYPASSRLS` ของ `service_role`) โดยอัตโนมัติทุก request ไม่ว่า PostgREST จะตั้งใจสลับเข้าไปจริงหรือไม่
+
+```sql
+-- sql/int_role_attrs.sql
+select rolname, rolinherit, rolcanlogin, rolbypassrls
+from pg_roles
+where rolname in ('anon','authenticated','service_role','authenticator','postgres')
+order by rolname;
+```
+
+```text
+    rolname    | rolinherit | rolcanlogin | rolbypassrls
+----------------+------------+-------------+--------------
+ anon           | t          | f           | f
+ authenticated  | t          | f           | f
+ authenticator  | f          | t           | f
+ postgres       | t          | t           | t
+ service_role   | t          | f           | t
+```
+
+สังเกตความไม่สมมาตรที่ `rolbypassrls` เผยตั้งแต่ต้น — `service_role` มี `BYPASSRLS = true`, `anon` กับ `authenticated` ไม่มี พิสูจน์ว่าสิ่งนี้มีผลกับ query จริงยังไง อยู่ด้านล่าง หลัง RPC
+
+<Mermaid title="Login role เดียว, privilege role สามตัว, สลับต่อ request" code={roleChainDiagram} />
+
+export const roleChainDiagram = `flowchart LR
+  client["Client request (apikey + Authorization header)"] --> kong["Kong gateway"]
+  kong --> pgrst["PostgREST"]
+  pgrst -->|"single DB login, always"| authenticator["authenticator (NOINHERIT, can login)"]
+  authenticator -->|"SET LOCAL ROLE anon"| anon["anon"]
+  authenticator -->|"SET LOCAL ROLE authenticated"| authenticated["authenticated"]
+  authenticator -->|"SET LOCAL ROLE service_role"| service_role["service_role (BYPASSRLS)"]
+  pgrst -->|"set_config('request.jwt.claims', jwt_json, true)"| gucs["session-local GUC: request.jwt.claims"]`;
+
+## พิสูจน์: `SET LOCAL ROLE` ต่อ request ของ PostgREST กับ JWT claims จาก RPC
+
+RPC ที่รายงานตรง ๆ ว่า transaction ปัจจุบันเห็นอะไร ใช้กับตารางและ function ที่ namespace เฉพาะของบทนี้ (`security invoker` เป็นค่า default อยู่แล้ว เขียนชัดไว้; `set search_path = ''` ตามกฎของคอร์สนี้เองใน [`database-functions-as-rpc`](/supabase/th/auto-generated-api/database-functions-as-rpc/) เรื่อง schema injection):
+
+```sql
+-- supabase/migrations/9501_int_roles_whoami.sql
+create table public.int_orders (
+  id uuid primary key default gen_random_uuid(),
+  note text
+);
+
+create or replace function public.int_whoami()
+returns table (current_user_ text, session_user_ text, jwt_claims text)
+language sql
+security invoker
+set search_path = ''
+as $$
+  select
+    current_user::text,
+    session_user::text,
+    current_setting('request.jwt.claims', true);
+$$;
+
+grant execute on function public.int_whoami() to anon, authenticated, service_role;
+```
+
+เรียก RPC `int_whoami()` ตัวเดียวกันสามครั้ง — ต่อคีย์ครั้งละครั้ง ไม่แก้โค้ดเลย เปลี่ยนแค่ header `Authorization`:
+
+```text
+$ curl -s -X POST "$API_URL/rest/v1/rpc/int_whoami" -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY" -H "Content-Type: application/json" -d '{}'
+[{"current_user_":"anon","session_user_":"authenticator","jwt_claims":"{\"exp\":1983812996,\"iss\":\"supabase-demo\",\"role\":\"anon\"}"}]
+
+$ curl -s -X POST "$API_URL/rest/v1/rpc/int_whoami" -H "apikey: $ANON_KEY" -H "Authorization: Bearer <a real signed-in user's access_token>" -H "Content-Type: application/json" -d '{}'
+[{"current_user_":"authenticated","session_user_":"authenticator","jwt_claims":"{\"aal\":\"aal1\",\"amr\":[{\"method\":\"password\",\"timestamp\":1790667710}],\"app_metadata\":{...},\"aud\":\"authenticated\",\"email\":\"int-roles+demo2@example.com\",\"exp\":1790671310,\"iat\":1790667710,\"is_anonymous\":false,\"iss\":\"http://127.0.0.1:55321/auth/v1\",\"phone\":\"\",\"role\":\"authenticated\",\"session_id\":\"b170be4a-e1ce-4231-8e51-8f283bd94907\",\"sub\":\"3a307b8b-1a47-4671-a197-a2a31af06052\",\"user_metadata\":{...}}"}]
+
+$ curl -s -X POST "$API_URL/rest/v1/rpc/int_whoami" -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" -H "Content-Type: application/json" -d '{}'
+[{"current_user_":"service_role","session_user_":"authenticator","jwt_claims":"{\"exp\":1983812996,\"iss\":\"supabase-demo\",\"role\":\"service_role\"}"}]
+```
+
+อ่านคอลัมน์ `session_user_` ลงมา: มันขึ้น `authenticator` ในทั้งสามคำตอบ — ทุกอันนี้คือ connection ของ login role *ตัวเดียวกัน* อาจจะเป็น pooled backend ตัวเดียวกันด้วยซ้ำ `current_user_` ต่างหากที่เปลี่ยนจริง ในแต่ละครั้ง ให้ตรงกับ claim `role` ข้างใน JWT ที่ PostgREST ถอดจาก header `Authorization` นี่ไม่ใช่ PostgREST กรอง row เองในโปรเซสของมันแล้วแกล้งทำเป็น database role — มันคือ `SET LOCAL ROLE <role>` จริง ๆ ที่ถูกยิงเข้าไปใน transaction ก่อน query ของคุณจะรัน ยืนยันอิสระจากกันด้วย `pg_stat_activity`:
+
+```text
+$ docker exec -i supabase_db_probe psql -U postgres -c "select usename, count(*) from pg_stat_activity where usename is not null group by usename order by 1;"
+        usename         | count
+------------------------+-------
+ authenticator          |     2
+ postgres               |    32
+ supabase_admin         |    29
+ supabase_storage_admin |     1
+```
+
+ทุก backend connection ที่ PostgREST เป็นเจ้าของใน `pg_stat_activity` ขึ้น `usename = authenticator` — pool ที่ PostgREST ถืออยู่คือ pool ของ connection `authenticator` ไม่เคยเป็น pool ของ `anon`/`authenticated`/`service_role` `LOCAL` ใน `SET LOCAL ROLE` สำคัญตรงนี้: การสลับ role ถูก scope อยู่แค่ transaction ปัจจุบัน แล้ว revert อัตโนมัติเมื่อมันจบ นี่แหละคือเหตุผลที่ pooled connection ส่งต่อไปให้ request *ถัดไป* ที่ authenticate มาคนละแบบได้เลย โดยไม่ต้อง reset อะไรด้วยมือ
+
+`jwt_claims` ด้านบนยังตอบด้วยว่า `auth.jwt()`, `auth.uid()`, และ `auth.role()` (ใช้ทั่วทั้งโมดูล Auth & RLS) เอาข้อมูลมาจากไหน: `current_setting('request.jwt.claims', true)` คือ session-local GUC ตัวจริงที่ PostgREST เติมด้วย `set_config('request.jwt.claims', <jwt-json>, true)` ก่อน query ของคุณจะรัน — helper function พวกนั้นเป็นแค่ wrapper บาง ๆ รอบ setting ตัวเดียวกันนี้ ไม่ใช่กลไกแยกต่างหาก
+
+## พิสูจน์: `BYPASSRLS` เป็น role attribute ไม่ใช่ grant
+
+`rolbypassrls = t` ของ `service_role` จาก output `\du`/`pg_roles` ด้านบนไม่ใช่แค่ของตกแต่ง เปิด RLS บน `int_orders` โดย **ไม่มี policy เลย** (สถานะ default-deny) แล้ว insert หนึ่งแถวในฐานะ `postgres`:
+
+```sql
+-- sql/int_orders_rls_on.sql
+alter table public.int_orders enable row level security;
+insert into public.int_orders (note) values ('secret-order-1');
+```
+
+```text
+$ curl -s "$API_URL/rest/v1/int_orders?select=*" -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY"
+[]
+
+$ curl -s "$API_URL/rest/v1/int_orders?select=*" -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY"
+[{"id":"48af4473-246e-4e13-8e8b-5d34fc439c33","note":"secret-order-1"}]
+```
+
+ตารางเดียวกัน แถวเดียวกัน ไม่มี policy สักตัว request ของ `anon` เป็นไปตาม default ของ RLS เอง (ไม่มี policy ⇒ ไม่เห็นแถวไหนเลย) และได้ array ว่างกลับมา — ไม่ใช่ error, `int_orders` เป็นตารางที่มองเห็นได้ปกติทุกอย่าง แค่ดู "ว่างเปล่า" จากฝั่ง `anon` request ของ `service_role` ข้าม RLS ไปเลยเพราะ Postgres เช็ก `rolbypassrls` *ก่อน* จะประเมิน policy ใด ๆ เลยด้วยซ้ำ — นี่แหละคือเหตุผลที่โมดูล Edge Functions บอกคุณได้ว่า "ใช้ `service_role` ข้างใน function เท่านั้น ห้ามใช้ฝั่ง client" เป็นกฎ โดยที่ยังไม่ต้องโชว์กลไก: นี่แหละคือกลไกนั้น
+
+## พิสูจน์: ทำไม `int_orders` ถึงมองเห็นได้จาก `anon` ตั้งแต่แรก ก่อนมี grant ใด ๆ
+
+พิสูจน์ `select`/`insert` ด้านบนทำงานได้เพราะ `pg_default_acl` ถาม query ตรง ๆ กับ `public`:
+
+```text
+$ docker exec -i supabase_db_probe psql -U postgres -c "select defaclrole::regrole, defaclobjtype, defaclacl from pg_default_acl where defaclnamespace::regnamespace::text='public';"
+ defaclrole |  defaclobjtype  |                                                                 defaclacl
+------------+-----------------+---------------------------------------------------------------------------------------------------------------------------------------------
+ postgres   | r (tables)      | {postgres=arwdDxtm/postgres,anon=arwdDxtm/postgres,authenticated=arwdDxtm/postgres,service_role=arwdDxtm/postgres}
+ postgres   | f (functions)   | {postgres=X/postgres,anon=X/postgres,authenticated=X/postgres,service_role=X/postgres}
+```
+
+`ALTER DEFAULT PRIVILEGES` สำหรับ role `postgres` ใน schema `public` grant `arwdDxtm` (select/insert/update/delete/... — DML เต็ม) ให้ **ทุกตารางในอนาคต** และ `X` (execute) ให้ **ทุก function ในอนาคต** แก่ `anon`, `authenticated`, และ `service_role` โดยอัตโนมัติอยู่แล้ว — ก่อนที่ migration ของบทนี้จะรัน `grant` แบบชัดเจนด้วยซ้ำ นี่คือกลไกจริงเบื้องหลังพฤติกรรม auto-expose บน local stack ที่ [Securing the Data API](/supabase/th/auto-generated-api/securing-the-data-api/) พิสูจน์จากมุมมองข้างนอกไปแล้ว ("ตารางใหม่เอี่ยมเข้าถึงได้โดยไม่ต้อง config อะไรเลย") — บทนั้นโชว์ *ว่า* มันเกิดขึ้น และวันที่ phased-rollout ที่กำลังเปลี่ยนมันบน hosted project; default ACL entry นี้คือ *เหตุผล* ที่มันเกิดขึ้นวันนี้บนโปรเจกต์ไหนก็ตาม (hosted หรือ local) ที่ยังมีมันอยู่: `postgres` (หรือ `supabase_admin` ซึ่งแบก default ACL ของตัวเองที่เหมือนกันเป๊ะ โชว์อยู่ใน raw query ด้านบน) เป็นเจ้าของ `public` และ pre-authorize สาม role นี้ไว้แล้วสำหรับทุกอย่างที่สร้างที่นั่น
+
+<Callout title="Default ACL นี้แหละคือสิ่งที่ auto_expose_new_tables เอาออก">
+การตั้ง `auto_expose_new_tables = false` ใน `config.toml` (พูดถึงใน Securing the Data API) ไม่ได้เปลี่ยน RLS และก็ไม่ได้เปลี่ยน `pg_default_acl` entry นี้ด้วย — tooling ของ Supabase เพิ่มขั้นตอน `revoke` ชัดเจนควบคู่ไปด้วย ทำให้ตาราง *ใหม่* หยุด inherit default grant พวกนี้ ทั้งที่กฎ default ACL เองไม่ได้เปลี่ยน ลอง query `pg_default_acl` เองหลังพลิก setting นั้นแล้วสร้างโปรเจกต์ใหม่ ถ้าอยากดูว่า entry ย้ายไปไหมหรือมี revoke มาซ้อนทับ — พิสูจน์ในบทนี้ด้านบนคือกับ default ที่ยังไม่ได้พลิกของ CLI
+</Callout>
+
+## อ่านโค้ดที่ AI เขียน
+
+<SpotTheBug lang="sql" code={`-- AI-generated "make this function safely admin-only"
+create or replace function public.int_admin_only_report()
+returns setof public.int_orders
+language plpgsql
+security definer
+as $$
+begin
+  if current_user <> 'service_role' then
+    raise exception 'admins only';
+  end if;
+  return query select * from public.int_orders;
+end;
+$$;
+
+grant execute on function public.int_admin_only_report() to authenticated;`}>
+มีบั๊กสองตัวซ้อนกันอยู่ตรงนี้ เป็นอิสระจากกัน ตัวแรก พิสูจน์ RPC ของบทนี้เองด้านบนโชว์ไปแล้วว่า `current_user` เปลี่ยนตาม role ที่เซ็น JWT ของ request — แต่ function นี้เป็น `security definer` ซึ่งทำให้มันรันด้วยสิทธิ์ของ **เจ้าของ function** (role ที่รัน `create function` ปกติคือ `postgres` บน local) ไม่ใช่ของผู้เรียก `current_user` ข้างใน function นี้คือ `postgres` ทุกครั้งที่เรียก ไม่ว่า `anon`, `authenticated`, หรือ `service_role` จะเป็นคนเรียกก็ตาม — ดังนั้น `current_user <> 'service_role'` เป็น `true` เสมอไม่มีเงื่อนไข exception เลยยิงทุกครั้งสำหรับทุกคนที่เรียก รวมถึง admin ตัวจริงด้วย ตัวที่สอง ถึงจะแก้เช็ก identity แล้ว (เช็ก role จริงของผู้เรียกผ่าน JWT claim หรือถอด `security definer` กลับไปเป็น invoker ซึ่งเป็นค่า default) ก็ยังเหลือช่องโหว่ schema-injection ที่ [บทเรื่อง RPC](/supabase/th/auto-generated-api/database-functions-as-rpc/) ของคอร์สนี้พิสูจน์ไปแล้ว — ไม่มี `set search_path = ''` ดังนั้น function ที่เป็น `security definer` จะ resolve ชื่อที่ไม่ qualify (ในนี้ `public.int_orders` qualify แล้ว แต่ function หน้าตาเดียวกันที่เรียก helper แบบไม่ qualify จะไม่) ตาม `search_path` ของ session ที่เรียกอยู่ตอนนั้น ไม่ใช่ค่าคงที่ วิธีแก้สำหรับบั๊กเฉพาะของบทนี้: เช็ก identity จาก `current_setting('request.jwt.claims', true)::json->>'role'` (พิสูจน์ด้านบนแล้วว่ารายงาน role จริงที่ผู้เรียกสลับเข้าไปได้แม่นยำ) แทนที่จะใช้ `current_user` ซึ่ง `security definer` ทำให้ไร้ความหมายสำหรับจุดประสงค์นี้ไปแล้ว
+</SpotTheBug>
+
+## Mental Model
+
+ลองคิดว่า `authenticator` คือ bouncer ที่มีสถานะ "อยู่ในบัญชีเงินเดือน" (login ได้) แค่คนเดียว — bouncer ไม่เคย inherit สิทธิ์ VIP อัตโนมัติเลย (`NOINHERIT`) และสำหรับทุก ๆ request มันเช็ก wristband (claim `role` ใน JWT) แล้วก้าวเข้าไป เฉพาะ transaction นั้น ในโซนที่กั้นไว้ (`anon`/`authenticated`/`service_role`) ตามที่ wristband บอก แล้วก้าวออกมาทันทีที่ transaction จบ `session_user` คือ "bouncer คนไหน" (เหมือนเดิมเสมอ); `current_user` คือ "โซนไหนกำลังมีผลอยู่" (เปลี่ยนทุก request) grant และ RLS policy ถูกเขียนกับโซนที่กั้นไว้ ไม่เคยเขียนกับตัว bouncer
+
+## Trade-offs
+
+| ทางเลือก | ข้อดี | ต้นทุน |
+|---|---|---|
+| `authenticator` แบบ `NOINHERIT` + `SET LOCAL ROLE` ต่อ request | Login role pooled ตัวเดียว, ใช้ connection ซ้ำข้าม caller ที่ authenticate ต่างกันโดยสิ้นเชิงได้, ความเสี่ยง privilege inherit โดยไม่ตั้งใจเป็นศูนย์ | มี `SET LOCAL ROLE` + `set_config` เพิ่มทุก request (overhead จริงแต่เล็ก — คือราคาของ connection pool เดียวที่รองรับทุก auth state) |
+| `BYPASSRLS` ของ `service_role` เป็น role attribute ไม่ใช่ grant ต่อตาราง | คิดง่ายมาก ("คีย์นี้ข้าม RLS จบ") — ไม่มีข้อยกเว้นต่อตารางให้ต้อง audit | มันข้าม RLS ของ **ทุก** ตารางพร้อมกัน; คีย์ `service_role` ที่หลุดไปถึง client คือการ bypass RLS ทั้งหมด ไม่ใช่แค่บาง scope (นี่แหละคือเหตุผลที่ Edge Functions เก็บมันไว้ฝั่ง server เท่านั้น) |
+| Default ACL (`ALTER DEFAULT PRIVILEGES`) grant `anon`/`authenticated`/`service_role` ล่วงหน้าบน object ใหม่ | Data API เข้าถึงได้แบบ zero-config ตอน prototype บน local | เป็นกับดักตัวเดียวกับที่ hosted phased rollout (Securing the Data API) กำลังถอยกลับ — ตารางที่ลืมไว้เข้าถึงได้ทันทีที่สร้าง ไม่ว่า RLS จะเปิดหรือไม่ |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"PostgREST เปิด connection ฐานข้อมูลคนละตัวต่อ role"** พิสูจน์ว่าผิดด้านบนด้วย `pg_stat_activity`: ทุก pooled backend มี `usename` เป็น `authenticator` login role เดียว, `SET LOCAL ROLE` ต่อ transaction — ไม่ใช่ pool แยกต่อระดับสิทธิ์
+- **"`security definer` ทำให้ function รันเป็น role ที่เรียกมัน แค่มีสิทธิ์เพิ่ม"** พิสูจน์ว่าผิดใน SpotTheBug: `security definer` ทำให้ function รันเป็น **เจ้าของ** ซึ่งตรงข้ามกับผู้เรียกเลย — นี่แหละคือเหตุผลที่การเช็ก `current_user` ข้างในเพื่อ authorization นั้นกลับด้าน
+- **"ตารางใหม่ต้องมี grant ชัดเจนก่อน `anon` ถึงจะแตะมันได้"** พิสูจน์ว่าผิดด้านบน: `pg_default_acl` grant DML เต็มให้ `anon`/`authenticated`/`service_role` บนทุกตาราง `public` ใหม่โดยอัตโนมัติอยู่แล้วบน stack นี้ (และ stack ไหนก็ตามที่ยังไม่ได้พลิก) — RLS ต่างหาก ไม่ใช่ grant ที่หายไป คือสิ่งที่กั้นการเข้าถึงจริงในชีวิตประจำวัน
+- **"`BYPASSRLS` ข้าม RLS แค่ตารางที่บอก role ไว้ชัดเจนว่าให้ bypass"** พิสูจน์ว่าผิดด้านบน: มันเป็น boolean role attribute (`rolbypassrls`) ที่ไม่มี scope ต่อตารางเลย — เปิดหรือปิด สำหรับทุกตาราง ทุกที่
+
+## แบบทดสอบ
+
+export const quizPostgresRolesAndGrants = [
+  {
+    q: 'ใน output `\\du` จริงด้านบน `anon`, `authenticated`, และ `service_role` ทั้งหมดขึ้น "Cannot login" สิ่งนี้พิสูจน์อะไรเกี่ยวกับวิธีที่ PostgREST เชื่อมต่อกับ Postgres จริง ๆ',
+    options: [
+      'PostgREST ไม่เคยใช้ role พวกนี้เลย',
+      'PostgREST ต้อง authenticate เป็น role ที่ login ได้ตัวอื่นแล้วสลับเข้าไปเอาสิทธิ์ — พิสูจน์แล้วว่าคือ `authenticator`',
+      'role พวกนี้ login ได้ output ของ CLI ทำให้เข้าใจผิด',
+      'แต่ละ role พวกนี้มี connection pool เป็นของตัวเอง',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ด้านบนแล้ว: `pg_stat_activity` โชว์ว่าทุก backend ที่ PostgREST เป็นเจ้าของมี `usename = authenticator` และ `authenticator` คือตัวเดียวในสี่ตัวที่ `\\du` ทำเครื่องหมายว่า login ได้',
+  },
+  {
+    q: 'พิสูจน์ด้วย whoami RPC โชว์ว่า `session_user_` ยังคงเป็น `authenticator` ตลอดการเรียก anon/authenticated/service_role ขณะที่ `current_user_` เปลี่ยนทุกครั้ง สิ่งนี้พิสูจน์ว่า PostgREST ใช้กลไก Postgres แบบไหน',
+    options: [
+      'Connection ทางกายภาพแยกต่างหากต่อ role',
+      'SET ROLE ระดับ cluster ฐานข้อมูล ถาวรจนกว่าจะ reset เอง',
+      'SET LOCAL ROLE, scope อยู่แค่ transaction ปัจจุบันและ revert อัตโนมัติหลังจากนั้น',
+      'การ rewrite header ระดับ Kong โดยไม่มีการเปลี่ยน role ระดับฐานข้อมูลเลย',
+    ],
+    answer: 2,
+    explain: 'session_user ไม่เคยเปลี่ยน (login role เดิม) ขณะที่ current_user เปลี่ยนทุก request บน connection ที่ pooled ใช้ซ้ำข้าม caller ที่ต่างกันโดยสิ้นเชิง — combination นี้คือสิ่งที่ SET LOCAL ROLE ข้างใน transaction สร้างขึ้นพอดี; SET ROLE แบบถาวรจะรั่วไปถึง pooled request ถัดไป',
+  },
+  {
+    q: 'ทำไม `authenticator` ถึงต้องการ `NOINHERIT` โดยเฉพาะ ทั้งที่มันเป็นสมาชิกของ anon, authenticated, และ service_role',
+    options: [
+      'NOINHERIT จำเป็นสำหรับ role ที่ login ได้ทุกตัว',
+      'ถ้าไม่มีมัน ทุก connection ของ authenticator จะแบก union ของสิทธิ์ทั้งสาม role อัตโนมัติ — รวมถึง BYPASSRLS ของ service_role — โดยไม่ต้อง SET ROLE ชัดเจนเลย',
+      'NOINHERIT เป็นแค่การ optimize performance ไม่มีผลด้าน security',
+      'มันไม่มีผลอะไรเพราะ PostgREST เรียก SET ROLE ชัดเจนอยู่แล้วทุกครั้ง',
+    ],
+    answer: 1,
+    explain: 'การเป็นสมาชิกอย่างเดียวจะให้สิทธิ์แบบ inherit อัตโนมัติถ้า authenticator inherit ได้ — NOINHERIT คือสิ่งที่บังคับให้ขั้นตอน SET LOCAL ROLE ชัดเจนมีความหมายเลย; ถ้าไม่มีมัน BYPASSRLS จะมีผลกับทุก request ไม่ว่าจะแบก JWT role claim อะไร',
+  },
+  {
+    q: 'พิสูจน์ BYPASSRLS โชว์ว่า anon ได้ `[]` และ service_role ได้แถวจริงจากตารางเดียวกันที่เปิด RLS แต่ไม่มี policy เลย array ว่างของ anon หมายความว่าอะไรจริง ๆ',
+    options: [
+      'ตารางไม่มีอยู่สำหรับ anon',
+      'anon เจอ permission error ที่ PostgREST กลืนเงียบ ๆ',
+      'anon ได้รับอนุญาตให้ query ตารางเต็มที่ (default ACL grant) แต่ RLS ที่ไม่มี policy ปฏิเสธทุกแถวโดยดีฟอลต์ — ผลลัพธ์ว่างเปล่า ไม่ใช่ error',
+      'RLS ยังไม่ได้เปิดจริง',
+    ],
+    answer: 2,
+    explain: 'พิสูจน์ด้านบนแล้ว: query เดียวกันด้วยคีย์ service_role คืนแถวจริง และไม่มี error ส่งกลับไปให้ anon เลย — default-deny ของ RLS ที่ไม่มี policy ตามที่ระบุไว้ในเอกสารให้ผลลัพธ์สำเร็จแต่ว่างเปล่า ไม่ใช่ permission error',
+  },
+  {
+    q: 'ตาม query `pg_default_acl` จริงด้านบน local stack grant อะไรให้ anon/authenticated/service_role บนตาราง `public` ใหม่เอี่ยม ก่อนที่ `grant` ชัดเจนใด ๆ จะรัน',
+    options: [
+      'ไม่มีอะไรเลย — ต้อง grant ด้วยมือก่อนเสมอ',
+      'SELECT อย่างเดียว',
+      'DML เต็ม (arwdDxtm — select/insert/update/delete/etc.) ผ่าน ALTER DEFAULT PRIVILEGES ที่เป็นเจ้าของโดย postgres/supabase_admin',
+      'EXECUTE อย่างเดียว ซึ่งใช้กับ function ไม่ใช่ตาราง',
+    ],
+    answer: 2,
+    explain: 'raw defaclacl output ด้านบนโชว์ `anon=arwdDxtm/postgres` เป็นต้น สำหรับ object type r (relation/ตาราง) — DML เต็ม grant มาโดย default privileges ซึ่งเป็นกลไกจริงเบื้องหลังพฤติกรรม auto-expose ของ local ในคอร์สนี้',
+  },
+];
+
+<Quiz client:visible id="supabase-internals/postgres-roles-and-grants" questions={quizPostgresRolesAndGrants} />
+
+<ProgressTracker client:visible id="supabase-internals/postgres-roles-and-grants" />
