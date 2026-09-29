@@ -1,6 +1,6 @@
 ---
 title: 'RLS Patterns and Pitfalls'
-description: 'Pattern ของ row level security ที่เจอบ่อยในโลกจริง บวกกับ pitfall เรื่อง per-operation และ performance ที่มือใหม่ Supabase มักเจอ'
+description: 'Pattern ของ row level security ที่เจอบ่อยในโลกจริง บวกกับ pitfall เรื่อง per-operation, hijack, performance และ multi-tenant ที่มือใหม่ Supabase มักเจอ — พิสูจน์จริงทุกจุดบน local stack'
 sidebar:
   order: 4
 ---
@@ -8,11 +8,12 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
 
-RLS ในโลกจริงส่วนใหญ่คือการผสม pattern ไม่กี่แบบเข้าด้วยกัน — owner-only, public-read-owner-write, role-based — และ bug ของ RLS ในโลกจริงส่วนใหญ่ก็มาจากการลืม policy ของ operation ใด operation หนึ่ง หรือลืม index column ที่ policy ใช้กรอง
+RLS ในโลกจริงส่วนใหญ่คือการผสม pattern ไม่กี่แบบเข้าด้วยกัน — owner-only, public-read-owner-write, role-based, multi-tenant — และ bug ของ RLS ในโลกจริงส่วนใหญ่มาจาก policy ที่ permissive เกินกว่าที่คนเขียนตั้งใจ หรือจาก `auth.uid()` ที่ถูกเรียกทุก row เงียบ ๆ แทนที่จะเรียกครั้งเดียวต่อ query
 
 ## Owner-only rows
 
@@ -47,7 +48,7 @@ with check (auth.uid() = user_id);
 
 ## Role-based access
 
-บางครั้งสิทธิ์การเข้าถึงขึ้นกับ role ไม่ใช่ความเป็นเจ้าของ เช่น admin ที่ moderate content ของทุกคนได้ วิธีที่นิยมคือใช้ table `user_roles` แล้ว join เข้าไปใน policy condition (custom claim ที่ฝังตรงใน JWT ก็เป็นอีกทางเลือกหนึ่ง แต่ table แบบ join จัดการง่ายกว่าเพราะไม่ต้องออก token ใหม่ทุกครั้ง)
+บางครั้งสิทธิ์การเข้าถึงขึ้นกับ role ไม่ใช่ความเป็นเจ้าของ เช่น admin ที่ moderate content ของทุกคนได้ วิธีที่นิยมคือใช้ table `user_roles` แล้ว join เข้าไปใน policy condition:
 
 ```sql
 create policy "Admins can delete any post"
@@ -62,30 +63,331 @@ using (
 );
 ```
 
-## Pitfall: policy อันเดียวไม่ครอบคลุมทุก operation
+## Multi-tenant: pattern ของ tenant_id claim
 
-RLS ถูกประเมิน **แยกตาม operation** — `select`, `insert`, `update`, `delete` แต่ละอันเช็คกับ policy ของตัวเองแยกกันโดยอิสระ table หนึ่งใบจึงมี policy `select` ที่ใช้งานได้ปกติ แต่ไม่มี policy `insert` เลยก็ได้ง่าย ๆ ผลคือ อ่านได้ปกติ แต่ทุกการเขียนจะ fail แบบเงียบ ๆ ด้วย permission error ซึ่งดูเหมือน bug ของโค้ดฝั่งแอป ทั้งที่จริง ๆ แค่ลืม policy ก่อน deploy table ควรเช็ก operation ที่แอปต้องใช้กับ table นั้นทีละอัน แล้วให้แน่ใจว่ามี policy ครบทุกตัว
-
-## Pitfall เรื่อง performance: column ที่ policy ใช้กรองแต่ไม่มี index
-
-condition ของ policy รันกับทุก row ที่ Postgres พิจารณาใน query เหมือนกับ `where` clause เป๊ะ ถ้า column ที่ policy ใช้กรอง — ส่วนใหญ่คือ `user_id` ในตัวอย่างข้างบน — ไม่มี index query ที่ดูเรียบง่ายอาจกลายเป็น full sequential scan ทันทีที่ table มีข้อมูลจริงเยอะขึ้น ให้ index column ที่ RLS policy อ้างอิงเหมือนที่ทำกับ column ที่ถูก filter บ่อย ๆ ทั่วไป
+รูปแบบที่ต่างออกไปจากความเป็นเจ้าของโดยสิ้นเชิง: หลาย row เป็นของ **tenant** (บริษัท, workspace, องค์กร) ไม่ใช่ของ user คนเดียว และทุก row ต้องแยกเฉพาะ tenant ของผู้เรียกเท่านั้น condition หน้าตาคล้าย `auth.uid()` มาก ต่างกันตรงที่มันอ่าน **custom claim** — `tenant_id` — จาก JWT แทน `sub` ที่มีมาให้เลย:
 
 ```sql
-create index on public.posts (user_id);
+-- supabase/migrations/5103_rls_orders_tenant.sql
+create table public.rls_orders (
+  id uuid primary key default gen_random_uuid(),
+  tenant_id uuid not null,
+  amount numeric not null
+);
+
+alter table public.rls_orders enable row level security;
+
+create policy rls_orders_tenant_isolation on public.rls_orders
+  for select
+  using (tenant_id = ((select auth.jwt()) ->> 'tenant_id')::uuid);
+
+insert into public.rls_orders (tenant_id, amount) values
+  ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 100),
+  ('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 200);
 ```
 
-อีกจุดที่ควรรู้ไว้คือการห่อ `auth.uid()` ด้วย `select` ภายใน policy condition จะทำให้ Postgres ประเมินแค่ครั้งเดียวต่อ query แทนที่จะประเมินทุก row ซึ่งมีผลชัดเจนเมื่อ table มี row เยอะขึ้น
+พิสูจน์ ในฐานะ user จริงที่ JWT มี `tenant_id: aaaaaaaa-...`:
+
+```text
+=# set role authenticated;
+=# set request.jwt.claims = '{"sub":"64721d1e-dd1d-4672-bdb0-519dcde3c455","role":"authenticated","tenant_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}';
+=# select tenant_id, amount from public.rls_orders;
+              tenant_id               | amount
+--------------------------------------+--------
+ aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa |    100
+(1 row)
+```
+
+order $200 ของอีก tenant ไม่โผล่มาเลย — กลไกเดียวกับ `auth.uid()` ทุกประการ ใช้กับ claim ที่ backend ของคุณเองต้องเป็นคนใส่เข้าไป เพราะ `tenant_id` ไม่ใช่ claim ที่ GoTrue ออกให้อัตโนมัติ นั่นคือสิ่งที่ section ถัดไปมีไว้ทำ
+
+## Auth Hook: Customize Access Token (JWT) Claims
+
+`auth.jwt()` มีแค่สิ่งที่ GoTrue ใส่เข้าไปในโทเค็นเท่านั้น — `sub`, `role`, `email`, และ claim มาตรฐานอีกไม่กี่ตัว (พิสูจน์แล้วในบทก่อนหน้า) `tenant_id`, subscription tier, permission set ที่ cache ไว้ — ไม่มีอันไหนอยู่ใน JWT เลยถ้าไม่มีอะไรใส่มันเข้าไป กลไกสำหรับเรื่องนี้คือ **Auth Hook** ฟังก์ชัน Postgres ที่ GoTrue เรียกตอนออก token ตั้งค่าด้วย `[auth.hook.custom_access_token]` ใน `supabase/config.toml`:
+
+```toml
+# supabase/config.toml (NOT applied to the shared probe — see callout below)
+[auth.hook.custom_access_token]
+enabled = true
+uri = "pg-functions://postgres/public/rls_custom_access_token_hook"
+```
+
+ตัว hook function เองรับ argument เดียวเป็น `jsonb` — event payload ที่มี `user_id` กับ claims ที่ GoTrue ประกอบมาแล้วจนถึงตอนนั้น — และต้องคืนค่าเป็น `jsonb` รูปร่าง `{"claims": {...}}` ([supabase.com/docs/guides/auth/auth-hooks/custom-access-token-hook](https://supabase.com/docs/guides/auth/auth-hooks/custom-access-token-hook)):
 
 ```sql
-create policy "Owners can update their posts"
-on public.posts
-for update
-using ((select auth.uid()) = user_id);
+-- supabase/migrations/5104_rls_custom_access_token_hook.sql
+create table public.rls_user_tenants (
+  user_id uuid primary key,
+  tenant_id uuid not null
+);
+
+insert into public.rls_user_tenants (user_id, tenant_id) values
+  ('64721d1e-dd1d-4672-bdb0-519dcde3c455', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa');
+
+create or replace function public.rls_custom_access_token_hook(event jsonb)
+returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  claims jsonb;
+  found_tenant uuid;
+begin
+  claims := event->'claims';
+
+  select tenant_id into found_tenant
+  from public.rls_user_tenants
+  where user_id = (event->>'user_id')::uuid;
+
+  if found_tenant is not null then
+    claims := jsonb_set(claims, '{tenant_id}', to_jsonb(found_tenant::text));
+  end if;
+
+  return jsonb_build_object('claims', claims);
+end;
+$$;
+
+-- per docs: only supabase_auth_admin may call this, never a client role
+grant execute on function public.rls_custom_access_token_hook to supabase_auth_admin;
+revoke execute on function public.rls_custom_access_token_hook from authenticated, anon, public;
+```
+
+<Callout title="สิ่งที่พิสูจน์ได้จริงตรงนี้ กับสิ่งที่พิสูจน์ไม่ได้">
+local stack ที่ใช้ร่วมกันของคอร์สนี้มีหลาย lesson/agent ใช้พร้อมกัน `config.toml` ของมันจึงไม่ใช่สิ่งที่ lesson ไหน lesson หนึ่งแก้เองได้ (`[auth.hook.custom_access_token]` เป็นการเปลี่ยนระดับ project ไม่ใช่ระดับ lesson) การพิสูจน์ด้านล่างเลยเรียก hook function **ตรง ๆ ด้วย sample event** เหมือนที่ GoTrue จะทำเป๊ะ — พิสูจน์ logic และรูปร่างค่าที่คืนมาของ function ได้จริง แต่พิสูจน์ **ไม่ได้** ว่า GoTrue เรียกมันจริงตอน sign-in เพราะต้องเปลี่ยน `config.toml` ตามข้างบนบวก restart GoTrue ด้วย ตาม docs พอต่อสายจริงแล้ว object `claims` ที่ return กลับมาจะแทนที่ claims ของ token ทั้งก้อน — ดังนั้น access token ที่ decode ในบทถัดไปจะมี claim `tenant_id` จริง ๆ อยู่ข้าง ๆ `sub`/`role`/`aud` ตรงตามที่พิสูจน์ไว้ด้านล่างนี้เป๊ะ
+</Callout>
+
+เรียก function ตรง ๆ ด้วย sample event ที่มีรูปร่างเหมือนของจริงที่ GoTrue ส่งมา (`user_id` + claims ที่ประกอบมาแล้ว):
+
+```text
+=# select public.rls_custom_access_token_hook(
+  '{"user_id": "64721d1e-dd1d-4672-bdb0-519dcde3c455", "claims": {"aud": "authenticated", "role": "authenticated", "sub": "64721d1e-dd1d-4672-bdb0-519dcde3c455"}}'::jsonb
+);
+                                                    rls_custom_access_token_hook
+-------------------------------------------------------------------------------------------------------------------------------------
+ {"claims": {"aud": "authenticated", "sub": "64721d1e-dd1d-4672-bdb0-519dcde3c455", "role": "authenticated", "tenant_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}}
+(1 row)
+
+-- a user with no row in rls_user_tenants: claims pass through unchanged, no error
+=# select public.rls_custom_access_token_hook(
+  '{"user_id": "8f07c3e8-0ce3-4d88-b1b7-75c93cca74ec", "claims": {"aud": "authenticated", "role": "authenticated", "sub": "8f07c3e8-0ce3-4d88-b1b7-75c93cca74ec"}}'::jsonb
+);
+                                         rls_custom_access_token_hook
+--------------------------------------------------------------------------------------------------------------
+ {"claims": {"aud": "authenticated", "sub": "8f07c3e8-0ce3-4d88-b1b7-75c93cca74ec", "role": "authenticated"}}
+(1 row)
+```
+
+claim `tenant_id` โผล่มาในผลลัพธ์ของการเรียกครั้งแรก ตรงกับที่ policy `rls_orders_tenant_isolation` ข้างบนคาดหวังไว้เป๊ะ — พิสูจน์ว่า function ทำสิ่งเดียวกับที่ hook ที่ต่อสายผ่าน config แล้วจะป้อนเข้าไปใน JWT ทุกอันของ user คนนั้นถัดจากนี้ การเรียกครั้งที่สองพิสูจน์ว่า hook fail safe: ไม่เจอ mapping, claims ผ่านไปเหมือนเดิมไม่แตะต้อง ไม่มี error โยนออกมาเลย (hook ที่ raise exception แทนจะบล็อก sign-in ทั้งหมดสำหรับทุก user ที่ไม่มี mapping ซึ่งไม่ใช่พฤติกรรมที่ต้องการสำหรับ claim แบบ optional ส่วนใหญ่)
+
+## Pitfall: policy อันเดียวไม่ครอบคลุมทุก operation
+
+RLS ถูกประเมิน **แยกตาม operation** — `select`, `insert`, `update`, `delete` แต่ละอันเช็คกับ policy ของตัวเองแยกกันโดยอิสระ table หนึ่งใบจึงมี policy `select` ที่ใช้งานได้ปกติ แต่ไม่มี policy `insert` เลยก็ได้ง่าย ๆ — พิสูจน์ด้วยการ insert จริงผ่าน Data API ในฐานะ user จริงที่ signed-in:
+
+```sql
+-- supabase/migrations/5101_rls_comments_forgot_insert.sql
+create table public.rls_comments (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null,
+  body text not null
+);
+
+alter table public.rls_comments enable row level security;
+
+create policy rls_comments_select on public.rls_comments
+  for select
+  using (true);
+-- no insert policy at all
+```
+
+```bash
+# scripts/rls-forgot-insert-proof.sh
+curl -s -X POST "$API_URL/rest/v1/rls_comments" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ALICE_TOKEN" \
+  -H "Content-Type: application/json" -H "Prefer: return=representation" \
+  -d '{"user_id":"64721d1e-dd1d-4672-bdb0-519dcde3c455","body":"hello"}'
+```
+
+```text
+{"code":"42501","details":null,"hint":null,"message":"new row violates row-level security policy for table \"rls_comments\""}
+```
+
+`42501` คือ SQLSTATE จริงของ Postgres สำหรับ `insufficient_privilege` — ไม่ใช่ "bad request" ทั่วไป แต่คือฐานข้อมูลเองที่ปฏิเสธการเขียนเพราะไม่มี policy `insert` อนุญาตไว้ โผล่ตรง ๆ ผ่าน JSON error body ของ PostgREST เลย อ่านสำเร็จ (`select` มี policy) ทุกการเขียนจะดูเหมือน bug ของโค้ดฝั่งแอป ทั้งที่จริง ๆ แค่ลืม policy ของ operation นั้นอันเดียว
+
+## Misconception: "using โดยไม่มี with_check บน update แปลว่า row ถูกขโมยได้"
+
+นี่คือ pitfall ตามที่มักถูกเล่าทั่วไปในอินเทอร์เน็ต แต่พฤติกรรมจริงละเอียดกว่านั้น — และพอเห็นกลไกจริงแล้วน่าสนใจกว่าที่คิด ตาม docs: *"ถ้าไม่มี `with check` expression นิยามไว้ `using` expression จะตัดสินทั้งว่า row ไหนมองเห็นได้ และ row ใหม่ไหนอนุญาตให้เขียน"* ([supabase.com/docs/guides/database/postgres/row-level-security](https://supabase.com/docs/guides/database/postgres/row-level-security)) พิสูจน์ — policy `update` แบบ owner-only ธรรมดา ที่มี `using` แต่ไม่มี `with_check` เลย:
+
+```sql
+create policy rls_todos_update_naive on public.rls_todos
+  for update
+  using (auth.uid() = user_id);
+  -- no with_check — does this let Alice hand her row to Bob?
+```
+
+```text
+=# set role authenticated;
+=# set request.jwt.claims = '{"sub":"<alice>","role":"authenticated"}';
+=# update public.rls_todos set user_id = '<bob>' where user_id = '<alice>';
+ERROR:  new row violates row-level security policy for table "rls_todos"
+```
+
+**ถูกบล็อก** — เพราะ Postgres เอา `using (auth.uid() = user_id)` มาใช้เป็น `with_check` ด้วย และ row *หลัง* update (`user_id = bob` แต่ `auth.uid()` ยังเป็น Alice) ไม่ผ่าน condition ที่ reuse มานั้น bug ที่ขโมย row ได้จริงหน้าตาต่างออกไป: ต้องให้ `using` เองอนุญาตกว้างพอจน reuse เป็น `with_check` แล้วไม่ได้ป้องกันอะไรเลย:
+
+```sql
+-- supabase/migrations/5102_rls_notes_hijack.sql
+create table public.rls_notes (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null,
+  body text not null
+);
+
+alter table public.rls_notes enable row level security;
+
+create policy rls_notes_select on public.rls_notes
+  for select
+  using (true);
+
+-- BUG: "any authenticated user can update rows in this shared workspace",
+-- with no with_check — using (true) reused as with_check (true) protects nothing
+create policy rls_notes_update_buggy on public.rls_notes
+  for update
+  using (true);
+
+insert into public.rls_notes (user_id, body) values
+  ('64721d1e-dd1d-4672-bdb0-519dcde3c455', 'alice note');
+```
+
+```text
+=# set role authenticated;
+=# set request.jwt.claims = '{"sub":"8f07c3e8-0ce3-4d88-b1b7-75c93cca74ec","role":"authenticated"}';
+
+-- Bob, who does not own this row at all, reassigns it to himself
+=# update public.rls_notes set user_id = '8f07c3e8-0ce3-4d88-b1b7-75c93cca74ec' where body = 'alice note';
+UPDATE 1
+=# select id, user_id, body from public.rls_notes;
+                  id                  |               user_id                |    body
+--------------------------------------+--------------------------------------+------------
+ e7020178-607f-4e56-913a-d04a19aaeb8a | 8f07c3e8-0ce3-4d88-b1b7-75c93cca74ec | alice note
+(1 row)
+```
+
+ขโมย row ได้จริง พิสูจน์แล้ว: Bob ที่ไม่เคยเป็นเจ้าของ row นี้เลย ตอนนี้เป็นเจ้าของแล้ว ทางแก้ไม่ใช่ "เติม `with_check` อะไรก็ได้เข้าไป" — แต่คือทำให้ `using` เองผูกกับความเป็นเจ้าของ ทำให้ Bob เข้าไม่ถึง row นี้ตั้งแต่แรกเลย:
+
+```sql
+drop policy rls_notes_update_buggy on public.rls_notes;
+
+create policy rls_notes_update_fixed on public.rls_notes
+  for update
+  using ((select auth.uid()) = user_id)
+  with check ((select auth.uid()) = user_id);
+```
+
+```text
+=# set role authenticated;
+=# set request.jwt.claims = '{"sub":"8f07c3e8-0ce3-4d88-b1b7-75c93cca74ec","role":"authenticated"}';
+=# update public.rls_notes set user_id = '8f07c3e8-0ce3-4d88-b1b7-75c93cca74ec' where body = 'alice second note';
+UPDATE 0
+=# select id, user_id, body from public.rls_notes where body = 'alice second note';
+                  id                  |               user_id                |       body
+--------------------------------------+--------------------------------------+-------------------
+ bca0db75-bf26-4160-ae85-7ffbc45b76e8 | 64721d1e-dd1d-4672-bdb0-519dcde3c455 | alice second note
+(1 row)
+```
+
+`UPDATE 0` — where clause ของ Bob ไม่ match row ที่เขาไม่ได้เป็นเจ้าของเลย ก็เลยไม่เหลืออะไรให้ `with_check` ต้องปฏิเสธด้วยซ้ำ บทเรียนไม่ใช่ "ต้องเขียน `with_check` ชัดเจนเสมอ" (Postgres ครอบให้อยู่แล้ว) — แต่คือ "clause `using` ของ policy `update` ทำหน้าที่สองอย่างพร้อมกันคือเป็น write-check ด้วยทันทีที่ไม่มี `with_check` ดังนั้น `using (true)` ที่ permissive บน `update` อันตรายพอ ๆ กับ `with_check (true)` ที่ permissive เป๊ะ"
+
+## Pitfall เรื่อง performance: `(select auth.uid())` กับ column ที่ policy ใช้กรองแต่ไม่มี index
+
+condition ของ policy รันกับทุก row ที่ Postgres พิจารณาใน query เหมือนกับ `where` clause เป๊ะ มีต้นทุนแยกกันสองอย่างที่ซ้อนกันได้ตอนข้อมูลเยอะขึ้น: `auth.uid()` เองถูกประเมินบ่อยแค่ไหน กับ column ที่มันเทียบด้วยมี index หรือเปล่า พิสูจน์บน table จริง 100,000 row (สร้างขึ้นมาเพื่อพิสูจน์นี้ แล้วลบทิ้งทันทีหลังจากนั้น):
+
+```sql
+-- illustrative: this 100k-row table is generated and dropped within the same
+-- manual proof session below, never left behind, never applied through the
+-- harness's --apply on this shared stack (no migration path comment on purpose)
+create table public.rls_big (
+  id bigint generated always as identity primary key,
+  user_id uuid not null,
+  amount numeric not null
+);
+
+insert into public.rls_big (user_id, amount)
+select
+  case when i % 10000 = 0 then '64721d1e-dd1d-4672-bdb0-519dcde3c455'::uuid
+       else gen_random_uuid() end,
+  (random() * 1000)::numeric
+from generate_series(1, 100000) as i;
+
+alter table public.rls_big enable row level security;
+
+create policy rls_big_naive on public.rls_big
+  for select
+  using (auth.uid() = user_id);
+```
+
+Stage 1 — `auth.uid() = user_id` แบบธรรมดา ไม่มี index ในฐานะ user เจ้าของจริง (10 จาก 100,000 row match):
+
+```text
+=# explain analyze select * from public.rls_big;
+ Seq Scan on rls_big  (cost=0.00..3665.43 rows=404 width=56) (actual time=8.545..86.759 rows=10 loops=1)
+   Filter: ((COALESCE(NULLIF(current_setting('request.jwt.claim.sub'::text, true), ''::text), ((NULLIF(current_setting('request.jwt.claims'::text, true), ''::text))::jsonb ->> 'sub'::text)))::uuid = user_id)
+   Rows Removed by Filter: 99990
+ Planning Time: 0.187 ms
+ Execution Time: 86.787 ms
+```
+
+`auth.uid()` คือ SQL function ที่ห่อ `current_setting(...)` — เขียนแบบข้างบนโดยไม่มี `select` Postgres จะประเมิน expression ทั้งก้อนนี้ใหม่ **ทุก row** ที่มันกรอง ครบทั้ง 100,000 row ซึ่ง `Filter:` ที่ขยาย function เต็ม ๆ ให้เห็นตรง ๆ ใน plan เลย
+
+Stage 2 — ห่อด้วย `(select auth.uid())` ยังไม่มี index:
+
+```sql
+drop policy rls_big_naive on public.rls_big;
+
+create policy rls_big_wrapped on public.rls_big
+  for select
+  using ((select auth.uid()) = user_id);
+```
+
+```text
+=# explain analyze select * from public.rls_big;
+ Seq Scan on rls_big  (cost=0.03..1845.26 rows=404 width=56) (actual time=0.379..3.482 rows=10 loops=1)
+   Filter: ((InitPlan 1).col1 = user_id)
+   Rows Removed by Filter: 99990
+   InitPlan 1
+     ->  Result  (cost=0.00..0.03 rows=1 width=16) (actual time=0.005..0.005 rows=1 loops=1)
+ Planning Time: 0.129 ms
+ Execution Time: 3.502 ms
+```
+
+**86.8ms → 3.5ms** เร็วขึ้นประมาณ 25 เท่า scan แบบเดิม (seq scan) ข้อมูล 100,000 row เท่าเดิม ผลลัพธ์เท่าเดิม — ต่างกันแค่ `InitPlan 1`: ตอนนี้ Postgres ประเมิน `auth.uid()` แค่ **ครั้งเดียว** ต่อ query แล้วใช้ผลลัพธ์ที่ cache ไว้ (`(InitPlan 1).col1`) ซ้ำกับทุก row แทนที่จะคำนวณใหม่ 100,000 ครั้ง
+
+Stage 3 — เพิ่ม index ให้ column ของ policy บนฐานที่ห่อไว้แล้ว:
+
+```sql
+create index rls_big_user_id_idx on public.rls_big (user_id);
+```
+
+```text
+=# explain analyze select * from public.rls_big;
+ Bitmap Heap Scan on rls_big  (cost=12.33..773.83 rows=500 width=56) (actual time=0.042..0.055 rows=10 loops=1)
+   Recheck Cond: ((InitPlan 1).col1 = user_id)
+   Heap Blocks: exact=10
+   InitPlan 1
+     ->  Result  (cost=0.00..0.03 rows=1 width=16) (actual time=0.009..0.009 rows=1 loops=1)
+   ->  Bitmap Index Scan on rls_big_user_id_idx  (cost=0.00..12.17 rows=500 width=0) (actual time=0.037..0.037 rows=10 loops=1)
+         Index Cond: (user_id = (InitPlan 1).col1)
+ Planning Time: 0.258 ms
+ Execution Time: 0.096 ms
+```
+
+**3.5ms → 0.096ms** ทับบนของเดิมอีกที — Postgres เลิก scan ทั้ง 100,000 row แล้วกระโดดตรงไปหา 10 row ที่ match ผ่าน index เลย ทางแก้ทั้งสองอย่างเป็นอิสระต่อกันและซ้อนกันได้: `(select auth.uid())` แก้ *จำนวนครั้งที่ function ถูกเรียก* index แก้ *วิธี scan table* — ข้ามอันไหนไปอันหนึ่งก็เสีย performance จริงไปเปล่า ๆ (เวลาทั้งหมดมาจาก Mac เครื่องนี้ — ตัวเลขจริงต่างกันไปตาม hardware แต่ช่องว่างเชิงสัดส่วนไม่เปลี่ยน)
+
+```sql
+drop table public.rls_big;
 ```
 
 ## Test policy ก่อน ship
 
-อย่าคิดเอาเองว่า policy ทำงานถูกต้อง ให้ test ในฐานะ user ที่ตั้งใจจะจำกัดสิทธิ์ table editor ของ Supabase Studio มี feature impersonation ไว้สำหรับเรื่องนี้โดยเฉพาะ หรือจะทำแบบเดียวกันตรง ๆ ใน SQL session ก็ได้ด้วยการสลับ role แล้วตั้ง claim ของ JWT ให้เหมือน request จริง
+อย่าคิดเอาเองว่า policy ทำงานถูกต้อง ให้ test ในฐานะ user ที่ตั้งใจจะจำกัดสิทธิ์ table editor ของ Supabase Studio มี feature impersonation ไว้สำหรับเรื่องนี้โดยเฉพาะ หรือจะทำแบบเดียวกันตรง ๆ ใน SQL session ก็ได้ด้วยการสลับ role แล้วตั้ง claim ของ JWT ให้เหมือน request จริง — เทคนิคเดียวกับที่ใช้พิสูจน์ทุกอย่างในบทนี้:
 
 ```sql
 set role authenticated;
@@ -96,20 +398,62 @@ select * from public.posts; -- now runs exactly as that user would see it
 reset role;
 ```
 
-<Mermaid title="A missing policy silently blocks one operation while others keep working" code={rlsPitfallsDiagram} />
+<Mermaid title="policy ที่หายไปบล็อกแค่ operation เดียวเงียบ ๆ ในขณะที่อันอื่นยังทำงานปกติ" code={rlsPitfallsDiagram} />
 
 export const rlsPitfallsDiagram = `flowchart TB
   subgraph missing["Table with only a SELECT policy"]
     m1["select policy: present"] --> m2["Reads work"]
-    m3["insert policy: missing"] --> m4["Writes silently blocked"]
+    m3["insert policy: missing"] --> m4["Writes fail: 42501"]
   end
   subgraph covered["Table with all four policies"]
     c1["select / insert / update / delete: all present"] --> c2["Reads and writes both work as intended"]
   end`;
 
 <Callout title="สรุปหนึ่งบรรทัด">
-RLS ในโลกจริงประกอบจาก pattern ไม่กี่แบบ — **owner-only**, **public-read-owner-write** (ที่ต้องใช้ policy สองอันแยกกัน หนึ่งสำหรับ select อีกหนึ่งสำหรับ operation ฝั่งเขียน) และ **role-based access** ผ่าน table `user_roles` ที่ join เข้ามา หรือผ่าน custom JWT claim แต่ความผิดพลาดสองแบบเดิมคือต้นเหตุของ bug ส่วนใหญ่ — ลืม policy ของ **operation ใด operation หนึ่ง** ทั้งที่ operation อื่นยังทำงานปกติ (อ่านได้ แต่เขียนแล้ว fail แบบเงียบ ๆ) และการอ้างอิง **column ที่ไม่มี index** ใน policy condition ซึ่งทำให้ query ที่ดูไม่มีพิษภัยกลายเป็น sequential scan เมื่อข้อมูลเยอะขึ้น ให้ test policy ด้วยการ impersonate เป็น user ที่จะจำกัดสิทธิ์เสมอก่อน ship
+RLS ในโลกจริงประกอบจาก pattern ไม่กี่แบบ — **owner-only**, **public-read-owner-write**, **role-based** access ผ่าน table ที่ join เข้ามา และ **multi-tenant** isolation ผ่าน claim `tenant_id` (ที่ต้องมี **Auth Hook** ถึงจะมีอยู่ใน JWT ได้เลย พิสูจน์แล้วข้างบนด้วยการเรียก hook function ตรง ๆ) — แต่ความผิดพลาดจริงไม่กี่แบบเป็นต้นเหตุของ bug ส่วนใหญ่: policy ที่หายไปของ **operation เดียว** โยน `42501` จริงเฉพาะ operation นั้น ในขณะที่อันอื่นยังทำงานปกติ; clause `using` ของ policy `update` ถูก reuse เป็น `with_check` เมื่อไม่มีให้ ดังนั้น `using (true)` ที่ permissive อันตรายพอ ๆ กับ `with_check (true)` ที่ permissive (พิสูจน์แล้ว: Bob ขโมย row ของ Alice ได้ก็ต่อเมื่อ `using` เองไม่ได้ผูกกับความเป็นเจ้าของ); และ `auth.uid()` ที่ห่อด้วย `(select ...)` บวกกับ index บน column ของ policy คือทางแก้ performance สองอย่างที่เป็นอิสระและซ้อนกันได้ (พิสูจน์แล้ว: 86.8ms → 3.5ms → 0.096ms บนข้อมูล 100,000 row)
 </Callout>
+
+## อ่านโค้ดที่ AI สร้าง
+
+AI assistant ถูกขอให้ "ให้ทีมสมาชิกคนไหนก็ reassign task ที่แชร์กันให้คนอื่นได้" แล้วสร้างโค้ดนี้มา:
+
+<SpotTheBug lang="sql" code={`create table public.rls_tasks (
+  id uuid primary key default gen_random_uuid(),
+  assignee_id uuid not null,
+  title text not null
+);
+
+alter table public.rls_tasks enable row level security;
+
+create policy "team members can read all tasks"
+on public.rls_tasks
+for select
+using (true);
+
+create policy "team members can reassign tasks"
+on public.rls_tasks
+for update
+using (true);
+`}>
+policy `select` เป็นทางเลือกที่สมเหตุสมผลสำหรับ shared team view ส่วน policy `update` คือบั๊กจริง และเป็นรูปแบบเดียวกับที่พิสูจน์แล้วในบทนี้เป๊ะ: `using (true)` ไม่มี `with_check` เลย ตาม docs Postgres จะ reuse `using` เป็น `with_check` เมื่อไม่มีให้ — แต่ reuse `true` เป็น `true` ไม่ป้องกันอะไรเลย ทีมสมาชิกที่ authenticated คนไหนก็รัน `update rls_tasks set assignee_id = '<ใครก็ได้>', title = '<อะไรก็ได้>' where id = '<task ไหนก็ได้ แม้จะไม่ใช่ของตัวเอง>'` ได้ตอนนี้ — ไม่ใช่แค่ reassign task ให้ *เพื่อนร่วมทีม* แต่แก้ title ได้ด้วย เพราะ `using (true)` ไม่เคยจำกัดเลยว่า "reassign" หมายถึง task *ไหน* หรือ column *ไหน* ทางแก้ต้องบอกสิ่งที่ตั้งใจจริง ๆ: `using (assignee_id = (select auth.uid()) or exists (select 1 from public.rls_task_members where task_id = id and member_id = (select auth.uid())))` เพื่อจำกัดว่า task ไหนที่สมาชิกคนนั้นแตะได้เลย และ `with_check` ที่อนุญาตให้ `assignee_id` เปลี่ยนเป็นได้แค่ *สมาชิกทีมจริง* เท่านั้น (เช่น `with check (exists (select 1 from public.rls_task_members where task_id = id and member_id = assignee_id))`) — `using (true)` สำหรับ `update` ควรเป็นทางเลือกที่ตั้งใจและหายาก (admin/service function) ไม่ใช่ทางลัด default สำหรับ "ให้คนอื่นนอกจาก owner จริง ๆ แตะ row ได้"
+</SpotTheBug>
+
+## Mental Model
+
+policy `update` ทุกอันบังคับใช้สองเงื่อนไขจริง ๆ แม้คุณจะเขียนแค่อันเดียว: `using` คุมว่า row ไหนที่คุณ *เล็งเป้าได้เลย* (ประเมินกับ row ตามสภาพก่อน statement รัน) และ `with_check` — ไม่ว่าจะเขียนชัดเจน หรือถ้าไม่เขียน `using` จะถูก reuse มาแทนคำต่อคำ — คุมว่า row ที่ได้อนุญาตให้ *กลายเป็น* อะไรได้บ้าง การอ่าน policy `update` คือต้องถามทั้งสองคำถามเสมอ "row ที่มีอยู่แล้วอันไหนแตะได้บ้าง" และ "อะไรกันไม่ให้ row ที่ได้กลายเป็นอะไรก็ได้" เพราะ `using` clause ที่ตอบคำถามแรกแบบ permissive ก็ตอบคำถามที่สองแบบเดียวกันเงียบ ๆ ด้วย ในแง่ performance policy ของ RLS ก็แค่ expression อีกอันใน clause แบบ `where` — กฎทั่วไปของ Postgres สำหรับ sub-expression ที่แพงและถูกเรียกซ้ำ (ห่อด้วย `select` เพื่อได้ InitPlan ที่ cache ไว้) กับกฎทั่วไปสำหรับ filter table ใหญ่ (index column ที่ถูก filter) ใช้กับ policy condition ได้เหมือนกับ query อื่นทุกอย่าง — RLS ไม่ได้รับการยกเว้นด้าน performance เป็นพิเศษ และก็ไม่ได้โดนโทษพิเศษเช่นกัน ถ้าเขียนแบบเดียวกับที่เขียน query ที่ filter ทั่วไป
+
+## Trade-offs
+
+- **claim `tenant_id` + Auth Hook ทำให้ multi-tenant isolation เหลือแค่การอ่าน JWT ครั้งเดียว แทนที่จะ join ทุก query** — แลกกับส่วนที่อยู่นอกฐานข้อมูลเอง: hook มีผลก็ต่อเมื่อมีการออก token **ใหม่** เท่านั้น (sign-in หรือ refresh รอบถัดไป) การเปลี่ยน `tenant_id` ของ user ที่มีอยู่แล้วจึงไม่ย้อนไปอัปเดต access token ที่ออกไปแล้วและยังใช้ได้อยู่
+- **การ reuse `using` เป็น `with_check` (default ของ Postgres เอง) ทำให้ clause เดียวครอบทั้งสองทิศทางได้ถูกต้องถ้า policy ถูก scope มาดีแล้ว** — แลกกับความรู้สึกปลอดภัยปลอม ๆ ถ้า clause นั้นดันดัน permissive เกินตั้งใจ เพราะไม่มีอะไรอื่นคอยป้องกันการเขียนอีกแล้ว
+- **`(select auth.uid())` กับ index บน column ของ policy เพิ่มง่ายมากและง่ายในเชิงกลไก** — แลกกับการลืมง่ายพอ ๆ กัน เพราะ table เล็ก ๆ สำหรับ test ไม่เคยเผยความต่างเลย ทั้งสอง pitfall มองไม่เห็นเลยจนกว่า table จะมีข้อมูลจริงระดับ production
+
+## Common Misconceptions
+
+- **"ลืม `with_check` บน policy update แปลว่ามีช่องโหว่ hijack เสมอ"** พิสูจน์แล้วว่าไม่จริง: Postgres reuse `using` เป็น `with_check` เมื่อไม่มีให้ ดังนั้น `using (auth.uid() = user_id)` ที่ scope ตามความเป็นเจ้าของแล้วปลอดภัยอยู่แล้วแม้ไม่มี `with_check` เลย ความเสี่ยงจริง ๆ คือ `using` ที่ permissive (แบบ `using (true)`) ไม่ใช่แค่การไม่มี `with_check`
+- **"policy select ครอบคลุมการอ่านแล้ว การเข้าถึง table ก็ถือว่าเซ็ตครบ"** policy `select` ไม่ได้บอกอะไรเลยเกี่ยวกับ `insert`/`update`/`delete` — แต่ละอันถูกเช็คแยกกันโดยอิสระ และตัวที่หายไปจะโยน `42501` จริง ๆ ตรง ๆ ไม่ใช่ fallback ที่นุ่มนวลกว่า
+- **"`auth.uid()` เร็วอยู่แล้วเพราะมันคือ `auth.uid()` ไม่ใช่ query จริง"** มันคือ SQL function จริงที่ใช้ `current_setting()` กับการ parse JSON — พิสูจน์แล้วว่ากินเวลาถึง 83ms จาก 86.7ms ทั้งหมดของการ scan 100,000 row เมื่อถูกประเมินซ้ำทุก row แก้ได้ง่าย ๆ ด้วยการห่อด้วย `(select ...)`
+- **"claim `tenant_id` มีอยู่แล้วแค่พอเราอ้างอิงมันใน policy"** custom claim อย่าง `tenant_id` ไม่มีอยู่ที่ไหนใน Supabase JWT เลยถ้าไม่มี Auth Hook ใส่มันเข้าไป การอ้างอิง `(auth.jwt() ->> 'tenant_id')` ใน policy โดยไม่มี hook จะได้ `null` เสมอ
 
 export const quizRlsPatterns = [
   {
@@ -121,36 +465,73 @@ export const quizRlsPatterns = [
       'with check ใช้ร่วมกับ using ใน policy เดียวกันไม่ได้เลย',
     ],
     answer: 1,
+    explain: 'RLS เช็คแต่ละ operation แยกกันโดยอิสระ — policy select ไม่มีผลกับ insert/update/delete เลย พิสูจน์แล้วทั้งบทด้วยตัวอย่าง 42501 กับ hijack',
   },
   {
-    q: 'pitfall เฉพาะของการลืม policy สำหรับ operation หนึ่งบน table คืออะไร',
+    q: 'table หนึ่งมี policy select แต่ไม่มี policy insert client จะเจอ error อะไรจริง ๆ ตอน insert',
     options: [
-      'ทั้ง table จะเปิดให้ทุกคนอ่านได้',
-      'operation นั้นถูกบล็อกแบบเงียบ ๆ (เช่นเขียนไม่ได้) ทั้งที่ operation อื่นที่มี policy ของตัวเองยังทำงานปกติ เพราะ RLS ประเมินแยกตาม operation',
-      'Postgres จะไม่ยอม start เลย',
-      'policy ที่มีอยู่ทั้งหมดบน table จะถูกปิดใช้งานอัตโนมัติ',
+      '500 Internal Server Error ทั่วไปไม่มีรายละเอียด',
+      'error จริงของ Postgres รหัส 42501 ("insufficient_privilege") โผล่ผ่าน JSON error body ของ PostgREST',
+      'insert สำเร็จเงียบ ๆ เพราะ policy select ครอบคลุมอยู่แล้ว',
+      '404 Not Found เพราะดูเหมือน table ไม่มีอยู่',
     ],
     answer: 1,
+    explain: 'พิสูจน์จริงผ่าน curl: {"code":"42501","message":"new row violates row-level security policy..."} — SQLSTATE จริงของ insufficient_privilege ไม่ใช่ error ทั่วไป',
   },
   {
-    q: 'ทำไม policy condition ที่อ้างอิง column ไม่มี index ถึงทำร้าย performance เมื่อข้อมูลเยอะขึ้น',
+    q: 'policy update มี using (auth.uid() = user_id) ไม่มี with_check เลย ตาม docs จะเกิดอะไรขึ้นตอนเขียน',
     options: [
-      'RLS policy ไม่เกี่ยวกับ index เลย',
-      'condition ของ policy ถูกประเมินต่อทุก row ที่ query พิจารณา ถ้าไม่มี index Postgres อาจต้องทำ full sequential scan',
-      'column ที่ไม่มี index จะทำให้ policy ถูกข้ามไปทั้งหมด',
-      'กระทบแค่ operation insert เท่านั้น ไม่กระทบ select',
+      'การเขียนสำเร็จเสมอ เพราะไม่มี with_check แปลว่าไม่มีข้อจำกัดอะไรเลย',
+      'Postgres reuse using expression เป็น with_check ด้วย ดังนั้น condition ความเป็นเจ้าของเดียวกันถูกเช็คกับ row ที่ได้หลังเขียนด้วย',
+      'การเขียนพังเสมอ เพราะ policy update ทุกอันต้องมี with_check',
+      'Postgres เลือก with_check default แบบสุ่มตาม primary key ของ table',
     ],
     answer: 1,
+    explain: 'อ้างอิงจาก docs ตรง ๆ และพิสูจน์แล้ว: การพยายามเปลี่ยน user_id ให้เป็นของคนอื่นถูกบล็อก เพราะ using ที่ reuse มาไม่ผ่านกับ row หลัง update',
   },
   {
-    q: 'วิธีที่ใช้งานได้จริงในการตรวจสอบว่า RLS policy ทำงานตามที่ตั้งใจก่อน ship คืออะไร',
+    q: 'ทำไม Bob ถึงโอน row ของ Alice มาเป็นของตัวเองสำเร็จ ตอน policy update เป็น using (true) ไม่มี with_check',
     options: [
-      'อ่าน SQL แล้วสมมติว่าถูกต้อง',
-      'impersonate เป็น target user ผ่าน Studio หรือ set role/request.jwt.claims ใน SQL session แล้วรัน query ในฐานะ user คนนั้น',
-      'ปิด RLS ชั่วคราวเพื่อดูผลลัพธ์',
-      'ไม่มีทาง test RLS ได้ก่อนขึ้น production',
+      'เพราะ using (true) เป็น case พิเศษที่ปิด RLS ทั้งหมดสำหรับ table นั้น',
+      'เพราะ using(true) ที่ reuse เป็น with_check(true) ไม่มีข้อจำกัดกับ row ที่ได้เลย ทำให้ authenticated user คนไหนก็เล็งเป้าและเขียน row ไหนก็ได้ตามใจ',
+      'เพราะ Bob ได้รับสิทธิ์ service_role สำหรับ request นั้น',
+      'Bob ไม่ได้สำเร็จจริง ๆ — การพิสูจน์แสดงว่า update ถูกปฏิเสธ',
     ],
     answer: 1,
+    explain: 'พิสูจน์จริง: UPDATE 1 แล้ว user_id ของ row กลายเป็นของ Bob — using(true) ไม่ป้องกันอะไรทั้งสองฝั่งของการเขียน ต่างจาก using ที่ scope ตามความเป็นเจ้าของ',
+  },
+  {
+    q: 'บน table 100,000 row การห่อ auth.uid() ด้วย (select auth.uid()) เปลี่ยนเวลาจาก 86.7ms เป็น 3.5ms ทั้งที่ยังไม่มี index เลย เพราะอะไร',
+    options: [
+      'การห่อสร้าง index ซ่อนอัตโนมัติบน column ของ policy',
+      'Postgres ประเมิน expression ที่ห่อไว้แค่ครั้งเดียวต่อ query ผ่าน InitPlan แล้วใช้ผลลัพธ์ที่ cache ไว้ซ้ำ แทนที่จะคำนวณ auth.uid() แบบ current_setting() ใหม่ทุก row',
+      'การห่อเปลี่ยน query จาก sequential scan เป็น index scan',
+      'การห่อไม่มีผลจริง ตัวเลขที่ต่างกันคือ noise จากการวัด',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ผ่าน explain analyze: plan โชว์ "InitPlan 1" แทนที่ expression filter แบบขยายเต็มต่อ row ของ current_setting() — seq scan เหมือนกันทั้งคู่ ต่างแค่ต้นทุนการเรียก function',
+  },
+  {
+    q: 'claim tenant_id ต้องมีอะไรเพิ่มที่ auth.uid() ไม่ต้องมี ถึงจะใช้ใน RLS policy ได้',
+    options: [
+      'ไม่ต้องมีอะไรเลย — Supabase JWT ทุกอันมี claim tenant_id ให้อยู่แล้วโดย default',
+      'Auth Hook (Customize Access Token Claims) ที่เพิ่ม tenant_id เข้า JWT ตอนออก token เพราะไม่ใช่ claim ที่ GoTrue ออกให้อัตโนมัติ',
+      'ต้องมี Supabase project แยกต่างหากต่อ tenant',
+      'ต้องเปิด anonymous sign-ins ใน config.toml',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ด้วยการเรียก hook function ตรง ๆ: event จริงของ user ที่ไม่มี row คู่กันใน rls_user_tenants ผ่านไปโดยไม่มี claim tenant_id เพิ่มเข้ามาเลย — claim มีอยู่ได้ก็เพราะ hook ใส่มันเข้าไปเท่านั้น',
+  },
+  {
+    q: 'custom access token hook function ถูกเรียกด้วย event ของ user ที่ไม่มี row ใน lookup table ที่มันอ้างอิง พฤติกรรมที่ปลอดภัยตามที่พิสูจน์ในบทนี้คืออะไร',
+    options: [
+      'hook raise exception บล็อก sign-in สำหรับ user คนนั้นไปเลย',
+      'hook คืน claims เดิมโดยไม่แตะต้อง ไม่เพิ่ม tenant_id ไม่มี error — sign-in ดำเนินต่อตามปกติ',
+      'hook กำหนด tenant_id แบบสุ่มเพื่อไม่ให้ต้อง return null',
+      'GoTrue crash และต้อง restart local stack',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ตรง ๆ: เรียก rls_custom_access_token_hook ด้วย event ของ Bob (ไม่มี row ใน rls_user_tenants) คืน claims object เดิมไม่แตะต้อง — claim แบบ optional ที่ fail safe แทนที่จะบล็อก auth',
   },
 ];
 
