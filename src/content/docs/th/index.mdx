@@ -40,6 +40,12 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
   <Card title="Production & Ecosystem" icon="puzzle">
     Supavisor connection pooling, branching กับ migration, performance กับ indexing และ production checklist [ขึ้น production →](/supabase/th/production-and-ecosystem/connection-pooling-and-supavisor/)
   </Card>
+  <Card title="Supabase ทำงานอย่างไรข้างใน" icon="seti:config">
+    Postgres role กับ grant (authenticator, anon, service_role), SQL ที่ PostgREST สร้างจริง, isolate ของ edge-runtime, Realtime WAL pipeline และวงจรชีวิตของ auth token — ทุก claim พิสูจน์บน local stack จริงด้วย psql, curl และ source ของแต่ละ service [ดูข้างใน →](/supabase/th/supabase-internals/)
+  </Card>
+  <Card title="อ่านโค้ด Supabase ที่ AI เขียน" icon="magnifier">
+    catalog 27 bug ที่ schema, RLS policy, supabase-js และ edge function จาก AI เขียนผิด, review checklist, บันได verification tool (db lint, pgTAP, explain analyze, gen types, deno check, MCP) และ worked review 3 ชุด — ทุก bug พิสูจน์จริง [ไป review →](/supabase/th/reading-supabase/)
+  </Card>
 </CardGrid>
 
 ## คอร์สนี้ทำงานยังไง
