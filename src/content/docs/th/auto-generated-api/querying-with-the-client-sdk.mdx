@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
@@ -65,6 +66,123 @@ if (error) {
 const { data, error } = await supabase.from('movies').select('title, directors(name)');
 ```
 
+## Filter และ operator รันจริง
+
+filter operator ทุกตัวจาก raw REST API มี builder method ที่ตรงกัน — `.eq()`, `.gte()`/`.lte()`, `.like()`/`.ilike()`, `.in()` และอีกมาก — แต่ละตัวเติม query parameter `column=operator.value` เดียวกับที่เห็นในบทก่อนหน้าเป๊ะ รันกับ table `agapi_movies` จริงจากบทนั้น:
+
+```ts
+// src/agapi-filters-and-pagination.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+declare const process: { env: Record<string, string | undefined> };
+
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!);
+
+const { data: recent } = await supabase
+  .from('agapi_movies')
+  .select('title,year')
+  .gte('year', 2021)
+  .order('year');
+console.log('gte 2021:', recent);
+
+const { data: matches } = await supabase
+  .from('agapi_movies')
+  .select('title')
+  .ilike('title', '%things%');
+console.log('ilike %things%:', matches);
+
+const { data: inList } = await supabase
+  .from('agapi_movies')
+  .select('title,year')
+  .in('year', [2021, 2023]);
+console.log('in [2021,2023]:', inList);
+```
+
+```text
+gte 2021: [ { title: 'Dune', year: 2021 }, { title: 'Barbie', year: 2023 }, { title: 'Poor Things', year: 2023 }, ... ]
+ilike %things%: [ { title: 'Poor Things' } ]
+in [2021,2023]: [ { title: 'Dune', year: 2021 }, { title: 'Barbie', year: 2023 }, { title: 'Poor Things', year: 2023 }, ... ]
+```
+
+`.ilike()` คือคู่แบบไม่สนตัวพิมพ์ใหญ่เล็กของ `.like()` — เป็น operator `ilike.` ของ PostgREST เอง ไม่ใช่ filter ฝั่ง client; query ยังรันข้างใน Postgres ทั้งหมด
+
+## Pagination: `.range()` ไม่ได้ใช้ HTTP `Range` header
+
+PostgREST รองรับกลไก pagination สองแบบที่เป็นอิสระจากกัน (ตาม docs ของมันเอง — [docs.postgrest.org — Pagination and Count](https://docs.postgrest.org/en/stable/references/api/pagination_count.html)): header `Range`/`Range-Unit` ของ request และ query parameter `limit`/`offset` ธรรมดา จากชื่อ มันง่ายที่จะเดาว่า `.range(from, to)` ของ `supabase-js` ส่ง `Range` header — แต่ไม่ใช่ อ่าน source ของ method นี้เอง (`postgrest-js/src/PostgrestTransformBuilder.ts` เวอร์ชันปัจจุบันที่มากับคอร์สนี้) เห็นชัดว่ามันตั้งค่าอะไร:
+
+```text
+this.url.searchParams.set(keyOffset, `${from}`)
+// Range is inclusive, so add 1
+this.url.searchParams.set(keyLimit, `${to - from + 1}`)
+```
+
+`.range()` ถูกตั้งชื่อตาม *แนวคิด* ของ range แต่ implement ด้วยกลไก pagination แบบ **query-parameter** ไม่ใช่แบบ header — ยืนยันด้วยการ log request URL จริงที่มันสร้างก่อนจะส่งออกไป:
+
+```ts
+// src/agapi-range-vs-header.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+declare const process: { env: Record<string, string | undefined> };
+
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!);
+
+const query = supabase.from('agapi_movies').select('id,title').order('id').range(0, 1);
+// `.url` is a protected member of PostgrestBuilder — not part of the public
+// API, only readable here (via a cast) as a one-off debugging trick to prove
+// exactly what request .range() builds.
+console.log('request URL:', (query as unknown as { url: URL }).url.toString());
+
+const { data } = await query;
+console.log('data:', data);
+```
+
+```text
+request URL: http://127.0.0.1:55321/rest/v1/agapi_movies?select=id%2Ctitle&order=id.asc&offset=0&limit=2
+data: [ { id: 1, title: 'Dune' }, { id: 2, title: 'Barbie' } ]
+```
+
+ไม่มี `Range` header เลย — `range(0, 1)` (0-based, inclusive ตาม docstring ของ method เอง) กลายเป็น `offset=0&limit=2` pagination แบบ HTTP `Range` header ยังมีอยู่จริงและ PostgREST ยังรองรับมัน (พิสูจน์แล้วในบทก่อนหน้าที่ request `Prefer: count=...` ใช้ query-string `limit` ธรรมดา) แต่ไม่มี method ไหนของ `supabase-js` ส่งมันเลย — ถ้าต้องการแบบนั้นจริง ๆ (เช่นให้ตรงกับ client ที่ใช้ `Range` อยู่แล้ว) ต้องใช้ `.select()` ร่วมกับ raw `fetch` เอง ไม่ใช่ query builder
+
+<Callout title="response มี Content-Range เสมอ ไม่ว่าจะใช้ pagination style ไหน">
+ทั้ง request แบบ `?limit=2&offset=0` และแบบ `Range: 0-1` ได้ response ที่มี header `Content-Range` กลับมา — server รายงาน range เสมอ และรายงาน total ด้วยถ้ามี `Prefer: count=...` ไม่ว่า client จะเลือกกลไก pagination ไหนก็ตาม
+</Callout>
+
+## PostgREST ส่งอะไรให้ Postgres จริง ๆ
+
+ทุก query builder call — filter, embed, pagination — ลงเอยเป็น SQL statement เดียวที่ PostgREST ส่งให้ Postgres ข้างใน transaction เดียว local stack นี้เปิด `pg_stat_statements` ไว้โดย default อยู่แล้ว (ยืนยันด้วย `select * from pg_available_extensions where name = 'pg_stat_statements'` — `installed_version` มีค่าอยู่แล้ว ไม่ต้อง `create extension` ที่นี่) ดังนั้น SQL ที่ generate จริงสำหรับ request หนึ่ง ๆ ตรวจสอบได้โดยตรง — ไม่ต้องเปลี่ยน `log_statement=all` บน server ที่ใช้ร่วมกันเลย:
+
+```sql
+-- sql/agapi_check_pg_stat_statements.sql
+select pg_stat_statements_reset();
+```
+
+```bash
+# scripts/agapi-curl-for-sql-inspection.sh
+curl "$API_URL/rest/v1/agapi_movies?select=id,title&order=id&limit=2&offset=0" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY" -H "Prefer: count=exact"
+```
+
+```sql
+-- sql/agapi_read_pg_stat_statements.sql
+select query from pg_stat_statements where query ilike '%agapi_movies%' limit 1;
+```
+
+```text
+WITH pgrst_source AS ( SELECT "public"."agapi_movies"."id", "public"."agapi_movies"."title" FROM "public"."agapi_movies"  ORDER BY "public"."agapi_movies"."id"   LIMIT $1 OFFSET $2 ) ,
+pgrst_source_count AS (SELECT $3  FROM "public"."agapi_movies")
+SELECT (SELECT pg_catalog.count(*) FROM pgrst_source_count) AS total_result_set,
+       pg_catalog.count(_postgrest_t) AS page_total,
+       coalesce(json_agg(_postgrest_t), $4) AS body,
+       nullif(current_setting($5, $6), $7) AS response_headers,
+       nullif(current_setting($8, $9), $10) AS response_status,
+       $11 AS response_inserted
+FROM ( SELECT * FROM pgrst_source ) _postgrest_t
+```
+
+query builder call, raw REST URL และ SQL นี้คือสามมุมมองของ request เดียวกันเป๊ะ มีจุดที่น่าสังเกตในนี้โดยตรง: ชื่อ table/column จริงถูก quote คู่และระบุ schema เต็ม (`"public"."agapi_movies"."id"` ไม่เคยเป็น `agapi_movies` เปล่า ๆ); ค่าถูก bind เป็น parameter `$1`/`$2`/... ไม่ใช่ string-concatenate — ภาษา query ทั้งหมดกัน SQL injection ได้โดยโครงสร้าง เพราะค่า filter ไม่เคยกลายเป็น SQL text; CTE `pgrst_source_count` ที่เพิ่มมาโผล่มาเพราะตั้ง `Prefer: count=exact` เท่านั้น — `total_result_set` ของ response ต้องการ `count(*)` จริงตัวที่สอง ซึ่งตรงกับต้นทุนที่ `count=exact` เตือนไว้ในบทก่อนหน้าเป๊ะ ตอนนี้เห็นเป็น CTE ตัวที่สองจริง ๆ แทนที่จะเป็นแค่คำกล่าวอ้างลอย ๆ การไล่ดูการแปลนี้แบบเต็ม ๆ — ทุก clause ทุก operator — เป็นระดับที่ลึกกว่าที่ `supabase-js` ต้องการในการใช้งานประจำวัน ดู [`/supabase/en/supabase-internals/postgrest-request-to-sql/`](/supabase/en/supabase-internals/postgrest-request-to-sql/) สำหรับเรื่องนั้น
+
 ## ตัวอย่างแบบสมบูรณ์
 
 ```typescript
@@ -98,8 +216,50 @@ export const sdkQueryDiagram = `flowchart LR
   http --> result["Result: data and error"]`;
 
 <Callout title="สรุปหนึ่งบรรทัด">
-query builder ของ `supabase-js` — `.from()`, `.select()`, `.eq()`, `.order()`, `.insert()`, `.update()`, `.delete()` — เป็น typed wrapper ที่สร้าง request เดียวกับที่ PostgREST รับเป็น raw query string อยู่แล้ว และ resolve เป็น **`{ data, error }`** เสมอแทนที่จะ throw ดังนั้นต้องเช็ค `error` เอง (เป็น `PostgrestError` ที่มี **message**, **code**, **details** และ **hint**) ทุกครั้ง ส่วน related table ก็ embed ได้แบบเดียวกับ REST API โดยระบุชื่อ table ไว้ข้างใน `select()`
+query builder ของ `supabase-js` — `.from()`, `.select()`, `.eq()`, `.order()`, `.insert()`, `.update()`, `.delete()` — เป็น typed wrapper ที่สร้าง request เดียวกับที่ PostgREST รับเป็น raw query string อยู่แล้ว และ resolve เป็น **`{ data, error }`** เสมอแทนที่จะ throw ดังนั้นต้องเช็ค `error` เอง (เป็น `PostgrestError` ที่มี **message**, **code**, **details** และ **hint**) ทุกครั้ง ส่วน related table ก็ embed ได้แบบเดียวกับ REST API โดยระบุชื่อ table ไว้ข้างใน `select()` `.range(from, to)` ทำ pagination ด้วย query parameter `limit`/`offset` ไม่ใช่ HTTP `Range` header ตามที่ชื่อบอก — พิสูจน์แล้วตรงจาก source ของ client เอง ทุก call ยังลงเอยเป็น SQL statement เดียวที่มี parameter ที่ PostgREST ส่งให้ Postgres ตรวจสอบได้ผ่าน `pg_stat_statements` โดยไม่ต้องแตะ server config
 </Callout>
+
+## Reading AI-generated code
+
+AI assistant ที่ถูกบอกว่า "โหลดหน้า 3 ของ movies หน้าละ 10 ตัว โดยใช้ Range header แบบที่ PostgREST คาดหวัง" เขียนโค้ดนี้:
+
+<SpotTheBug lang="ts" code={`// src/paginated-movies.ts
+import { createClient } from '@supabase/supabase-js';
+
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!);
+
+async function getPage(pageNumber: number, pageSize = 10) {
+  const from = (pageNumber - 1) * pageSize;
+  const to = from + pageSize;
+
+  const { data, error, count } = await supabase
+    .from('agapi_movies')
+    .select('id, title, year', { count: 'exact' })
+    .range(from, to);
+
+  if (error) throw error;
+  return { data, totalPages: Math.ceil((count ?? 0) / pageSize) };
+}
+`}>
+สองบั๊ก อันหนึ่งเป็น off-by-one ใน `range()` อีกอันเป็นสมมติฐานผิดที่ฝังอยู่ใน prompt เอง อันแรก: `.range()` ถูก document ไว้ว่าเป็น **0-based และ inclusive** — `range(from, to)` ขอ `to - from + 1` row ไม่ใช่ `to - from` สำหรับหน้า 3 ที่ `pageSize = 10` `from` เป็น 20 และโค้ดคำนวณ `to` เป็น `from + pageSize` คือ 30 — นั่นคือ 11 row (20 ถึง 30 รวม) ไม่ใช่ 10 ทำให้ขอบเขตของแต่ละหน้าคลาดไปทีละ row เงียบ ๆ ตลอดทั้ง list ที่ paginate ทางแก้คือ `to = from + pageSize - 1` อันที่สอง และนี่คือกรอบคิด "Range header" จาก prompt เองที่ทำให้ implementation หลงทาง: ไม่มีจุดไหนในนี้ใช้ HTTP `Range` header จริง ๆ เลย — พิสูจน์แล้วด้านบน `.range()` ส่ง query parameter `limit`/`offset` นั่นไม่ใช่บั๊กในโค้ดนี้ (request ยังทำงานถูกต้อง นอกจาก off-by-one) แต่มันแปลว่า comment หรือคำอธิบายจากเพื่อนร่วมทีมที่บอกว่าโค้ดนี้ "ใช้ Range header" ผิดเลย และการ debug พฤติกรรมจริงที่เกี่ยวกับ Range header โดยเฉพาะบน server (เช่น proxy หรือ CDN ที่ rewrite มัน) โดยอ่านโค้ด client นี้จะไม่นำไปไหนเลย เพราะ header ที่โค้ดนี้ส่งไม่ใช่ตัวนั้นเลย
+</SpotTheBug>
+
+## Mental Model
+
+query builder เป็นแค่ตัวประกอบ URL-กับ-header แบบ typed บาง ๆ — ไม่มีอะไรในนั้นคุยกับ Postgres ตรง ๆ และไม่มีอะไรถูก execute จนกว่า object จะถูก `await` (พิสูจน์แล้วด้านบน: URL ถูกสร้างครบและตรวจสอบได้ *ก่อน* request จะยิงออกไป) ทุก method ที่ chain กัน — `.eq()`, `.range()`, `.select()` — mutate search param ของ `URL` object เดียวกันหรือ header ของ request และ `await` สุดท้ายคือช่วงเวลาเดียวที่ HTTP request ออกจาก process จริง ๆ นี่คือเหตุผลที่การ log `query.url.toString()` ก่อน await เป็นนิสัย debug ที่มีประโยชน์มาก: มันแสดง request REST ที่กำลังจะถูกส่งจริง ๆ ให้เห็นแน่ชัด ไม่ต้องเดาว่าลำดับ method ทำอะไร "น่าจะ"
+
+## Trade-offs
+
+- **query builder เป็น typed และ chain ได้** — **แลกกับชื่อ method ที่ไม่ได้สื่อพฤติกรรมบน wire เสมอไป**: `.range()` ฟังดูเหมือน `Range` header มันไม่ใช่ พิสูจน์แล้วด้านบน วิธีเดียวที่จะแน่ใจคืออ่าน source หรือ log URL
+- **`{ data, error }` ไม่ throw เลย ดังนั้น `if (error)` ที่ลืมเช็คจะพังแบบเห็นได้เป็น data ที่ผิด ไม่ใช่ exception ที่จับไม่ได้** — **แลกกับความปลอดภัยที่เป็น opt-in**: ไม่มีอะไรบังคับให้เช็ค และถ้าลืมมันจะลดลงเป็น "ดูเหมือนผลลัพธ์ว่างเปล่า" ซึ่ง misdiagnose ง่ายว่าเป็น "ไม่มี row ที่ตรง" แทนที่จะเป็น "request ล้มเหลว"
+- **filter method อ่านเป็นธรรมชาติใน TypeScript** (`.gte('year', 2021)`) — **แลกกับการซ่อนว่าทุกตัวยังเป็น syntax operator ของ REST เป๊ะข้างใต้** (`year=gte.2021`); การให้เหตุผลว่า chain หนึ่ง ๆ จะทำอะไรจริงใน Postgres ได้ประโยชน์จากการอ่านได้ทั้งสองรูปแบบสลับกัน ไม่ใช่แค่รูปแบบ TypeScript อย่างเดียว
+
+## Common Misconceptions
+
+- **"`.range()` ส่ง HTTP `Range` header เพราะนั่นคือที่มาของชื่อ"** พิสูจน์แล้วว่าไม่จริงตรงจาก source ของ library เองและ request URL ที่ log ไว้ — มันส่ง query parameter `limit`/`offset` ซึ่งเป็นกลไก pagination อีกแบบของ PostgREST ที่แยกจากกัน
+- **"ถ้า `.select()` คืน `data: null` แปลว่าไม่มี row ที่ตรงเลย"** `data` เป็น `null` ตอน **ล้มเหลว**; ไม่มี row ที่ตรงคือ `data: []` array ว่างที่ไม่ใช่ null พร้อม `error: null` การสับสนสองอย่างนี้ซ่อนความล้มเหลวจริงให้ดูเหมือน "ไม่มีผลลัพธ์"
+- **"query builder เป็นภาษา query แยกต่างหากจาก raw PostgREST URL"** มันเป็นแค่ builder บาง ๆ บน URL syntax เดียวกันจากบทก่อนหน้า ทุก method call เติม query string เดียวกับที่ request `curl` ที่เขียนเองจะใช้ พิสูจน์ได้ด้วยการ log `.url.toString()` ก่อน await
+- **"อ่าน entry ของ `pg_stat_statements` สำหรับ Data API request ต้องมี server config พิเศษ"** พิสูจน์แล้วด้านบน: มันเปิดไว้โดย default บน local stack นี้อยู่แล้ว — ไม่ต้องเปลี่ยน `log_statement=all` หรือ shared config อะไรเลยเพื่อดู SQL ที่ generate จริง
 
 export const quizSdkQuery = [
   {
@@ -111,6 +271,7 @@ export const quizSdkQuery = [
       'คืนแค่ boolean บอกว่าสำเร็จหรือล้มเหลวเท่านั้น',
     ],
     answer: 1,
+    explain: 'request ที่ล้มเหลว resolve แบบปกติ โดย data: null และ error ถูกเติมค่า — ไม่มี exception ให้ catch เลย',
   },
   {
     q: 'ทำไมต้องเช็ค field error เอง แทนที่จะพึ่ง try/catch',
@@ -121,6 +282,7 @@ export const quizSdkQuery = [
       'เพราะการเช็ค error เป็น optional และไม่มีผลต่อ behavior',
     ],
     answer: 1,
+    explain: 'การไม่เช็คแปลว่าความล้มเหลวจริงจะดูเหมือน "ไม่มี row ที่ตรง" เงียบ ๆ เพราะทั้งสองแบบทิ้ง data ที่ falsy/ว่างไว้เหมือนกันโดยไม่มี exception',
   },
   {
     q: 'การรวม method ไหนที่ filter movie ให้เหลือปี 2020 แล้วเรียงตาม year จากมากไปน้อย',
@@ -131,6 +293,7 @@ export const quizSdkQuery = [
       '.match({ year: "desc" })',
     ],
     answer: 1,
+    explain: '.eq() map ไปหา operator eq. และ .order() พร้อม { ascending: false } map ไปหา order=year.desc — ตัวเลือกอื่นไม่ใช่ method จริงของ supabase-js',
   },
   {
     q: 'query builder embed table directors ที่เกี่ยวข้องเข้าไปใน query ของ movies ได้อย่างไร',
@@ -141,6 +304,29 @@ export const quizSdkQuery = [
       'ส่ง argument ตัวที่สองเข้าไปใน .from()',
     ],
     answer: 1,
+    explain: 'ไม่มี .join() ใน supabase-js — การ embed แสดงออกทั้งหมดข้างใน string ของ select() เหมือน query parameter ของ raw REST เป๊ะ',
+  },
+  {
+    q: 'method `.range(from, to)` ของ supabase-js ส่ง HTTP request header `Range` หรือไม่',
+    options: [
+      'ใช่ นั่นคือสิ่งที่มันมีไว้ทำ',
+      'ไม่ — พิสูจน์แล้วจาก source ของมันเอง มันตั้งค่า query parameter limit/offset แทน ซึ่งเป็นกลไก pagination อีกแบบที่แยกจากกันของ PostgREST',
+      'มันส่งทั้ง Range header และ limit/offset เพื่อความเข้ากันได้',
+      'ขึ้นอยู่กับว่ามีการขอ count หรือไม่',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วด้านบนด้วยการอ่าน source ของ PostgrestTransformBuilder และ log request URL ที่สร้างจริง — .range(0, 1) ได้ offset=0&limit=2 ไม่มี Range header เลย',
+  },
+  {
+    q: 'เพื่อนร่วมทีมบอกว่า Data API request "ต้องใช้ log_statement=all ถึงจะโผล่ใน query log" บทนี้พิสูจน์ว่าอะไรมักไม่จำเป็น',
+    options: [
+      'ไม่มีอะไรเลย — log_statement=all จำเป็นเสมอเพื่อดู SQL ที่ generate',
+      'pg_stat_statements เมื่อเปิดไว้แล้ว (แบบที่ local stack นี้เปิดโดย default) แสดง SQL ที่ generate จริงสำหรับ request หนึ่ง ๆ ได้โดยไม่ต้องเปลี่ยน server config เลย',
+      'PostgREST print SQL ลง stdout ของตัวเองเสมอโดย default',
+      'Supabase Studio เป็นทางเดียวที่จะเห็น SQL ที่ generate ได้',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วด้านบน: pg_stat_statements ถูกติดตั้งไว้แล้วบน stack นี้ และการ query มันหลัง request จริงแสดง SQL ที่มี parameter ที่ PostgREST generate จริง — ไม่มีการเปลี่ยน config เลย',
   },
 ];
 
