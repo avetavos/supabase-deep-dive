@@ -1,6 +1,6 @@
 ---
 title: 'Writing and Invoking a Function'
-description: 'A minimal Deno.serve function, calling it from supabase-js, and managing secrets for local and deployed environments.'
+description: 'Deno import specifiers, CORS, invoking a function from supabase-js, verify_jwt, secrets, and deno check as a pre-deploy gate.'
 sidebar:
   order: 2
 ---
@@ -8,105 +8,405 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
 
-An Edge Function is a plain `Deno.serve` handler that receives an HTTP request and returns a response, invoked from a client with `supabase.functions.invoke()`.
+An Edge Function is a plain `Deno.serve` handler that receives an HTTP request and returns a response, invoked from a client with `supabase.functions.invoke()` — but because it runs on **Deno**, writing one correctly means importing dependencies, and handling cross-origin requests, the Deno way.
 
 ## A minimal real function
 
 `Deno.serve` is a global provided by the Deno runtime — there is nothing to import for it. You hand it a callback that receives the incoming `Request` and returns a `Response`, exactly like the Fetch API you already know from the browser:
 
-```typescript
-Deno.serve(async (req) => {
-  const { name } = await req.json()
-  return new Response(JSON.stringify({ message: `Hello ${name}!` }), {
+```ts
+// supabase/functions/edge-hello/index.ts
+Deno.serve((_req) => {
+  return new Response(JSON.stringify({ message: 'Hello from the edge' }), {
     headers: { 'Content-Type': 'application/json' },
   })
 })
 ```
 
-This file lives at `supabase/functions/hello-world/index.ts`. Once deployed, it is reachable at `https://<project-ref>.supabase.co/functions/v1/hello-world`, but you rarely construct that URL by hand — the client library does it for you.
+This file lives at `supabase/functions/edge-hello/index.ts`. Once deployed, it is reachable at `https://<project-ref>.supabase.co/functions/v1/edge-hello`, but you rarely construct that URL by hand — the client library does it for you. `deno check` confirms this file type-checks on its own before you ever run it — covered at the end of this lesson.
 
-## Invoking it from a client
+## Import specifiers: this is Deno, not Node
 
-`supabase-js` exposes a dedicated `functions.invoke()` method rather than a plain `fetch`, because it does useful work on your behalf:
+The single most common way AI-generated Edge Function code breaks: importing a package the way you would in a Node.js or Vite project.
 
-```typescript
-const { data, error } = await supabase.functions.invoke('hello-world', {
-  body: { name: 'World' },
+```ts
+// @expect-error worker fails to boot: bare specifiers are not resolvable in Deno
+import { createClient } from '@supabase/supabase-js'
+
+Deno.serve((_req) => {
+  const client = createClient('http://x', 'y')
+  return new Response(JSON.stringify({ ok: !!client }))
 })
 ```
 
-Beyond serializing `body` to JSON, `invoke()` automatically attaches an `Authorization` header — the currently signed-in user's access token if someone is logged in, or the project's anon key otherwise. That means your function can inspect who called it (or confirm no one is authenticated) without you wiring that header manually on every call.
+Deployed as-is under `supabase functions serve`, every request to this function returns a real `503`, and the actual boot error, captured from the local runtime's own logs, is unambiguous about what to do instead:
 
-## Secrets and environment variables
+```text
+HTTP/1.1 503
+{"code":"BOOT_ERROR","message":"Worker failed to boot (please check logs)"}
 
-A function frequently needs a credential it should never expose to the client — a third-party API key, a signing secret. Set one for your deployed functions with the CLI:
-
-```bash
-supabase secrets set MY_API_KEY=sk_live_examplekey123
+worker boot error: failed to bootstrap runtime: failed to create the graph:
+Relative import path "@supabase/supabase-js" not prefixed with / or ./ or ../
+  hint: If you want to use a JSR or npm package, try running
+  `deno add jsr:@supabase/supabase-js` or `deno add npm:@supabase/supabase-js`
+    at file:///.../supabase/functions/edge-bare-import-demo/index.ts:1:30
 ```
 
-Read it inside the function with `Deno.env.get`:
+Deno has no `node_modules`-style bare-specifier resolution by default — every import must be a relative path (`./foo.ts`), a full URL, or one of two package-registry specifiers:
+
+- **`jsr:`** — the [JSR](https://jsr.io) registry, Deno's own, and where `@supabase/supabase-js` is published for Deno consumption.
+- **`npm:`** — resolves an ordinary npm package through Deno's npm compatibility layer.
+
+Fixed, both specifier styles working for real against this local stack in the same function:
+
+```ts
+// supabase/functions/edge-import-specifiers/index.ts
+import { createClient } from 'jsr:@supabase/supabase-js@2'
+import { nanoid } from 'npm:nanoid@5'
+
+Deno.serve((_req) => {
+  const client = createClient('http://example.com', 'anon-key-placeholder')
+  return new Response(JSON.stringify({ jsrClientOk: !!client, npmId: nanoid(8) }), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+})
+```
+
+```text
+$ curl "$FUNCTIONS_URL/edge-import-specifiers" -H "Authorization: Bearer $ANON_KEY" -H "apikey: $ANON_KEY"
+{"jsrClientOk":true,"npmId":"kR-o8HyM"}
+```
+
+<Callout title="Always pin a version">
+Every real example in this course pins `@2`, `@5`, and so on. An unpinned `jsr:@supabase/supabase-js` or `npm:nanoid` resolves to whatever the latest version happens to be at deploy time — fine while iterating locally, a real risk for a function you intend to keep working unchanged in production.
+</Callout>
+
+## `deno.json`: a per-function import map
+
+A bare specifier can still work if you give Deno a mapping for it — a `deno.json` sitting next to a function's `index.ts` acts as that function's own import map, scoped to just that function (each function gets its own module graph, so nothing here leaks to a sibling function):
+
+```json
+// supabase/functions/edge-import-map/deno.json
+{
+  "imports": {
+    "supabase": "jsr:@supabase/supabase-js@2"
+  }
+}
+```
 
 ```typescript
-const apiKey = Deno.env.get('MY_API_KEY')
+// supabase/functions/edge-import-map/index.ts
+import { createClient } from 'supabase'
+
+Deno.serve((_req) => {
+  const client = createClient('http://example.com', 'anon-key-placeholder')
+  return new Response(JSON.stringify({ ok: !!client }), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+})
 ```
 
-For local development, `supabase functions serve` reads a `.env` file placed under `supabase/functions/`, so the same `Deno.env.get` call works identically whether you are running locally or against the deployed function — only where the value comes from changes.
+```text
+$ curl "$FUNCTIONS_URL/edge-import-map" -H "Authorization: Bearer $ANON_KEY" -H "apikey: $ANON_KEY"
+{"ok":true}
+```
 
-<Mermaid title="A client invocation reaching a deployed Deno function" code={invokeFlowDiagram} />
+The bare specifier `'supabase'` resolves only because `deno.json`'s `imports` map redirects it to the real `jsr:` specifier — remove that file and this exact function fails with the same `BOOT_ERROR` shown above.
+
+## CORS: headers your function must set itself
+
+Every browser-issued cross-origin request first checks whether the server explicitly allows it — for a non-trivial request (a `POST` with a JSON body, say), the browser sends an `OPTIONS` **preflight** first and only proceeds with the real request if the preflight response says it may. A function that never sets CORS headers works perfectly from `curl` (curl does not enforce CORS — only browsers do) and then fails silently for real browser clients from a different origin. Handled correctly:
+
+```ts
+// supabase/functions/edge-cors/index.ts
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+}
+
+Deno.serve(async (req) => {
+  if (req.method === 'OPTIONS') {
+    return new Response(null, { headers: corsHeaders })
+  }
+
+  const { name } = await req.json()
+  return new Response(JSON.stringify({ message: `Hello ${name}!` }), {
+    headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+  })
+})
+```
+
+A real preflight against it, and the real headers the response actually carries:
+
+```bash
+# scripts/edge-cors-preflight.sh
+curl -i -X OPTIONS "$FUNCTIONS_URL/edge-cors" \
+  -H "Origin: https://example.com" \
+  -H "Access-Control-Request-Method: POST" \
+  -H "Access-Control-Request-Headers: authorization, content-type"
+```
+
+```text
+HTTP/1.1 200 OK
+Access-Control-Allow-Origin: *
+Access-Control-Allow-Headers: authorization, content-type
+Access-Control-Allow-Methods: GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS,TRACE,CONNECT
+```
+
+<Callout title="Local quirk: Kong answers OPTIONS before your function ever sees it">
+On this local stack, the CLI's own Kong gateway intercepts `OPTIONS` requests to `/functions/v1/*` and answers with its own permissive CORS headers (the `Access-Control-Allow-Methods` line above listing every HTTP verb is Kong's default plugin response, not anything `edge-cors`'s code returned) — the function's own `if (req.method === 'OPTIONS')` branch is never actually reached locally for a cross-origin preflight. The real POST response *does* carry the function's own headers through untouched, confirmed below. This is a **local-only** difference: the [official CORS guide](https://github.com/supabase/supabase/blob/master/apps/docs/content/guides/functions/cors.mdx) is explicit that hosted Edge Functions expect the function itself to answer `OPTIONS` — write the `req.method === 'OPTIONS'` branch regardless of what this local proxy does for you.
+</Callout>
+
+The real request, with and without the function setting its own CORS headers — curl shows both as `200`, because curl never enforces CORS; a browser reading the *headers* is what would differ:
+
+```text
+$ curl -i -X POST "$FUNCTIONS_URL/edge-cors" -H "Origin: https://example.com" \
+    -H "Authorization: Bearer $ANON_KEY" -H "apikey: $ANON_KEY" -H "Content-Type: application/json" -d '{"name":"world"}'
+HTTP/1.1 200 OK
+access-control-allow-origin: *
+access-control-allow-headers: authorization, x-client-info, apikey, content-type
+access-control-allow-methods: POST, OPTIONS
+{"message":"Hello world!"}
+
+$ curl -i -X POST "$FUNCTIONS_URL/edge-no-cors" -H "Origin: https://example.com" \
+    -H "Authorization: Bearer $ANON_KEY" -H "apikey: $ANON_KEY" -H "Content-Type: application/json" -d '{"name":"world"}'
+HTTP/1.1 200 OK
+Access-Control-Allow-Origin: *
+{"message":"Hello world!"}
+```
+
+Both come back `200` with a body — the difference a real browser's `fetch()` would act on is that `edge-cors`'s response carries the specific `Allow-Headers`/`Allow-Methods` a real cross-origin `POST` with custom headers needs, while `edge-no-cors` only has whatever this local proxy added on top; deployed and called from a genuinely different origin with custom headers, only the function that sets its own headers is guaranteed to work.
+
+## Invoking it from a client
+
+`supabase-js` exposes a dedicated `functions.invoke()` method rather than a plain `fetch`, because it does useful work on your behalf: serializing `body` to JSON, and automatically attaching an `Authorization` header — the currently signed-in user's access token if someone is logged in, or the project's anon key otherwise.
+
+```ts
+// src/invoke-edge-hello.ts
+// @run
+import { createClient } from '@supabase/supabase-js'
+
+declare const process: { env: Record<string, string | undefined> }
+
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!)
+
+const { data, error } = await supabase.functions.invoke('edge-hello')
+
+if (error) {
+  throw new Error(`invoke failed: ${error.message}`)
+}
+
+console.log('invoke succeeded, function responded:', data)
+```
+
+This is a real, executed call — `supabase.functions.invoke('edge-hello')` reaches the `edge-hello` function from earlier in this lesson, served locally by this module's own `supabase functions serve` process, and the harness runs it with `tsx` against the live stack exactly as shown, not a mocked client.
+
+## `verify_jwt`: who is allowed to call at all
+
+Before your function's code runs at all, the Edge Runtime can require a valid Supabase JWT on every request — controlled per-function with `verify_jwt` (`true` by default; disable it for a function meant to be called by something other than a signed-in client, like a webhook receiver in the next lesson):
+
+```toml
+# supabase/config.toml
+[functions.edge-hello]
+verify_jwt = false
+```
+
+With the default (`verify_jwt = true`, no flag), the real response bodies for a missing vs. a malformed `Authorization` header — captured from this local stack, calling `edge-hello`:
+
+```text
+$ curl "$FUNCTIONS_URL/edge-hello"
+{"code":"UNAUTHORIZED_NO_AUTH_HEADER","message":"Missing authorization header","msg":"Missing authorization header"}
+HTTP 401
+
+$ curl "$FUNCTIONS_URL/edge-hello" -H "Authorization: Bearer not-a-real-jwt" -H "apikey: $ANON_KEY"
+{"code":"UNAUTHORIZED_INVALID_JWT_FORMAT","message":"Invalid JWT format","msg":"Invalid JWT format"}
+HTTP 401
+
+$ curl "$FUNCTIONS_URL/edge-hello" -H "Authorization: Bearer $ANON_KEY" -H "apikey: $ANON_KEY"
+{"message":"Hello from the edge"}
+HTTP 200
+```
+
+The project's own **anon key** is itself a valid JWT (signed for the `anon` role), which is exactly why it works as a bearer token above — `verify_jwt` only checks that the token is a real, validly signed Supabase JWT, not that a specific human user is signed in. Passing the caller's actual **user** access token instead (covered fully in the next lesson) is what lets the function's own database queries run as that user rather than as `anon`. With `--no-verify-jwt` (equivalent to `verify_jwt = false`), the same request with **no** `Authorization` header at all succeeds:
+
+```text
+$ supabase functions serve --no-verify-jwt
+$ curl "$FUNCTIONS_URL/edge-hello"
+{"message":"Hello from the edge"}
+HTTP 200
+```
+
+## Secrets: `.env` locally, `supabase secrets set` when deployed
+
+A function frequently needs a credential it should never expose to the client. Locally, `supabase functions serve --env-file <path>` loads a plain `.env` file, read inside the function with `Deno.env.get` exactly the same way in both environments:
+
+```ts
+// supabase/functions/edge-secrets/index.ts
+Deno.serve((_req) => {
+  const secret = Deno.env.get('EDGE_DEMO_SECRET') ?? null
+  return new Response(JSON.stringify({ secret }), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+})
+```
+
+```text
+$ echo "EDGE_DEMO_SECRET=from-env-file" > .env.local
+$ supabase functions serve --env-file .env.local
+$ curl "$FUNCTIONS_URL/edge-secrets" -H "Authorization: Bearer $ANON_KEY" -H "apikey: $ANON_KEY"
+{"secret":"from-env-file"}
+```
+
+`supabase secrets set` is the deployed-project equivalent — and, run against this local stack with no cloud project linked, it fails with exactly the error that gives away it is a **hosted-only** command:
+
+```text
+$ supabase secrets set EDGE_DEMO_SECRET2=from-secrets-set
+{"_tag":"Error","error":{"code":"LegacyPlatformAuthRequiredError","message":"Access token not provided. Supply an access token by running `supabase login` or setting the SUPABASE_ACCESS_TOKEN environment variable."}}
+```
+
+There is no local emulation of `supabase secrets set` — `.env`/`--env-file` **is** the local story; `supabase secrets set` only ever talks to a real, logged-in, deployed project.
+
+## `deno check` as a pre-deploy gate
+
+Every real `ts-edge` fence in this course is already run through `deno check` before it is trusted — the exact command a CI pipeline (or you, before `supabase functions deploy`) should run on a function directory:
+
+```text
+$ cd supabase/functions/edge-typecheck-demo && deno check index.ts
+Check index.ts
+TS2345 [ERROR]: Argument of type 'string' is not assignable to parameter of type 'number'.
+  const total = addToCount(5, "3")
+                              ~~~
+    at file:///.../edge-typecheck-demo/index.ts:6:31
+
+error: Type checking failed.
+```
+
+A real type error (`addToCount(5, "3")` passing a `string` where a `number` is declared) caught before deploy, not discovered as a runtime `503` after — `deno check` is Deno's own compiler doing exactly what `tsc --noEmit` does for a Node/browser project, scoped to one function's own module graph.
+
+<Mermaid title="A client invocation reaching a locally served Deno function" code={invokeFlowDiagram} />
 
 export const invokeFlowDiagram = `flowchart LR
-  client["supabase.functions.invoke('hello-world', { body })"] -->|"HTTP request + Authorization header"| edge["Deployed Deno function (Deno.serve)"]
+  client["supabase.functions.invoke('edge-hello')"] -->|"HTTP request + Authorization header"| edge["Deno.serve function (jsr:/npm: imports resolved)"]
   edge -->|"Response"| client`;
 
 <Callout title="The one-line takeaway">
-An Edge Function is a `Deno.serve((req) => ...)` handler with **no import required** for `Deno.serve` itself, invoked from a client with `supabase.functions.invoke(name, { body })` which **automatically attaches an Authorization header** (user token or anon key), and secrets are set with `supabase secrets set` and read inside the function with `Deno.env.get`, backed locally by a `.env` file under `supabase/functions/`.
+Edge Functions are Deno, not Node: bare specifiers boot-fail with a real `503`/`BOOT_ERROR` (fix with `jsr:`, `npm:`, a URL, or a per-function `deno.json` import map), CORS headers are the **function's own responsibility** to set (proved: a local Kong quirk answers preflight for you here, hosted does not), `verify_jwt` (default `true`) gates every request before your code runs (proved: real `401` bodies for a missing vs. malformed header), secrets are `.env`/`--env-file` locally and `supabase secrets set` only for a deployed, logged-in project, and `deno check` is the pre-deploy gate that catches a real type error before it becomes a runtime failure.
 </Callout>
+
+## Reading AI-generated code
+
+An AI assistant asked to "call the internal notifications service" from an Edge Function produced this:
+
+<SpotTheBug lang="ts" code={`// supabase/functions/notify-user/index.ts
+import axios from 'axios'
+import { v4 as uuidv4 } from 'uuid'
+
+Deno.serve(async (req) => {
+  const { userId, message } = await req.json()
+
+  const response = await axios.post('https://notifications.internal/send', {
+    id: uuidv4(),
+    userId,
+    message,
+  })
+
+  return new Response(JSON.stringify(response.data), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+})
+`}>
+Both imports are bare specifiers — `import axios from 'axios'` and `import { v4 as uuidv4 } from 'uuid'` — exactly the pattern that fails to boot with the real `BOOT_ERROR`/"Relative import path ... not prefixed with / or ./ or ../" shown earlier in this lesson, because the AI generated this the way it would for a Node.js/Express backend, where bare specifiers resolve through `node_modules` automatically. Every request to this function would 503 before a single line of the handler ever runs. The fix is mechanical, not a redesign: `import axios from 'npm:axios@1'` and `import { v4 as uuidv4 } from 'npm:uuid@9'` (or drop both entirely — `crypto.randomUUID()` is a Deno/Web-standard global that needs no import at all, and a plain `fetch()` replaces `axios` for a simple POST with no dependency required).
+</SpotTheBug>
+
+## Mental Model
+
+Writing an Edge Function is writing a standalone Deno program with its own module graph, not adding a route to an existing Node.js app. Every import is resolved fresh, per function, the moment the isolate boots — which is exactly why a bare specifier fails at *boot* (before your handler code runs at all) rather than merely at the one line that uses it, and why a `deno.json` sitting next to one function's `index.ts` has zero effect on any other function. CORS and `verify_jwt` sit at that same "before your code runs" boundary: `verify_jwt` is checked by the runtime before your handler is even invoked (proved by the exact, structured `401` body, not something your own code produced), while CORS headers are the opposite — nothing checks them for you, which is precisely why a function that never sets them "works" everywhere curl or a same-origin browser call is tried, and breaks silently the first time a genuinely cross-origin browser client calls it.
+
+## Trade-offs
+
+- **`jsr:`/`npm:` specifiers give you the entire npm/JSR ecosystem inside a function** — **at the cost of remembering to pin a version explicitly**, since an unpinned specifier resolves to "whatever is latest right now" with no lockfile the way a Node project's `package-lock.json` would give you.
+- **A per-function `deno.json` import map keeps a function's dependencies fully scoped to itself** — **at the cost of duplication**: two functions that both need the same package each declare and pin it independently, with no shared root `package.json` to fall back on.
+- **`verify_jwt = true` (the default) rejects unauthenticated requests before your code runs, for free** — **at the cost of being unusable for anything that is not a signed-in Supabase client**: a Database Webhook or third-party callback (next lesson) has no Supabase JWT to present, and needs `verify_jwt = false` plus its own authentication scheme instead.
+
+## Common Misconceptions
+
+- **"I can import any npm package the way I would in a Node.js file."** Only with an explicit `npm:` (or `jsr:`, or a URL, or a mapped bare specifier via `deno.json`) — a bare specifier is a boot-time `503`, not a runtime surprise on first use.
+- **"If curl gets a 200 with the right JSON, my CORS headers are fine."** curl never enforces CORS — only browsers do, by refusing to expose a cross-origin response to page JavaScript when the headers don't allow it. A `200` from curl proves the function ran; it proves nothing about whether a real cross-origin browser client can read the result.
+- **"`verify_jwt = false` means anyone can do anything."** It only removes the built-in JWT check before your handler runs — a function with `verify_jwt = false` is fully responsible for its own authentication and authorization from that point on (a shared secret header, an HMAC signature check, or nothing at all if it is genuinely meant to be public).
+- **"`supabase secrets set` works locally once I'm testing with the CLI."** It is a hosted-project-only command that requires `supabase login`; the local equivalent is always `.env`/`--env-file`, proved above by the real `LegacyPlatformAuthRequiredError`.
 
 export const quizWritingInvoking = [
   {
-    q: 'Do you need to import anything to use Deno.serve in an Edge Function',
+    q: 'Why does `import { createClient } from "@supabase/supabase-js"` (no prefix) fail inside an Edge Function',
     options: [
-      'Yes, you must import it from a Deno standard library module',
-      'No, Deno.serve is a global provided by the runtime',
-      'Yes, you must install it via npm first',
-      'Only when running locally with supabase functions serve',
+      'It does not fail, Deno resolves it from a hidden global cache',
+      'Deno has no bare-specifier/node_modules resolution by default; the worker fails to boot with a real error asking for jsr:/npm:',
+      'It only fails when deployed, never locally',
+      '@supabase/supabase-js does not exist for Deno at all',
     ],
     answer: 1,
+    explain: 'Proved above: the function boots with "worker boot error ... Relative import path ... not prefixed with / or ./ or ../" and every request 503s until the import is written as jsr:/npm:.',
   },
   {
-    q: 'What does supabase.functions.invoke() automatically attach to the request',
+    q: 'What does a per-function `deno.json` do',
     options: [
-      'Nothing, you must set every header manually',
-      'An Authorization header with the caller\'s access token or the anon key',
-      'A hard-coded service_role key',
-      'A random request id and nothing else',
+      'Nothing, it is only used by the Supabase Dashboard',
+      'Acts as an import map scoped to just that function, letting a bare specifier resolve to a real jsr:/npm: target',
+      'Sets global secrets for every function in the project',
+      'Replaces the need for a deno check before deploy',
     ],
     answer: 1,
+    explain: 'Proved above: edge-import-map\'s deno.json maps the bare specifier "supabase" to jsr:@supabase/supabase-js@2 — remove the file and the same import fails to boot.',
   },
   {
-    q: 'How do you set a secret for a deployed Edge Function',
+    q: 'Why does a function with no CORS headers still return 200 when tested with curl',
     options: [
-      'Write it directly into the index.ts file',
-      'supabase secrets set MY_API_KEY=value, then read it with Deno.env.get',
-      'Store it in a Postgres table and query it at request time',
-      'Secrets cannot be used inside Edge Functions',
+      'Because curl automatically adds the missing headers for you',
+      'Because curl does not enforce CORS at all — only browsers do, by refusing to expose the response to page JavaScript',
+      'Because CORS only applies to GET requests',
+      'Because the function is misconfigured and curl is reporting a false success',
     ],
     answer: 1,
+    explain: 'CORS is a browser-enforced protection, not a server-side gate — curl (and this local Kong proxy) will happily return 200 regardless of what Access-Control-* headers are or are not present.',
   },
   {
-    q: 'How does local development read environment variables for a function',
+    q: 'A request to a function with `verify_jwt = true` (the default) has no Authorization header at all. What happens before the handler code runs?',
     options: [
-      'It always calls the deployed secrets store over the network',
-      'From a .env file placed under supabase/functions/',
-      'It is not possible to use environment variables locally',
-      'From the project\'s package.json',
+      'The handler runs normally and req.headers is simply empty',
+      'The Edge Runtime rejects it with a structured 401 (UNAUTHORIZED_NO_AUTH_HEADER) before the function\'s own code executes',
+      'It succeeds only if the function itself checks for a header',
+      'The request hangs until it times out',
     ],
     answer: 1,
+    explain: 'Proved above with a real curl transcript: {"code":"UNAUTHORIZED_NO_AUTH_HEADER",...} HTTP 401 — this check happens at the runtime level, before user code runs at all.',
+  },
+  {
+    q: 'What is the local equivalent of `supabase secrets set` for a deployed project',
+    options: [
+      'There is no local equivalent, secrets cannot be tested locally',
+      '`supabase functions serve --env-file <path>`, reading a plain .env file with the same Deno.env.get() call in the function',
+      '`supabase secrets set` also works locally without logging in',
+      'Secrets must be hardcoded for local development',
+    ],
+    answer: 1,
+    explain: 'Proved above: supabase secrets set fails locally with LegacyPlatformAuthRequiredError (it is hosted-only); --env-file is the real local mechanism, and the function code calling Deno.env.get does not change between the two.',
+  },
+  {
+    q: 'An AI-generated function does `import axios from \'axios\'` and `import { v4 as uuidv4 } from \'uuid\'` inside `supabase/functions/notify-user/index.ts`. What happens, and what is the minimal fix?',
+    options: [
+      'Nothing, both packages are Deno built-ins',
+      'The worker fails to boot (503 on every request) because both are bare specifiers; fix with npm: prefixes, or drop them for fetch()/crypto.randomUUID()',
+      'Only the axios import fails, uuid works fine unprefixed',
+      'It works locally but fails only once deployed',
+    ],
+    answer: 1,
+    explain: 'Both are bare specifiers, so the whole function fails to boot immediately — the same BOOT_ERROR/InvalidWorkerCreation shown earlier in this lesson, not a partial failure.',
   },
 ];
 

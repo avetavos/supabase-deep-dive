@@ -1,6 +1,6 @@
 ---
 title: 'การเขียนและ Invoke Function'
-description: 'ฟังก์ชัน Deno.serve แบบพื้นฐาน การเรียกใช้จาก supabase-js และการจัดการ secrets สำหรับ local กับ deployed environment'
+description: 'import specifier ของ Deno, CORS, การ invoke function จาก supabase-js, verify_jwt, secrets, และ deno check เป็น pre-deploy gate'
 sidebar:
   order: 2
 ---
@@ -8,105 +8,405 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
 
-Edge Function คือ `Deno.serve` handler ธรรมดาที่รับ HTTP request แล้วคืน response กลับไป เรียกใช้จาก client ด้วย `supabase.functions.invoke()`
+Edge Function คือ `Deno.serve` handler ธรรมดาที่รับ HTTP request แล้วคืน response กลับไป เรียกใช้จาก client ด้วย `supabase.functions.invoke()` — แต่เพราะมันรันบน **Deno** การเขียนให้ถูกต้องแปลว่าต้อง import dependency และจัดการ cross-origin request แบบ Deno เอง
 
 ## function จริงแบบขั้นต่ำ
 
 `Deno.serve` เป็น global ที่ Deno runtime มีให้ในตัว ไม่ต้อง import อะไรเพิ่ม คุณส่ง callback ที่รับ `Request` ที่เข้ามาแล้วคืน `Response` กลับไป เหมือน Fetch API ที่คุณคุ้นเคยจากฝั่ง browser อยู่แล้ว
 
-```typescript
-Deno.serve(async (req) => {
-  const { name } = await req.json()
-  return new Response(JSON.stringify({ message: `Hello ${name}!` }), {
+```ts
+// supabase/functions/edge-hello/index.ts
+Deno.serve((_req) => {
+  return new Response(JSON.stringify({ message: 'Hello from the edge' }), {
     headers: { 'Content-Type': 'application/json' },
   })
 })
 ```
 
-ไฟล์นี้อยู่ที่ `supabase/functions/hello-world/index.ts` เมื่อ deploy แล้วจะเรียกได้ที่ `https://<project-ref>.supabase.co/functions/v1/hello-world` แต่ปกติคุณไม่ต้องประกอบ URL นี้เอง เพราะ client library จัดการให้
+ไฟล์นี้อยู่ที่ `supabase/functions/edge-hello/index.ts` เมื่อ deploy แล้วจะเรียกได้ที่ `https://<project-ref>.supabase.co/functions/v1/edge-hello` แต่ปกติคุณไม่ต้องประกอบ URL นี้เอง เพราะ client library จัดการให้ `deno check` ยืนยันได้ว่าไฟล์นี้ type-check ผ่านด้วยตัวเองก่อนจะรันด้วยซ้ำ — พูดถึงท้ายบทนี้
 
-## การเรียกใช้จาก client
+## Import specifier: นี่คือ Deno ไม่ใช่ Node
 
-`supabase-js` มี method `functions.invoke()` แยกออกมาแทนที่จะใช้ `fetch` เปล่า ๆ เพราะทำงานที่เป็นประโยชน์ให้อัตโนมัติ
+วิธีที่โค้ด Edge Function ที่ AI สร้างพังบ่อยที่สุด: import package แบบเดียวกับที่ทำในโปรเจกต์ Node.js หรือ Vite
 
-```typescript
-const { data, error } = await supabase.functions.invoke('hello-world', {
-  body: { name: 'World' },
+```ts
+// @expect-error worker fails to boot: bare specifiers are not resolvable in Deno
+import { createClient } from '@supabase/supabase-js'
+
+Deno.serve((_req) => {
+  const client = createClient('http://x', 'y')
+  return new Response(JSON.stringify({ ok: !!client }))
 })
 ```
 
-นอกจากจะ serialize `body` เป็น JSON ให้แล้ว `invoke()` ยังแนบ header `Authorization` ให้อัตโนมัติ เป็น access token ของ user ที่ล็อกอินอยู่ตอนนั้น หรือเป็น anon key ของโปรเจกต์ถ้าไม่มีใครล็อกอิน นั่นแปลว่า function ของคุณตรวจสอบได้ว่าใครเป็นคนเรียก (หรือยืนยันว่าไม่มีการยืนยันตัวตนเลย) โดยไม่ต้องต่อ header นี้เองในทุกครั้งที่เรียก
+deploy แบบนี้ตรง ๆ ภายใต้ `supabase functions serve` ทุก request ที่เข้า function นี้จะได้ `503` จริง และ error ตอน boot จริง ๆ ที่จับมาจาก log ของ runtime ในเครื่องก็บอกชัดเจนว่าต้องทำอย่างไรแทน
 
-## Secrets และ environment variables
+```text
+HTTP/1.1 503
+{"code":"BOOT_ERROR","message":"Worker failed to boot (please check logs)"}
 
-function มักต้องใช้ credential ที่ห้ามให้ client เห็นเด็ดขาด เช่น API key ของ third-party หรือ signing secret ตั้งค่าให้ deployed function ด้วย CLI
-
-```bash
-supabase secrets set MY_API_KEY=sk_live_examplekey123
+worker boot error: failed to bootstrap runtime: failed to create the graph:
+Relative import path "@supabase/supabase-js" not prefixed with / or ./ or ../
+  hint: If you want to use a JSR or npm package, try running
+  `deno add jsr:@supabase/supabase-js` or `deno add npm:@supabase/supabase-js`
+    at file:///.../supabase/functions/edge-bare-import-demo/index.ts:1:30
 ```
 
-อ่านค่าในฟังก์ชันด้วย `Deno.env.get`
+Deno ไม่มี bare-specifier/`node_modules`-style resolution มาให้โดย default ทุก import ต้องเป็น relative path (`./foo.ts`), URL เต็ม ๆ หรือ package-registry specifier สองแบบนี้
+
+- **`jsr:`** — registry ของ Deno เอง ([JSR](https://jsr.io)) และเป็นที่ที่ `@supabase/supabase-js` ถูก publish ไว้สำหรับ Deno
+- **`npm:`** — resolve npm package ธรรมดาผ่าน npm compatibility layer ของ Deno
+
+แก้แล้ว ทั้งสอง specifier ทำงานได้จริงกับ local stack นี้ใน function เดียวกัน
+
+```ts
+// supabase/functions/edge-import-specifiers/index.ts
+import { createClient } from 'jsr:@supabase/supabase-js@2'
+import { nanoid } from 'npm:nanoid@5'
+
+Deno.serve((_req) => {
+  const client = createClient('http://example.com', 'anon-key-placeholder')
+  return new Response(JSON.stringify({ jsrClientOk: !!client, npmId: nanoid(8) }), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+})
+```
+
+```text
+$ curl "$FUNCTIONS_URL/edge-import-specifiers" -H "Authorization: Bearer $ANON_KEY" -H "apikey: $ANON_KEY"
+{"jsrClientOk":true,"npmId":"kR-o8HyM"}
+```
+
+<Callout title="ต้อง pin version เสมอ">
+ทุกตัวอย่างจริงในคอร์สนี้ pin `@2`, `@5` ไว้เสมอ `jsr:@supabase/supabase-js` หรือ `npm:nanoid` ที่ไม่ pin version จะ resolve ไปที่ version ล่าสุด ณ ตอน deploy — ไม่มีปัญหาตอนพัฒนา local แต่เป็นความเสี่ยงจริงสำหรับ function ที่คุณตั้งใจให้ทำงานเหมือนเดิมไม่เปลี่ยนบน production
+</Callout>
+
+## `deno.json`: import map ต่อ function
+
+bare specifier ยังใช้ได้ถ้าคุณให้ mapping กับ Deno — `deno.json` ที่วางไว้ข้าง `index.ts` ของ function ทำหน้าที่เป็น import map ของ function นั้นเท่านั้น (แต่ละ function มี module graph ของตัวเอง ไม่มีอะไรรั่วไปยัง function ข้างเคียง)
+
+```json
+// supabase/functions/edge-import-map/deno.json
+{
+  "imports": {
+    "supabase": "jsr:@supabase/supabase-js@2"
+  }
+}
+```
 
 ```typescript
-const apiKey = Deno.env.get('MY_API_KEY')
+// supabase/functions/edge-import-map/index.ts
+import { createClient } from 'supabase'
+
+Deno.serve((_req) => {
+  const client = createClient('http://example.com', 'anon-key-placeholder')
+  return new Response(JSON.stringify({ ok: !!client }), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+})
 ```
 
-สำหรับ local development `supabase functions serve` จะอ่านไฟล์ `.env` ที่วางไว้ใต้ `supabase/functions/` ดังนั้นโค้ด `Deno.env.get` เดิมทำงานเหมือนกันไม่ว่าจะรัน local หรือรันบน function ที่ deploy แล้ว ต่างกันแค่ค่านั้นมาจากไหน
+```text
+$ curl "$FUNCTIONS_URL/edge-import-map" -H "Authorization: Bearer $ANON_KEY" -H "apikey: $ANON_KEY"
+{"ok":true}
+```
 
-<Mermaid title="การ invoke จาก client ไปถึง Deno function ที่ deploy แล้ว" code={invokeFlowDiagram} />
+bare specifier `'supabase'` resolve ได้เพราะ `imports` map ใน `deno.json` redirect มันไปที่ `jsr:` specifier จริง ๆ ลบไฟล์นี้ออก function นี้ตัวเดิมเป๊ะจะพังด้วย `BOOT_ERROR` แบบเดียวกับข้างบนทันที
+
+## CORS: header ที่ function ต้องตั้งเอง
+
+browser ที่ยิง cross-origin request จะตรวจก่อนว่า server ยอมให้ทำแบบนี้หรือไม่ — สำหรับ request ที่ไม่ธรรมดา (เช่น `POST` ที่มี JSON body) browser จะส่ง **preflight** แบบ `OPTIONS` ไปก่อน แล้วค่อยยิง request จริงถ้า response ของ preflight บอกว่าทำได้ function ที่ไม่ตั้ง CORS header เลยจะทำงานได้สมบูรณ์จาก `curl` (curl ไม่บังคับ CORS — มีแค่ browser เท่านั้นที่บังคับ) แล้วพังแบบเงียบ ๆ สำหรับ browser client จริงจากคนละ origin จัดการให้ถูกต้อง
+
+```ts
+// supabase/functions/edge-cors/index.ts
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+}
+
+Deno.serve(async (req) => {
+  if (req.method === 'OPTIONS') {
+    return new Response(null, { headers: corsHeaders })
+  }
+
+  const { name } = await req.json()
+  return new Response(JSON.stringify({ message: `Hello ${name}!` }), {
+    headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+  })
+})
+```
+
+preflight จริงยิงเข้าไป และ header จริงที่ response ถืออยู่
+
+```bash
+# scripts/edge-cors-preflight.sh
+curl -i -X OPTIONS "$FUNCTIONS_URL/edge-cors" \
+  -H "Origin: https://example.com" \
+  -H "Access-Control-Request-Method: POST" \
+  -H "Access-Control-Request-Headers: authorization, content-type"
+```
+
+```text
+HTTP/1.1 200 OK
+Access-Control-Allow-Origin: *
+Access-Control-Allow-Headers: authorization, content-type
+Access-Control-Allow-Methods: GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS,TRACE,CONNECT
+```
+
+<Callout title="quirk เฉพาะ local: Kong ตอบ OPTIONS ก่อนที่ function ของคุณจะเห็นด้วยซ้ำ">
+บน local stack นี้ Kong gateway ของ CLI เอง intercept request `OPTIONS` ไปยัง `/functions/v1/*` แล้วตอบด้วย CORS header ที่ยอมรับกว้าง ๆ ของตัวเอง (บรรทัด `Access-Control-Allow-Methods` ข้างบนที่มีทุก HTTP verb คือ response default ของ plugin ของ Kong ไม่ใช่สิ่งที่โค้ดของ `edge-cors` คืนมา) — branch `if (req.method === 'OPTIONS')` ของ function เองจึงไม่ถูกเรียกจริง ๆ ในเครื่องสำหรับ cross-origin preflight เลย ส่วน response ของ POST จริง ๆ ถือ header ของ function เองผ่านมาไม่เปลี่ยนแปลง พิสูจน์ด้านล่าง นี่คือความต่างที่มีแค่ **ในเครื่องเท่านั้น** — [official CORS guide](https://github.com/supabase/supabase/blob/master/apps/docs/content/guides/functions/cors.mdx) บอกชัดว่า Edge Functions บนโฮสต์จริงคาดหวังให้ function เองตอบ `OPTIONS` — เขียน branch `req.method === 'OPTIONS'` ไว้เสมอ ไม่ว่า proxy ในเครื่องนี้จะทำอะไรให้ก็ตาม
+</Callout>
+
+request จริง ทั้งแบบที่ function ตั้ง CORS header เองและไม่ตั้ง — curl แสดงทั้งคู่เป็น `200` เพราะ curl ไม่บังคับ CORS เลย สิ่งที่ browser อ่าน *header* จะต่างกัน
+
+```text
+$ curl -i -X POST "$FUNCTIONS_URL/edge-cors" -H "Origin: https://example.com" \
+    -H "Authorization: Bearer $ANON_KEY" -H "apikey: $ANON_KEY" -H "Content-Type: application/json" -d '{"name":"world"}'
+HTTP/1.1 200 OK
+access-control-allow-origin: *
+access-control-allow-headers: authorization, x-client-info, apikey, content-type
+access-control-allow-methods: POST, OPTIONS
+{"message":"Hello world!"}
+
+$ curl -i -X POST "$FUNCTIONS_URL/edge-no-cors" -H "Origin: https://example.com" \
+    -H "Authorization: Bearer $ANON_KEY" -H "apikey: $ANON_KEY" -H "Content-Type: application/json" -d '{"name":"world"}'
+HTTP/1.1 200 OK
+Access-Control-Allow-Origin: *
+{"message":"Hello world!"}
+```
+
+ทั้งคู่ได้ `200` พร้อม body — ความต่างที่ `fetch()` ของ browser จริงจะเอาไปใช้คือ response ของ `edge-cors` ถือ `Allow-Headers`/`Allow-Methods` ที่ `POST` cross-origin จริงพร้อม custom header ต้องมี ส่วน `edge-no-cors` มีแค่สิ่งที่ proxy ในเครื่องนี้เติมให้เท่านั้น deploy จริงแล้วเรียกจาก origin ที่ต่างกันจริงพร้อม custom header มีแค่ function ที่ตั้ง header ของตัวเองเท่านั้นที่การันตีว่าทำงานได้
+
+## การเรียกใช้จาก client
+
+`supabase-js` มี method `functions.invoke()` แยกออกมาแทนที่จะใช้ `fetch` เปล่า ๆ เพราะทำงานที่เป็นประโยชน์ให้อัตโนมัติ: serialize `body` เป็น JSON และแนบ header `Authorization` ให้อัตโนมัติ เป็น access token ของ user ที่ล็อกอินอยู่ตอนนั้น หรือเป็น anon key ของโปรเจกต์ถ้าไม่มีใครล็อกอิน
+
+```ts
+// src/invoke-edge-hello.ts
+// @run
+import { createClient } from '@supabase/supabase-js'
+
+declare const process: { env: Record<string, string | undefined> }
+
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!)
+
+const { data, error } = await supabase.functions.invoke('edge-hello')
+
+if (error) {
+  throw new Error(`invoke failed: ${error.message}`)
+}
+
+console.log('invoke succeeded, function responded:', data)
+```
+
+นี่คือการเรียกจริงที่ถูก execute จริง — `supabase.functions.invoke('edge-hello')` ไปถึง function `edge-hello` จากก่อนหน้านี้ในบทนี้ ที่ถูก serve ในเครื่องด้วย `supabase functions serve` process ของโมดูลนี้เอง และ harness รันมันด้วย `tsx` กับ live stack ตรงตามที่แสดงไว้ ไม่ใช่ client ปลอม
+
+## `verify_jwt`: ใครเรียกได้บ้าง
+
+ก่อนที่โค้ดของ function จะรันเลย Edge Runtime บังคับ Supabase JWT ที่ valid บนทุก request ได้ ควบคุมต่อ function ด้วย `verify_jwt` (default เป็น `true` — ปิดไว้สำหรับ function ที่ถูกเรียกโดยอะไรที่ไม่ใช่ client ที่ล็อกอินแล้ว เช่น webhook receiver ในบทถัดไป)
+
+```toml
+# supabase/config.toml
+[functions.edge-hello]
+verify_jwt = false
+```
+
+ด้วยค่า default (`verify_jwt = true` ไม่ใส่ flag) response body จริงสำหรับ header `Authorization` ที่ขาดไปกับที่ผิดรูปแบบ — จับมาจาก local stack นี้ เรียก `edge-hello`
+
+```text
+$ curl "$FUNCTIONS_URL/edge-hello"
+{"code":"UNAUTHORIZED_NO_AUTH_HEADER","message":"Missing authorization header","msg":"Missing authorization header"}
+HTTP 401
+
+$ curl "$FUNCTIONS_URL/edge-hello" -H "Authorization: Bearer not-a-real-jwt" -H "apikey: $ANON_KEY"
+{"code":"UNAUTHORIZED_INVALID_JWT_FORMAT","message":"Invalid JWT format","msg":"Invalid JWT format"}
+HTTP 401
+
+$ curl "$FUNCTIONS_URL/edge-hello" -H "Authorization: Bearer $ANON_KEY" -H "apikey: $ANON_KEY"
+{"message":"Hello from the edge"}
+HTTP 200
+```
+
+anon key ของโปรเจกต์เองก็เป็น JWT ที่ valid (signed สำหรับ role `anon`) นี่คือเหตุผลที่มันใช้เป็น bearer token ข้างบนได้เลย — `verify_jwt` ตรวจแค่ว่า token เป็น Supabase JWT จริงที่ signed ถูกต้อง ไม่ได้ตรวจว่ามี user จริงล็อกอินอยู่ การส่ง access token ของ **user** จริงเข้าไปแทน (บทถัดไปพูดเต็ม ๆ) คือสิ่งที่ทำให้ database query ของ function รันในฐานะ user นั้น ไม่ใช่ในฐานะ `anon` ด้วย `--no-verify-jwt` (เท่ากับ `verify_jwt = false`) request เดิมที่**ไม่มี** header `Authorization` เลยก็สำเร็จ
+
+```text
+$ supabase functions serve --no-verify-jwt
+$ curl "$FUNCTIONS_URL/edge-hello"
+{"message":"Hello from the edge"}
+HTTP 200
+```
+
+## Secrets: `.env` ในเครื่อง, `supabase secrets set` ตอน deploy
+
+function มักต้องใช้ credential ที่ห้ามให้ client เห็นเด็ดขาด ในเครื่อง `supabase functions serve --env-file <path>` โหลดไฟล์ `.env` ธรรมดา อ่านในฟังก์ชันด้วย `Deno.env.get` แบบเดียวกันทั้งสองสภาพแวดล้อม
+
+```ts
+// supabase/functions/edge-secrets/index.ts
+Deno.serve((_req) => {
+  const secret = Deno.env.get('EDGE_DEMO_SECRET') ?? null
+  return new Response(JSON.stringify({ secret }), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+})
+```
+
+```text
+$ echo "EDGE_DEMO_SECRET=from-env-file" > .env.local
+$ supabase functions serve --env-file .env.local
+$ curl "$FUNCTIONS_URL/edge-secrets" -H "Authorization: Bearer $ANON_KEY" -H "apikey: $ANON_KEY"
+{"secret":"from-env-file"}
+```
+
+`supabase secrets set` คือคำสั่งเทียบเท่าสำหรับ deployed project — รันกับ local stack นี้ที่ไม่ได้ link cloud project ไว้ มันพังด้วย error ที่บอกตัวเองว่าเป็นคำสั่ง **hosted-only** ชัดเจน
+
+```text
+$ supabase secrets set EDGE_DEMO_SECRET2=from-secrets-set
+{"_tag":"Error","error":{"code":"LegacyPlatformAuthRequiredError","message":"Access token not provided. Supply an access token by running `supabase login` or setting the SUPABASE_ACCESS_TOKEN environment variable."}}
+```
+
+ไม่มี local emulation ของ `supabase secrets set` — `.env`/`--env-file` **คือ** เรื่องราวฝั่ง local ทั้งหมด `supabase secrets set` คุยกับ deployed project ที่ล็อกอินแล้วเท่านั้น
+
+## `deno check` เป็น pre-deploy gate
+
+ทุก `ts-edge` fence จริงในคอร์สนี้ถูกรันผ่าน `deno check` ก่อนจะเชื่อถือได้อยู่แล้ว — คำสั่งเดียวกันที่ CI pipeline (หรือคุณเอง ก่อน `supabase functions deploy`) ควรรันกับ function directory
+
+```text
+$ cd supabase/functions/edge-typecheck-demo && deno check index.ts
+Check index.ts
+TS2345 [ERROR]: Argument of type 'string' is not assignable to parameter of type 'number'.
+  const total = addToCount(5, "3")
+                              ~~~
+    at file:///.../edge-typecheck-demo/index.ts:6:31
+
+error: Type checking failed.
+```
+
+type error จริง (`addToCount(5, "3")` ส่ง `string` เข้าไปที่ประกาศไว้เป็น `number`) ถูกจับได้ก่อน deploy ไม่ใช่ไปเจอเป็น runtime `503` หลังจากนั้น — `deno check` คือ compiler ของ Deno เองที่ทำแบบเดียวกับที่ `tsc --noEmit` ทำให้โปรเจกต์ Node/browser แค่ scope อยู่ที่ module graph ของ function เดียว
+
+<Mermaid title="การ invoke จาก client ไปถึง Deno function ที่ serve อยู่ในเครื่อง" code={invokeFlowDiagram} />
 
 export const invokeFlowDiagram = `flowchart LR
-  client["supabase.functions.invoke('hello-world', { body })"] -->|"HTTP request + Authorization header"| edge["Deployed Deno function (Deno.serve)"]
+  client["supabase.functions.invoke('edge-hello')"] -->|"HTTP request + Authorization header"| edge["Deno.serve function (jsr:/npm: imports resolved)"]
   edge -->|"Response"| client`;
 
 <Callout title="สรุปในบรรทัดเดียว">
-Edge Function คือ `Deno.serve((req) => ...)` handler ที่**ไม่ต้อง import** อะไรสำหรับ `Deno.serve` เอง เรียกใช้จาก client ด้วย `supabase.functions.invoke(name, { body })` ซึ่ง**แนบ Authorization header ให้อัตโนมัติ** (user token หรือ anon key) ส่วน secrets ตั้งค่าด้วย `supabase secrets set` แล้วอ่านในฟังก์ชันด้วย `Deno.env.get` โดย local ใช้ไฟล์ `.env` ใต้ `supabase/functions/` แทน
+Edge Functions คือ Deno ไม่ใช่ Node: bare specifier boot-fail ด้วย `503`/`BOOT_ERROR` จริง (แก้ด้วย `jsr:`, `npm:`, URL หรือ `deno.json` import map ต่อ function) CORS header เป็นความรับผิดชอบของ **function เอง** ที่ต้องตั้ง (พิสูจน์แล้ว: quirk ของ Kong ในเครื่องตอบ preflight ให้แทน แต่บนโฮสต์จริงไม่ทำแบบนั้น) `verify_jwt` (default `true`) ตรวจทุก request ก่อนโค้ดคุณรัน (พิสูจน์แล้ว: response body `401` จริงสำหรับ header ที่ขาดหรือผิดรูปแบบ) secrets เป็น `.env`/`--env-file` ในเครื่อง และ `supabase secrets set` เฉพาะ deployed project ที่ล็อกอินแล้วเท่านั้น และ `deno check` คือ pre-deploy gate ที่จับ type error จริงก่อนมันกลายเป็น runtime failure
 </Callout>
+
+## อ่านโค้ดที่ AI สร้าง
+
+AI ถูกขอให้ "เรียก internal notifications service" จาก Edge Function แล้วได้โค้ดนี้มา
+
+<SpotTheBug lang="ts" code={`// supabase/functions/notify-user/index.ts
+import axios from 'axios'
+import { v4 as uuidv4 } from 'uuid'
+
+Deno.serve(async (req) => {
+  const { userId, message } = await req.json()
+
+  const response = await axios.post('https://notifications.internal/send', {
+    id: uuidv4(),
+    userId,
+    message,
+  })
+
+  return new Response(JSON.stringify(response.data), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+})
+`}>
+ทั้งสอง import เป็น bare specifier — `import axios from 'axios'` และ `import { v4 as uuidv4 } from 'uuid'` — ตรงกับ pattern ที่พังไม่ boot ด้วย `BOOT_ERROR`/"Relative import path ... not prefixed with / or ./ or ../" จริงที่โชว์ไว้ก่อนหน้านี้ในบทนี้เลย เพราะ AI สร้างโค้ดนี้แบบเดียวกับที่จะทำให้ backend Node.js/Express ที่ bare specifier resolve ผ่าน `node_modules` ได้อัตโนมัติ ทุก request ที่เข้า function นี้จะ 503 ก่อนที่ handler code แม้แต่บรรทัดเดียวจะได้รัน วิธีแก้เป็นเรื่อง mechanical ไม่ต้อง redesign อะไร: `import axios from 'npm:axios@1'` และ `import { v4 as uuidv4 } from 'npm:uuid@9'` (หรือตัดทั้งคู่ออกไปเลย — `crypto.randomUUID()` เป็น Deno/Web-standard global ที่ไม่ต้อง import อะไร และ `fetch()` เปล่า ๆ แทน `axios` สำหรับ POST ธรรมดาได้โดยไม่ต้องมี dependency เลย)
+</SpotTheBug>
+
+## Mental Model
+
+การเขียน Edge Function คือการเขียนโปรแกรม Deno เดี่ยว ๆ ที่มี module graph ของตัวเอง ไม่ใช่การเพิ่ม route ให้แอป Node.js ที่มีอยู่แล้ว ทุก import ถูก resolve ใหม่ต่อ function ตอน isolate boot ขึ้นมา นี่คือเหตุผลที่ bare specifier พังตอน *boot* (ก่อนที่ handler code ของคุณจะรันเลย) ไม่ใช่แค่พังที่บรรทัดที่ใช้มัน และทำไม `deno.json` ที่อยู่ข้าง `index.ts` ของ function หนึ่งจึงไม่มีผลกับ function อื่นเลย CORS และ `verify_jwt` อยู่ที่ boundary "ก่อนโค้ดคุณรัน" เดียวกันนี้ `verify_jwt` ถูกตรวจโดย runtime ก่อน handler ของคุณถูกเรียกด้วยซ้ำ (พิสูจน์ด้วย response body ที่มี structure ชัดเจน ไม่ใช่สิ่งที่โค้ดคุณสร้างเอง) ส่วน CORS header กลับกัน ไม่มีอะไรตรวจให้คุณเลย นี่คือเหตุผลที่ function ที่ไม่ตั้ง CORS header เลย "ทำงานได้" ทุกที่ที่ทดสอบด้วย curl หรือ browser same-origin แต่จะพังแบบเงียบ ๆ ทันทีที่ browser client จากคนละ origin จริง ๆ เรียกมา
+
+## Trade-offs
+
+- **specifier `jsr:`/`npm:` ให้คุณใช้ npm/JSR ecosystem ทั้งหมดในฟังก์ชันได้** — **แต่ต้องแลกกับการต้องจำ pin version เอง** เพราะ specifier ที่ไม่ pin จะ resolve เป็น "อะไรก็ตามที่ล่าสุด ณ ตอนนั้น" โดยไม่มี lockfile แบบที่ `package-lock.json` ของโปรเจกต์ Node ให้คุณ
+- **`deno.json` import map ต่อ function ทำให้ dependency ของ function หนึ่งอยู่ในขอบเขตของตัวเองล้วน ๆ** — **แต่ต้องแลกกับการซ้ำซ้อน**: สอง function ที่ต้องใช้ package เดียวกัน ต้อง declare และ pin เองแยกกันทั้งคู่ ไม่มี root `package.json` กลางให้พึ่งพา
+- **`verify_jwt = true` (default) reject request ที่ไม่ล็อกอินก่อนโค้ดคุณรัน ให้ฟรี ๆ** — **แต่ต้องแลกกับการใช้ไม่ได้กับอะไรที่ไม่ใช่ Supabase client ที่ล็อกอินแล้ว**: Database Webhook หรือ third-party callback (บทถัดไป) ไม่มี Supabase JWT ให้ยื่น ต้องใช้ `verify_jwt = false` พร้อม authentication scheme ของตัวเองแทน
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"import npm package อะไรก็ได้แบบเดียวกับที่ทำในไฟล์ Node.js"** ทำได้เฉพาะที่มี `npm:` (หรือ `jsr:`, URL, หรือ bare specifier ที่ map ผ่าน `deno.json`) ชัดเจนเท่านั้น — bare specifier คือ `503` ตอน boot ไม่ใช่เรื่องเซอร์ไพรส์ตอน runtime ที่เจอตอนใช้ครั้งแรก
+- **"ถ้า curl ได้ 200 พร้อม JSON ที่ถูก แปลว่า CORS header ของฉันโอเคแล้ว"** curl ไม่บังคับ CORS เลย — มีแค่ browser เท่านั้นที่บังคับ ด้วยการปฏิเสธไม่ให้ page JavaScript อ่าน response cross-origin เมื่อ header ไม่อนุญาต `200` จาก curl พิสูจน์แค่ว่า function รันสำเร็จ ไม่ได้พิสูจน์อะไรเลยว่า browser client cross-origin จริงจะอ่านผลลัพธ์ได้
+- **"`verify_jwt = false` แปลว่าใครจะทำอะไรก็ได้"** มันแค่เอา JWT check ที่มีอยู่แล้วออกไปก่อน handler จะรัน — function ที่ `verify_jwt = false` ต้องรับผิดชอบ authentication และ authorization ของตัวเองเต็ม ๆ ตั้งแต่จุดนั้นไป (shared secret header, ตรวจ HMAC signature, หรือไม่มีอะไรเลยถ้าตั้งใจให้เป็น public จริง ๆ)
+- **"`supabase secrets set` ใช้ในเครื่องได้เลยตอนทดสอบด้วย CLI"** มันเป็นคำสั่งสำหรับ hosted project เท่านั้นที่ต้อง `supabase login` ก่อน สิ่งที่ใช้แทนในเครื่องเสมอคือ `.env`/`--env-file` พิสูจน์ข้างบนด้วย `LegacyPlatformAuthRequiredError` จริง
 
 export const quizWritingInvoking = [
   {
-    q: 'ต้อง import อะไรก่อนใช้ Deno.serve ใน Edge Function หรือไม่',
+    q: 'ทำไม `import { createClient } from "@supabase/supabase-js"` (ไม่มี prefix) พังตอนอยู่ใน Edge Function',
     options: [
-      'ต้อง import จาก Deno standard library module',
-      'ไม่ต้อง Deno.serve เป็น global ที่ runtime มีให้',
-      'ต้องติดตั้งผ่าน npm ก่อน',
-      'ต้อง import เฉพาะตอนรัน local ด้วย supabase functions serve',
+      'ไม่พัง Deno resolve จาก cache ที่ซ่อนไว้',
+      'Deno ไม่มี bare-specifier/node_modules resolution มาให้โดย default worker จะ boot ไม่สำเร็จด้วย error จริงที่ขอให้ใช้ jsr:/npm:',
+      'พังเฉพาะตอน deploy เท่านั้น ไม่พังในเครื่อง',
+      '@supabase/supabase-js ไม่มีเวอร์ชันสำหรับ Deno เลย',
     ],
     answer: 1,
+    explain: 'พิสูจน์ข้างบน: function boot ไม่สำเร็จด้วย "worker boot error ... Relative import path ... not prefixed with / or ./ or ../" ทุก request จะ 503 จนกว่า import จะเขียนเป็น jsr:/npm:',
   },
   {
-    q: 'supabase.functions.invoke() แนบอะไรให้ request อัตโนมัติ',
+    q: '`deno.json` ต่อ function ทำหน้าที่อะไร',
     options: [
-      'ไม่แนบอะไรเลย ต้องตั้ง header เองทุกครั้ง',
-      'header Authorization ที่เป็น access token ของผู้เรียกหรือ anon key',
-      'service_role key แบบ hard-coded',
-      'request id แบบสุ่มเท่านั้น',
+      'ไม่ทำอะไร ใช้แค่กับ Supabase Dashboard เท่านั้น',
+      'ทำหน้าที่เป็น import map ที่ scope อยู่แค่ function นั้น ให้ bare specifier resolve ไปยัง jsr:/npm: target จริง',
+      'ตั้ง secret แบบ global ให้ทุก function ในโปรเจกต์',
+      'แทนที่ความจำเป็นของ deno check ก่อน deploy',
     ],
     answer: 1,
+    explain: 'พิสูจน์ข้างบน: deno.json ของ edge-import-map map bare specifier "supabase" ไปที่ jsr:@supabase/supabase-js@2 — ลบไฟล์นี้ทิ้ง import เดิมจะพังไม่ boot',
   },
   {
-    q: 'ตั้งค่า secret ให้ Edge Function ที่ deploy แล้วทำอย่างไร',
+    q: 'ทำไม function ที่ไม่มี CORS header เลยยังคืน 200 ตอนทดสอบด้วย curl',
     options: [
-      'เขียนค่าลงไฟล์ index.ts โดยตรง',
-      'รัน supabase secrets set MY_API_KEY=value แล้วอ่านด้วย Deno.env.get',
-      'เก็บไว้ใน Postgres table แล้ว query ตอน request',
-      'ใช้ secret ใน Edge Function ไม่ได้',
+      'เพราะ curl เติม header ที่ขาดให้อัตโนมัติ',
+      'เพราะ curl ไม่บังคับ CORS เลย — มีแค่ browser เท่านั้นที่บังคับ ด้วยการปฏิเสธไม่ให้ page JavaScript อ่าน response',
+      'เพราะ CORS ใช้กับ GET request เท่านั้น',
+      'เพราะ function ตั้งค่าผิด และ curl รายงานผลสำเร็จแบบผิด ๆ',
     ],
     answer: 1,
+    explain: 'CORS คือการป้องกันที่ browser บังคับ ไม่ใช่ gate ฝั่ง server — curl (และ Kong proxy ในเครื่องนี้) คืน 200 ได้เสมอไม่ว่า header Access-Control-* จะมีหรือไม่มี',
   },
   {
-    q: 'local development อ่าน environment variables ของ function มาจากไหน',
+    q: 'request ไปยัง function ที่ `verify_jwt = true` (default) ไม่มี header Authorization เลย จะเกิดอะไรก่อน handler code จะรัน',
     options: [
-      'เรียก secrets store ที่ deploy แล้วผ่านเครือข่ายเสมอ',
-      'จากไฟล์ .env ที่วางไว้ใต้ supabase/functions/',
-      'ใช้ environment variables ใน local ไม่ได้',
-      'จาก package.json ของโปรเจกต์',
+      'handler รันตามปกติ และ req.headers ก็แค่ว่างเปล่า',
+      'Edge Runtime ปฏิเสธด้วย 401 ที่มี structure ชัดเจน (UNAUTHORIZED_NO_AUTH_HEADER) ก่อนที่โค้ดของ function จะรันเลย',
+      'สำเร็จเฉพาะถ้า function ตรวจ header เอง',
+      'request จะแขวนรอจนกว่าจะ timeout',
     ],
     answer: 1,
+    explain: 'พิสูจน์ข้างบนด้วย curl transcript จริง: {"code":"UNAUTHORIZED_NO_AUTH_HEADER",...} HTTP 401 — การตรวจนี้เกิดที่ระดับ runtime ก่อน user code จะรันเลย',
+  },
+  {
+    q: 'สิ่งที่ใช้แทน `supabase secrets set` ในเครื่องสำหรับ deployed project คืออะไร',
+    options: [
+      'ไม่มีสิ่งที่ใช้แทนในเครื่องได้ ทดสอบ secret ในเครื่องไม่ได้',
+      '`supabase functions serve --env-file <path>` อ่านไฟล์ .env ธรรมดา ด้วยโค้ด Deno.env.get() เดียวกันในฟังก์ชัน',
+      '`supabase secrets set` ก็ใช้ในเครื่องได้เลยโดยไม่ต้องล็อกอิน',
+      'ต้อง hardcode secret ไว้สำหรับ local development',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ข้างบน: supabase secrets set พังในเครื่องด้วย LegacyPlatformAuthRequiredError (เป็น hosted-only) --env-file คือกลไกจริงในเครื่อง และโค้ด function ที่เรียก Deno.env.get ไม่ต้องเปลี่ยนระหว่างสองแบบนี้เลย',
+  },
+  {
+    q: 'function ที่ AI สร้างเขียน `import axios from \'axios\'` และ `import { v4 as uuidv4 } from \'uuid\'` ใน `supabase/functions/notify-user/index.ts` จะเกิดอะไรขึ้น และวิธีแก้ที่น้อยที่สุดคือ?',
+    options: [
+      'ไม่เกิดอะไร ทั้งสอง package เป็น built-in ของ Deno',
+      'worker จะ boot ไม่สำเร็จ (503 ทุก request) เพราะทั้งคู่เป็น bare specifier แก้ด้วย prefix npm: หรือตัดออกแล้วใช้ fetch()/crypto.randomUUID() แทน',
+      'มีแค่ axios import ที่พัง uuid ใช้ได้โดยไม่ต้อง prefix',
+      'ทำงานได้ในเครื่อง แต่จะพังเฉพาะตอน deploy แล้วเท่านั้น',
+    ],
+    answer: 1,
+    explain: 'ทั้งคู่เป็น bare specifier ทำให้ function ทั้งตัว boot ไม่สำเร็จทันที เป็น BOOT_ERROR/InvalidWorkerCreation แบบเดียวกับที่โชว์ไว้ก่อนหน้านี้ในบทนี้ ไม่ใช่พังแค่บางส่วน',
   },
 ];
 
