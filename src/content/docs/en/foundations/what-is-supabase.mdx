@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
@@ -75,9 +76,86 @@ export const whatIsSupabaseDiagram = `flowchart TB
   realtime --> pg
   functions --> pg`;
 
+## What one `supabase start` actually boots
+
+The service list above is not a marketing diagram — it is one Docker Compose stack, and every box in it is a real, individually-named container. This is the real `docker ps` output for this course's own local stack (one unrelated sibling-course container filtered out):
+
+```text
+$ docker ps --format '{{.Names}}\t{{.Image}}'
+supabase_kong_probe        ghcr.io/supabase/kong:2.8.1
+supabase_rest_probe        ghcr.io/supabase/postgrest:v16.2
+supabase_auth_probe        ghcr.io/supabase/gotrue:v2.196.0
+supabase_realtime_probe    ghcr.io/supabase/realtime:v2.130.0
+supabase_storage_probe     ghcr.io/supabase/storage-api:v1.72.1
+supabase_pooler_probe      public.ecr.aws/supabase/supavisor:2.9.12
+supabase_db_probe          public.ecr.aws/supabase/postgres:17.6.1.167
+supabase_studio_probe      public.ecr.aws/supabase/studio:2026.08.24-sha-8ec45b2
+supabase_pg_meta_probe     public.ecr.aws/supabase/postgres-meta:v0.99.0
+supabase_analytics_probe   ghcr.io/supabase/logflare:1.50.6
+supabase_vector_probe      ghcr.io/supabase/vector:0.53.0-alpine
+supabase_inbucket_probe    ghcr.io/supabase/mailpit:v1.30.2
+```
+
+Every one of those names ends in `_probe` because this course's `project_id` is `probe` — your own project's containers carry your project's own id instead. `supabase_edge_runtime_probe` and `supabase_imgproxy_probe` are part of the same stack but report **stopped**: the CLI starts them lazily, on first real use (an Edge Function invocation, an image transformation), not eagerly at `supabase start`.
+
+**Kong is the one piece the diagram above simplifies away**: nothing talks to PostgREST, GoTrue, Realtime, or Storage directly — every request, whether it is `supabase-js`, `curl`, or the Studio UI, goes through **Kong**, an API gateway, first. Kong is what turns "several independent services on several different ports" into the single `API_URL` (`http://127.0.0.1:55321` on this stack) you have been using since the previous lesson, routing each request onward by path (`/rest/v1/...` to PostgREST, `/auth/v1/...` to GoTrue, and so on).
+
+<Mermaid title="Real containers from this stack's own docker ps, Kong routing every request onward" code={realArchitectureDiagram} />
+
+export const realArchitectureDiagram = `flowchart LR
+  client["Client - supabase-js / curl / Studio"] --> kong["supabase_kong_probe (Kong API gateway)"]
+  kong -->|"/rest/v1"| rest["supabase_rest_probe (PostgREST)"]
+  kong -->|"/auth/v1"| auth["supabase_auth_probe (GoTrue)"]
+  kong -->|"/realtime/v1"| realtime["supabase_realtime_probe"]
+  kong -->|"/storage/v1"| storage["supabase_storage_probe"]
+  kong -->|"/functions/v1"| edge["supabase_edge_runtime_probe (Deno - lazy start)"]
+  rest --> pg[("supabase_db_probe - Postgres 17")]
+  auth --> pg
+  realtime --> pg
+  storage --> pg
+  edge -.->|"Supavisor, transaction mode"| pooler["supabase_pooler_probe"]
+  pooler --> pg
+  studio["supabase_studio_probe"] --> pgmeta["supabase_pg_meta_probe"] --> pg`;
+
+This course goes one layer deeper into exactly this request path — how PostgREST turns an HTTP request into SQL, which Postgres role each request carries, and how the pieces above actually behave — in [Supabase Internals](/supabase/en/supabase-internals/) once that module exists, and applies it directly to spotting bugs in AI-generated Supabase code in [Reading AI-Generated Supabase Code](/supabase/en/reading-supabase/).
+
 ## Why not just roll your own?
 
 Nothing here is magic you could not build yourself — PostgREST, GoTrue, and the rest are open-source projects you could self-host individually. What Supabase actually saves you is the integration work: one project, one set of credentials, one dashboard, and services that already know how to talk to each other and to the same Postgres instance. You still write the schema, the SQL, and the access rules — Supabase just removes the plumbing around them.
+
+## Reading AI-generated code
+
+An AI assistant, prompted with "add a bio field when creating a profile" and shown a Firebase-flavored example from its training data, produced this:
+
+<SpotTheBug lang="sql" code={`-- An AI assistant's attempt at "just add a bio field", Firebase-habit style
+insert into public.fnd_profiles_demo (id, username, bio)
+values (gen_random_uuid(), 'ada', 'wrote the first algorithm');
+`}>
+Run for real against this lesson's own table:
+
+\`\`\`text
+ERROR:  column "bio" of relation "fnd_profiles_demo" does not exist
+LINE 2: insert into public.fnd_profiles_demo (id, username, bio)
+\`\`\`
+
+This is the "Postgres first" section's whole point, made concrete: unlike Firestore, where writing an extra field to a document just adds it, Postgres has a fixed, declared set of columns per table, and an `insert` naming a column that was never created with `alter table ... add column` fails loudly instead of silently accepting arbitrary shape. The fix is not a query change — it is a migration (`alter table public.fnd_profiles_demo add column bio text;`, the subject of the next lesson) that declares the column first. An AI assistant trained heavily on schemaless-database examples will reach for "just include the field" out of habit; Supabase's relational core rejects that instinct at the database layer, every time, which is exactly the portability and validation trade described above.
+</SpotTheBug>
+
+## Mental Model
+
+Treat every Supabase service as a **client of the same Postgres database**, not as a separate product that happens to share a project dashboard. `supabase-js`'s `.from('profiles').select()` is not a special Supabase primitive — it is a thin wrapper that asks PostgREST to run `select * from public.profiles`, over HTTP, through Kong. Auth's sign-up flow is not magic — it is GoTrue inserting a row into `auth.users`. When something behaves unexpectedly, the reliable move is to ask "what SQL did this actually turn into, and what does `psql` say if I run that directly" — which is exactly the debugging path this course keeps returning to.
+
+## Trade-offs
+
+- **A real, unmodified Postgres core buys full SQL power, every extension in the Postgres ecosystem, and a `pg_dump`-shaped exit ramp** — **at the cost of schema discipline you do not pay with a schemaless store**: every column must be declared before it can be written, proved above by the AI-generated insert that failed instantly instead of "just working."
+- **Bundling Auth, Storage, Realtime, and Edge Functions as managed services saves the integration work of wiring five separate open-source projects together** — **at the cost of a wider surface to learn up front**: this course's seven modules exist because there are genuinely seven distinct services' worth of behavior to understand, not one.
+- **Configuring everything through Studio or the CLI keeps day-to-day changes fast** — **at the cost of needing migrations (next lesson) to keep any of it reviewable and reproducible**, the same "GUI edit vs. version-controlled file" tension that shows up in every infrastructure-as-code discipline.
+
+## Common Misconceptions
+
+- **"Supabase is just Firebase, but with SQL instead of NoSQL."** The data model difference is not cosmetic — it changes what a write can do at all, proved above: a Firestore-habit `insert` with an undeclared field fails hard in Postgres instead of silently succeeding.
+- **"Since it's Postgres, the Supabase-specific services are optional add-ons I can ignore."** They are real, separate processes with their own containers (proved by the `docker ps` output above), not thin SQL views — GoTrue genuinely manages sessions and JWTs, Storage genuinely proxies an S3-compatible object store, and understanding each one's actual behavior (not just "it's Postgres under there") is most of this course.
+- **"Everything goes through PostgREST."** Proved above: Kong routes by path to five *different* backend services (PostgREST, GoTrue, Realtime, Storage, the Edge Runtime) — PostgREST is only the one handling `/rest/v1`.
 
 <Callout title="The one-line takeaway">
 Supabase is **Postgres plus a set of services layered around it** — a REST/RPC API (PostgREST) and GraphQL API (pg_graphql), **Auth**, **Storage**, **Realtime**, and **Edge Functions** — all managed through **Studio** or the **CLI**, and unlike Firebase, the underlying data model is always plain, portable, queryable Postgres.
@@ -93,6 +171,7 @@ export const quizWhatIsSupabase = [
       'A managed queue system with no persistent storage',
     ],
     answer: 1,
+    explain: 'The whole "Postgres first, services second" section, and the docker ps output above, exist to prove exactly this: every service is a client of one real Postgres instance.',
   },
   {
     q: 'How does Supabase differ from Firebase in terms of the data model?',
@@ -103,6 +182,7 @@ export const quizWhatIsSupabase = [
       'Firebase is built on Postgres and Supabase is not',
     ],
     answer: 1,
+    explain: 'Proved directly in the SpotTheBug above: a Firestore-habit insert with an undeclared column fails with a real Postgres error instead of silently succeeding as it would in a schemaless store.',
   },
   {
     q: 'Which of these is NOT one of the core services bundled with a Supabase project?',
@@ -113,6 +193,7 @@ export const quizWhatIsSupabase = [
       'Realtime and Storage',
     ],
     answer: 2,
+    explain: 'There is no app-store service — the real docker ps output above lists exactly the services this course covers: Kong, PostgREST, GoTrue, Realtime, Storage, the Edge Runtime, Supavisor, Studio, and supporting services.',
   },
   {
     q: 'Where can you configure and manage the services in a Supabase project?',
@@ -123,6 +204,18 @@ export const quizWhatIsSupabase = [
       'Only through a third-party paid add-on',
     ],
     answer: 1,
+    explain: 'Studio and the CLI are the two management surfaces this course uses throughout — the next lesson goes hands-on with the CLI specifically.',
+  },
+  {
+    q: 'In the real docker ps output above, why do supabase_edge_runtime_probe and supabase_imgproxy_probe show as "stopped" right after supabase start?',
+    options: [
+      'They crashed and need to be restarted manually',
+      'The CLI starts them lazily, only on first real use, not eagerly at supabase start',
+      'They are disabled by default and can never run locally',
+      'They only run on hosted projects, never locally',
+    ],
+    answer: 1,
+    explain: 'Stated directly above: the CLI defers starting the Edge Runtime and imgproxy until an Edge Function is actually invoked or an image transformation is actually requested.',
   },
 ];
 

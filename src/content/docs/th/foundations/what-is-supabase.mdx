@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
@@ -75,9 +76,86 @@ export const whatIsSupabaseDiagram = `flowchart TB
   realtime --> pg
   functions --> pg`;
 
+## สิ่งที่ `supabase start` หนึ่งครั้งเปิดขึ้นมาจริง ๆ
+
+รายการ service ข้างบนไม่ใช่ diagram โฆษณา — มันคือ Docker Compose stack เดียว และทุกกล่องในนั้นคือ container ที่มีชื่อจริงแยกกัน นี่คือ `docker ps` output จริงจาก local stack ของคอร์สนี้เอง (กรอง container ของคอร์สพี่น้องที่ไม่เกี่ยวออกไป 1 ตัว):
+
+```text
+$ docker ps --format '{{.Names}}\t{{.Image}}'
+supabase_kong_probe        ghcr.io/supabase/kong:2.8.1
+supabase_rest_probe        ghcr.io/supabase/postgrest:v16.2
+supabase_auth_probe        ghcr.io/supabase/gotrue:v2.196.0
+supabase_realtime_probe    ghcr.io/supabase/realtime:v2.130.0
+supabase_storage_probe     ghcr.io/supabase/storage-api:v1.72.1
+supabase_pooler_probe      public.ecr.aws/supabase/supavisor:2.9.12
+supabase_db_probe          public.ecr.aws/supabase/postgres:17.6.1.167
+supabase_studio_probe      public.ecr.aws/supabase/studio:2026.08.24-sha-8ec45b2
+supabase_pg_meta_probe     public.ecr.aws/supabase/postgres-meta:v0.99.0
+supabase_analytics_probe   ghcr.io/supabase/logflare:1.50.6
+supabase_vector_probe      ghcr.io/supabase/vector:0.53.0-alpine
+supabase_inbucket_probe    ghcr.io/supabase/mailpit:v1.30.2
+```
+
+ทุกชื่อลงท้ายด้วย `_probe` เพราะ `project_id` ของคอร์สนี้คือ `probe` — project ของคุณเองจะมี container ที่ลงท้ายด้วย project id ของคุณแทน `supabase_edge_runtime_probe` กับ `supabase_imgproxy_probe` เป็นส่วนหนึ่งของ stack เดียวกันแต่ report ว่า **stopped**: CLI จะ start มันแบบ lazy คือตอนถูกใช้งานจริงครั้งแรก (Edge Function ถูกเรียก, มีการขอ image transformation) ไม่ใช่ start ตั้งแต่ `supabase start` ทันที
+
+**Kong คือส่วนที่ diagram ข้างบนย่อทิ้งไป**: ไม่มีใครคุยกับ PostgREST, GoTrue, Realtime หรือ Storage ตรง ๆ เลย — ทุก request ไม่ว่าจะเป็น `supabase-js`, `curl` หรือ Studio UI ต้องผ่าน **Kong** ซึ่งเป็น API gateway ก่อนเสมอ Kong คือตัวที่แปลง "หลาย service แยกกันบนหลาย port" ให้กลายเป็น `API_URL` เดียว (`http://127.0.0.1:55321` บน stack นี้) ที่คุณใช้มาตั้งแต่บทที่แล้ว โดย route request ต่อไปตาม path (`/rest/v1/...` ไป PostgREST, `/auth/v1/...` ไป GoTrue และต่อ ๆ ไป)
+
+<Mermaid title="Container จริงจาก docker ps ของ stack นี้เอง Kong route ทุก request ต่อไป" code={realArchitectureDiagram} />
+
+export const realArchitectureDiagram = `flowchart LR
+  client["Client - supabase-js / curl / Studio"] --> kong["supabase_kong_probe (Kong API gateway)"]
+  kong -->|"/rest/v1"| rest["supabase_rest_probe (PostgREST)"]
+  kong -->|"/auth/v1"| auth["supabase_auth_probe (GoTrue)"]
+  kong -->|"/realtime/v1"| realtime["supabase_realtime_probe"]
+  kong -->|"/storage/v1"| storage["supabase_storage_probe"]
+  kong -->|"/functions/v1"| edge["supabase_edge_runtime_probe (Deno - lazy start)"]
+  rest --> pg[("supabase_db_probe - Postgres 17")]
+  auth --> pg
+  realtime --> pg
+  storage --> pg
+  edge -.->|"Supavisor, transaction mode"| pooler["supabase_pooler_probe"]
+  pooler --> pg
+  studio["supabase_studio_probe"] --> pgmeta["supabase_pg_meta_probe"] --> pg`;
+
+คอร์สนี้เจาะลึก request path ด้านบนอีกชั้นหนึ่ง — PostgREST แปลง HTTP request เป็น SQL ยังไง, แต่ละ request พก Postgres role ไหนมา, และ service ข้างบนแต่ละตัวพฤติกรรมจริงเป็นยังไง — ใน [Supabase Internals](/supabase/th/supabase-internals/) เมื่อ module นั้นถูกสร้างขึ้น และเอาไปใช้จับบั๊กในโค้ด Supabase ที่ AI สร้างโดยตรงใน [Reading AI-Generated Supabase Code](/supabase/th/reading-supabase/)
+
 ## ทำไมไม่สร้างเองไปเลย
 
 ไม่มีอะไรตรงนี้ที่เป็นเวทมนตร์ที่คุณสร้างเองไม่ได้ — PostgREST, GoTrue และตัวอื่น ๆ ล้วนเป็น open-source project ที่ self-host แยกเองได้ สิ่งที่ Supabase ประหยัดให้จริง ๆ คืองาน integration หนึ่ง project, credential ชุดเดียว, dashboard เดียว และ service ที่รู้วิธีคุยกันเองและคุยกับ Postgres instance เดียวกันอยู่แล้ว คุณยังคงต้องเขียน schema, SQL และ access rule เอง — Supabase แค่เอา plumbing รอบ ๆ ออกไปให้
+
+## อ่านโค้ดที่ AI สร้าง
+
+AI assistant ถูกสั่งว่า "add a bio field when creating a profile" แล้วมันไปดึงตัวอย่างสไตล์ Firebase จาก training data มาใช้ ผลลัพธ์คือ:
+
+<SpotTheBug lang="sql" code={`-- An AI assistant's attempt at "just add a bio field", Firebase-habit style
+insert into public.fnd_profiles_demo (id, username, bio)
+values (gen_random_uuid(), 'ada', 'wrote the first algorithm');
+`}>
+รันจริงกับ table ของบทนี้เอง:
+
+\`\`\`text
+ERROR:  column "bio" of relation "fnd_profiles_demo" does not exist
+LINE 2: insert into public.fnd_profiles_demo (id, username, bio)
+\`\`\`
+
+นี่คือประเด็นของหัวข้อ "Postgres มาก่อน" ที่กลายเป็นรูปธรรม: ต่างจาก Firestore ที่การเขียนฟิลด์เพิ่มลง document แค่เพิ่มมันเข้าไปเฉย ๆ Postgres มีชุด column ที่ประกาศตายตัวต่อ table หนึ่งตัว และ `insert` ที่เอ่ยชื่อ column ที่ไม่เคยถูกสร้างจะพังทันทีแทนที่จะรับ shape อะไรก็ได้แบบเงียบ ๆ ทางแก้ไม่ใช่การแก้ query — แต่คือ migration (`alter table public.fnd_profiles_demo add column bio text;` หัวข้อของบทถัดไป) ที่ประกาศ column นั้นก่อน AI assistant ที่ train มาหนักกับตัวอย่าง schemaless database จะมีสัญชาตญาณ "ใส่ field เข้าไปเลย" เป็นนิสัย แต่แกน relational ของ Supabase ปฏิเสธสัญชาตญาณนั้นที่ระดับ database ทุกครั้ง ซึ่งตรงกับ trade-off เรื่อง portability และ validation ที่พูดถึงข้างบนพอดี
+</SpotTheBug>
+
+## Mental Model
+
+มองทุก service ของ Supabase เป็น **client ของ Postgres database ตัวเดียวกัน** ไม่ใช่ product แยกที่บังเอิญแชร์ dashboard เดียวกัน `.from('profiles').select()` ของ `supabase-js` ไม่ใช่ primitive พิเศษของ Supabase — มันคือ wrapper บาง ๆ ที่ขอให้ PostgREST รัน `select * from public.profiles` ผ่าน HTTP ผ่าน Kong flow สมัครสมาชิกของ Auth ไม่ใช่เวทมนตร์ — มันคือ GoTrue insert row เข้า `auth.users` เมื่อมีอะไรทำงานไม่ตรงกับที่คิด วิธีที่เชื่อถือได้คือถามว่า "สิ่งนี้กลายเป็น SQL อะไรจริง ๆ และ `psql` บอกอะไรถ้ารันตรง ๆ" ซึ่งเป็น debugging path ที่คอร์สนี้วนกลับมาใช้ตลอด
+
+## Trade-offs
+
+- **Postgres core จริงที่ไม่ถูกดัดแปลงให้พลัง SQL เต็มรูปแบบ, extension ทุกตัวใน ecosystem ของ Postgres และทางออกแบบ `pg_dump`** — **แลกมาด้วย schema discipline ที่ schemaless store ไม่ต้องจ่าย**: ทุก column ต้องถูกประกาศก่อนถึงจะเขียนได้ พิสูจน์ข้างบนด้วย insert ที่ AI สร้างที่พังทันทีแทนที่จะ "ใช้ได้เลย"
+- **การรวม Auth, Storage, Realtime และ Edge Functions เป็น managed service ประหยัดงาน integration ของการต่อ open-source project แยก 5 ตัวเข้าด้วยกัน** — **แลกมาด้วยพื้นที่ต้องเรียนรู้ที่กว้างขึ้นตั้งแต่แรก**: คอร์สนี้มี 7 module เพราะมีพฤติกรรมของ 7 service ที่แยกกันจริง ๆ ต้องเข้าใจ ไม่ใช่แค่ตัวเดียว
+- **การตั้งค่าทุกอย่างผ่าน Studio หรือ CLI ทำให้เปลี่ยนแปลงรายวันเร็ว** — **แลกมาด้วยการต้องมี migration (บทถัดไป) เพื่อให้ทุกอย่าง reviewable และ reproduce ได้** ความตึงเครียดแบบ "แก้ผ่าน GUI vs. ไฟล์ version-controlled" แบบเดียวกับที่โผล่ใน infrastructure-as-code ทุกที่
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"Supabase ก็แค่ Firebase ที่ใช้ SQL แทน NoSQL"** ความต่างของ data model ไม่ใช่แค่ผิวเผิน — มันเปลี่ยนว่า write หนึ่งครั้งทำอะไรได้บ้าง พิสูจน์ข้างบนแล้ว: `insert` สไตล์ Firestore ที่มี field ที่ไม่ประกาศไว้พังทันทีใน Postgres แทนที่จะสำเร็จแบบเงียบ ๆ
+- **"เพราะมันคือ Postgres service เฉพาะของ Supabase คือ add-on ที่ไม่สนใจก็ได้"** มันคือ process จริงแยกกันพร้อม container ของตัวเอง (พิสูจน์ด้วย `docker ps` output ข้างบน) ไม่ใช่ SQL view บาง ๆ — GoTrue จัดการ session และ JWT จริง, Storage proxy object store แบบ S3-compatible จริง และการเข้าใจพฤติกรรมจริงของแต่ละตัว (ไม่ใช่แค่ "มันคือ Postgres ข้างใน") คือเนื้อหาส่วนใหญ่ของคอร์สนี้
+- **"ทุกอย่างผ่าน PostgREST หมด"** พิสูจน์ข้างบนแล้ว: Kong route ตาม path ไปยัง backend service ที่ *ต่างกัน* ถึง 5 ตัว (PostgREST, GoTrue, Realtime, Storage, Edge Runtime) — PostgREST จัดการแค่ `/rest/v1` เท่านั้น
 
 <Callout title="สรุปหนึ่งบรรทัด">
 Supabase คือ **Postgres บวก service ห่อรอบอีกชั้น** — REST/RPC API (PostgREST) กับ GraphQL API (pg_graphql), **Auth**, **Storage**, **Realtime** และ **Edge Functions** — จัดการทั้งหมดผ่าน **Studio** หรือ **CLI** และต่างจาก Firebase ตรงที่ data model ข้างล่างยังเป็น Postgres ธรรมดาที่ portable และ query ได้เสมอ
@@ -93,6 +171,7 @@ export const quizWhatIsSupabase = [
       'ระบบ queue ที่จัดการให้ ไม่มี persistent storage',
     ],
     answer: 1,
+    explain: 'หัวข้อ "Postgres มาก่อน service มาทีหลัง" ทั้งหมด และ docker ps output ข้างบน มีไว้เพื่อพิสูจน์เรื่องนี้ตรง ๆ: ทุก service คือ client ของ Postgres instance จริงตัวเดียว',
   },
   {
     q: 'Supabase ต่างจาก Firebase ในแง่ data model ยังไง',
@@ -103,6 +182,7 @@ export const quizWhatIsSupabase = [
       'Firebase สร้างบน Postgres ส่วน Supabase ไม่ได้สร้างบน Postgres',
     ],
     answer: 1,
+    explain: 'พิสูจน์ตรง ๆ ใน SpotTheBug ข้างบน: insert สไตล์ Firestore ที่มี column ไม่ประกาศไว้พังด้วย Postgres error จริง แทนที่จะสำเร็จแบบเงียบ ๆ อย่างที่จะเกิดใน schemaless store',
   },
   {
     q: 'ข้อไหน NOT ใช่ service หลักที่มากับ Supabase project',
@@ -113,6 +193,7 @@ export const quizWhatIsSupabase = [
       'Realtime กับ Storage',
     ],
     answer: 2,
+    explain: 'ไม่มี app-store service — docker ps output จริงข้างบนแสดง service ที่คอร์สนี้ครอบคลุมพอดี: Kong, PostgREST, GoTrue, Realtime, Storage, Edge Runtime, Supavisor, Studio และ service สนับสนุนอื่น ๆ',
   },
   {
     q: 'ตั้งค่าและจัดการ service ต่าง ๆ ใน Supabase project ได้จากที่ไหน',
@@ -123,6 +204,18 @@ export const quizWhatIsSupabase = [
       'ผ่าน add-on เสียเงินจากบุคคลที่สามเท่านั้น',
     ],
     answer: 1,
+    explain: 'Studio และ CLI คือสองช่องทางจัดการที่คอร์สนี้ใช้ตลอดทั้งคอร์ส — บทถัดไปลงมือใช้ CLI โดยตรง',
+  },
+  {
+    q: 'ใน docker ps output จริงข้างบน ทำไม supabase_edge_runtime_probe กับ supabase_imgproxy_probe ถึงขึ้นว่า "stopped" ทันทีหลัง supabase start',
+    options: [
+      'มันพังและต้อง restart เอง',
+      'CLI start มันแบบ lazy คือตอนถูกใช้งานจริงครั้งแรกเท่านั้น ไม่ใช่ตั้งแต่ supabase start',
+      'มันถูกปิดโดย default และรัน local ไม่ได้เลย',
+      'มันรันได้แค่บน hosted project เท่านั้น ไม่รัน local',
+    ],
+    answer: 1,
+    explain: 'บอกไว้ตรง ๆ ข้างบน: CLI เลื่อนการ start Edge Runtime และ imgproxy ไปจนกว่าจะมี Edge Function ถูกเรียกจริง หรือมีการขอ image transformation จริง',
   },
 ];
 
