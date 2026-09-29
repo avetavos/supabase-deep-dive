@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
@@ -16,9 +17,71 @@ A table or function must pass **two separate gates** before a request is both sa
 
 ## Layer 1 — Data API exposure
 
-Many older Supabase tutorials describe RLS as the whole story. It is not. Before RLS is even evaluated, Postgres must have granted the requesting role — `anon`, `authenticated`, or `service_role` — permission to touch the table or function in the first place. In current Supabase projects this is not automatic: you either expose specific tables and functions in the **Integrations → Data API** section of the dashboard, or turn on **Default privileges for new entities** so that new objects created in the `public` schema are granted access going forward.
+Many older Supabase tutorials describe RLS as the whole story. It is not. Before RLS is even evaluated, Postgres must have granted the requesting role — `anon`, `authenticated`, or `service_role` — permission to touch the table or function in the first place.
 
-Under the hood, this exposure is ordinary Postgres `grant` statements:
+<Callout title="This is a moving target — get the dates right">
+Whether that grant happens **automatically** for a brand-new table is being changed on a phased schedule, not flipped everywhere at once (quoting the official changelog, [supabase.com/changelog/45329-breaking-change-tables-not-exposed-to-data-and-graphql-api-automatically](https://supabase.com/changelog/45329-breaking-change-tables-not-exposed-to-data-and-graphql-api-automatically)):
+
+- **April 28, 2026** — opt-in only: new projects *can* be created with the new "not exposed by default" behavior.
+- **May 30, 2026** — becomes the **default for all new projects**, rolled out gradually over a few weeks.
+- **October 30, 2026** — applied to **all existing projects** too.
+- Explicitly called out in the changelog: *"Existing tables are not affected in your project, they keep their current grants and stay reachable"* — this is about new tables created after the setting reaches your project, not a retroactive lockdown.
+
+Today's date matters here: if you are reading this after October 30, 2026, essentially every Supabase project — hosted, new or old — requires an explicit `grant` before a new table is reachable. If you are reading this between May 30 and October 30, 2026, it depends on whether your specific project is new or pre-existing. Re-check the changelog link above; do not trust a memorized cutoff date.
+</Callout>
+
+**The local CLI stack you have been using since the Foundations module does not follow this rollout.** Proof, run today (2026-09-29) against this course's own local stack, with zero configuration beyond a plain `supabase start`:
+
+```sql
+-- supabase/migrations/4001_agapi_demo_table.sql
+create table public.agapi_demo (
+  id uuid primary key default gen_random_uuid(),
+  val text
+);
+
+insert into public.agapi_demo (val) values ('hello-from-postgres');
+```
+
+No `grant`, no dashboard, no "Default privileges" toggle — query it as `anon` immediately:
+
+```bash
+# scripts/agapi-curl-demo.sh
+curl "$API_URL/rest/v1/agapi_demo?select=*" \
+  -H "apikey: $ANON_KEY" \
+  -H "Authorization: Bearer $ANON_KEY"
+```
+
+```text
+HTTP/1.1 200 OK
+[{"id":"c00eb34c-...","val":"hello-from-postgres"}]
+```
+
+`\dp public.agapi_demo` confirms why — `anon` and `authenticated` already hold full privileges the instant the table exists:
+
+```text
+                                      Access privileges
+ Schema |    Name    | Type  |        Access privileges        | Column privileges | Policies
+--------+------------+-------+---------------------------------+-------------------+----------
+ public | agapi_demo | table | postgres=arwdDxtm/postgres     +|                   |
+        |            |       | anon=arwdDxtm/postgres         +|                   |
+        |            |       | authenticated=arwdDxtm/postgres+|                   |
+        |            |       | service_role=arwdDxtm/postgres  |                   |
+(1 row)
+```
+
+The reason is in the CLI's own scaffolded `supabase/config.toml`, commented out but explained in full:
+
+```toml
+# Controls whether new tables, views, sequences and functions created in the `public` schema by
+# `postgres` are reachable through the Data API roles (`anon`, `authenticated`, `service_role`)
+# without explicit GRANTs, matching the cloud default. Set to `false` to require explicit GRANTs
+# instead. Left unset, a fresh project falls back to `true`.
+# auto_expose_new_tables = true
+```
+
+Uncommenting that line as `auto_expose_new_tables = false` in **your own project's** `supabase/config.toml` makes local development match a new hosted project post-May-30-2026: new tables stop being auto-granted, and you must `grant` explicitly, same as the SQL below. (This lesson does not flip that setting on the course's own shared local stack — other lessons and other readers rely on the current default — but it is the one line you add to a real project once you want local behavior to match the new hosted default.)
+
+Under the hood, whichever way exposure happens — auto-grant, dashboard, or hand-written SQL — it is always ordinary Postgres `grant` statements:
 
 ```sql
 -- Table grants: what each role is allowed to attempt
@@ -30,7 +93,57 @@ grant all on public.your_table to service_role;
 grant execute on function public.your_function to authenticated, service_role;
 ```
 
-If a role has no `grant` on a table, that table is invisible to it through the Data API — the request fails before RLS is ever checked, regardless of how permissive your RLS policies are. This is a **table/function-level** gate: it answers "can this role touch this object at all," not "which rows."
+If a role has no `grant` on a table, that table is invisible to it through the Data API — the request fails before RLS is ever checked, regardless of how permissive your RLS policies are. This is a **table/function-level** gate: it answers "can this role touch this object at all," not "which rows." Proved by revoking `anon`'s grant on the table above and repeating the exact same request:
+
+```sql
+-- supabase/migrations/4002_agapi_revoke_anon.sql
+revoke select on public.agapi_demo from anon;
+```
+
+```text
+HTTP/1.1 401 Unauthorized
+{"code":"42501","details":null,"hint":"Grant the required privileges to the current role with: GRANT SELECT ON public.agapi_demo TO anon;","message":"permission denied for table agapi_demo"}
+```
+
+`42501` is Postgres's own `insufficient_privilege` SQLSTATE — PostgREST passes it straight through, and even names the exact `grant` statement that fixes it in `hint`. Nothing about RLS ran; there is no policy on this table at all. `service_role` still reads the same row after the revoke (it was never touched), because `service_role`'s own grant is separate.
+
+### Exposed schemas — `[api] schemas` and what "not exposed" really means
+
+Every project's `supabase/config.toml` also names which **schemas** PostgREST looks in at all, independent of per-table grants:
+
+```toml
+[api]
+schemas = ["public", "graphql_public"]
+```
+
+A table can have every grant right and still be completely unreachable if its schema is not in that list — proved by creating a *fully granted* table in a schema that was never added to `schemas`:
+
+```sql
+-- supabase/migrations/4003_agapi_priv_schema.sql
+create schema agapi_priv;
+
+create table agapi_priv.secret_stuff (
+  id int primary key,
+  val text
+);
+
+grant usage on schema agapi_priv to anon, authenticated;
+grant select on agapi_priv.secret_stuff to anon;
+```
+
+```bash
+# scripts/agapi-curl-unexposed-schema.sh
+curl "$API_URL/rest/v1/secret_stuff?select=*" \
+  -H "apikey: $ANON_KEY" \
+  -H "Authorization: Bearer $ANON_KEY"
+```
+
+```text
+HTTP/1.1 404 Not Found
+{"code":"PGRST205","details":null,"hint":null,"message":"Could not find the table 'public.secret_stuff' in the schema cache"}
+```
+
+`usage` on the schema, `select` on the table — both grants are correct — and PostgREST still returns `404 PGRST205`, not `401`/`403`. It does not say "forbidden"; it says the table does not exist, because PostgREST only introspects schemas listed in `[api] schemas`, and `agapi_priv` was never one of them (note the error even names `public.secret_stuff`, defaulting to the `public` schema it does search, since no `Accept-Profile` header named `agapi_priv` either). This is the error you get for two completely different mistakes — a genuinely missing table, and a real table Postgres would happily let you touch outside the Data API — which is exactly the trap in the [Reading AI-generated code](#reading-ai-generated-code) section below.
 
 ## Layer 2 — Row Level Security
 
@@ -68,8 +181,44 @@ export const securityLayersDiagram = `flowchart TB
   gate2 -- "policy matches" --> scoped["Only matching rows visible/modifiable"]`;
 
 <Callout title="The one-line takeaway">
-Supabase's Data API security is **two layers**, not one: **Data API exposure** — via the dashboard's **Integrations → Data API** settings, "Default privileges for new entities," or plain Postgres `grant` statements to `anon`/`authenticated`/`service_role` — is a table/function-level gate deciding whether an object is reachable through the API **at all**, and only once a request clears that gate does **Row Level Security** decide which **rows** it can see or modify; `service_role` has the `BYPASSRLS` attribute and skips RLS entirely, which is why that key must stay server-side only.
+Supabase's Data API security is **two layers**, not one: **Data API exposure** — plain Postgres `grant` statements to `anon`/`authenticated`/`service_role`, on a schema that must also be listed in `[api] schemas` — is a table/function-level gate deciding whether an object is reachable through the API **at all**, and only once a request clears that gate does **Row Level Security** decide which **rows** it can see or modify. Whether a *new* table gets those grants automatically depends on where your project sits in a phased rollout (new hosted projects: default flips May 30, 2026; existing hosted projects: October 30, 2026) and, on the CLI stack you develop against locally, on `auto_expose_new_tables` in `supabase/config.toml` (fallback `true` as of this writing) — treat "is this table reachable" as something to check with `\dp`/`curl`, not something to assume from a date on a blog post. `service_role` has the `BYPASSRLS` attribute and skips RLS entirely, which is why that key must stay server-side only.
 </Callout>
+
+## Reading AI-generated code
+
+An AI assistant asked to "lock down a private settings table so only the API can't touch it directly" produced this migration:
+
+<SpotTheBug lang="sql" code={`create schema app_private;
+
+create table app_private.feature_flags (
+  key text primary key,
+  enabled boolean not null default false
+);
+
+grant usage on schema app_private to service_role;
+grant select on app_private.feature_flags to service_role;
+
+-- "service_role only, so it's safe to read from an Edge Function"
+`}>
+The migration is internally consistent and the grants are genuinely correct — `service_role` really can read this table, and `anon`/`authenticated` really cannot, because they were never granted anything. The bug is what the author *believes* this achieves: they wrote a comment claiming the table is now reachable "from an Edge Function" via `service_role` over the Data API, i.e. via `supabase.from('feature_flags')` with a service-role client. It never will be, for a reason that has nothing to do with the grants: `app_private` is not in `[api] schemas` (which defaults to `["public", "graphql_public"]`), so PostgREST never introspects it at all. Any request — `anon`, `authenticated`, or `service_role` — gets the same `404 PGRST205 "Could not find the table"`, proved above for exactly this shape of mistake. The fix is not a grant; it is realizing that a Data API client was never the right tool here in the first place — either add `app_private` to `schemas` (which somewhat defeats the "private" in the name, since every Data API role can now query it, gated only by grants) and send `Accept-Profile: app_private`, or — the actual fix for "server-only settings" — read it with a direct Postgres connection (e.g. from an Edge Function using `postgres.js`/`pg` against the pooler) and never route it through PostgREST at all.
+</SpotTheBug>
+
+## Mental Model
+
+Think of every request as walking through a building with two independent doors, not one: the **front door** (Data API exposure — a Postgres `grant`, on a schema PostgREST was told to look in) and an **interior door per room** (RLS, evaluated per row once you're already inside). A locksmith who only fits the interior doors with locks but leaves the front door unlocked has secured nothing an attacker cares about; conversely, bricking up the front door to a room that never had an interior lock just means legitimate traffic can't get in either. `\dp <table>` answers "is the front door unlocked for this role"; `[api] schemas` answers "does this building even appear on the map PostgREST is holding"; RLS policies are the only thing that ever looks inside once both of those say yes.
+
+## Trade-offs
+
+- **Auto-expose (current local default, previous hosted default) is fast to prototype with** — every new table just works from the client immediately — **at the cost of a silent security default**: a table with sensitive columns is reachable the moment `create table` runs, before you have written a single RLS policy, unless you remember to lock it down.
+- **`auto_expose_new_tables = false` / the new hosted default is safer by construction** — nothing is reachable until you say so — **at the cost of a step every table needs**: forget the `grant`, and a legitimate feature silently 404s in a way that is easy to mistake for "the table doesn't exist" rather than "the table exists but isn't exposed."
+- **Keeping a table out of `[api] schemas` entirely** is the strongest form of "not reachable through PostgREST," stronger than revoking grants (no role, however privileged, gets in through REST/GraphQL) — but it also means you cannot expose it later with just a `grant`; you have to add the schema, which affects every table in it, not just one.
+
+## Common Misconceptions
+
+- **"RLS is the whole security model."** It is the second of two gates. A table with `enable row level security` and zero grants is not "extra safe" — it is simply unreachable, and a table with broad grants and no policies is reachable by anyone with a matching role, in full.
+- **"A 404 from PostgREST means the table doesn't exist."** It means PostgREST's schema cache doesn't have an entry matching that name in a schema it was told to search — which is also what you get for a table that exists, is fully granted, and sits one schema away from where you think it is.
+- **"Since my hosted project shows 'not exposed by default' in the docs, my local dev stack behaves the same way."** Proved false above: as of this writing the CLI's own scaffolded `auto_expose_new_tables` still falls back to `true`. Docs describing hosted defaults are not automatically true of `supabase start`.
+- **"Fixing a 404/403 always means changing a grant."** Sometimes it means adding a schema to `[api] schemas`, or sending an `Accept-Profile`/`Content-Profile` header for a non-`public` schema — no amount of `grant` fixes an unlisted schema.
 
 export const quizSecuringApi = [
   {
@@ -81,6 +230,7 @@ export const quizSecuringApi = [
       'The network firewall rules for the Postgres port',
     ],
     answer: 1,
+    explain: 'Exposure is a table/function-level gate answered by grants (and schema listing) — it never looks at individual rows. That is RLS\'s job, one layer later.',
   },
   {
     q: 'If a table has permissive RLS policies but no grant to the authenticated role, what happens?',
@@ -91,6 +241,7 @@ export const quizSecuringApi = [
       'The table becomes readable only by anon, never by authenticated',
     ],
     answer: 1,
+    explain: 'Proved above with `revoke select on public.agapi_demo from anon` — the response was a plain `42501 permission denied`, not an empty RLS-filtered result. RLS was never consulted.',
   },
   {
     q: 'Why does a request made with the service_role key skip Row Level Security entirely?',
@@ -101,6 +252,7 @@ export const quizSecuringApi = [
       'Because service_role automatically fails the Data API exposure gate',
     ],
     answer: 1,
+    explain: 'BYPASSRLS is a Postgres role attribute, independent of any policy definition — Postgres itself skips the RLS check for that role before it would even look for a matching policy.',
   },
   {
     q: 'Why is it not enough to configure Row Level Security alone?',
@@ -111,6 +263,29 @@ export const quizSecuringApi = [
       'Because RLS policies can only be written in plpgsql, never SQL',
     ],
     answer: 1,
+    explain: 'A table stuck behind an unmet exposure gate never reaches RLS evaluation at all — correct policies on an unreachable table protect nothing, because no request gets that far.',
+  },
+  {
+    q: 'As of this course, when does "tables are not exposed to the Data API by default" become true for an existing (not brand-new) hosted Supabase project?',
+    options: [
+      'Immediately, as of April 28, 2026',
+      'May 30, 2026, the same day as new projects',
+      'October 30, 2026',
+      'Never — it only ever applies to newly created projects',
+    ],
+    answer: 2,
+    explain: 'The changelog\'s three dates are staged: April 28 (opt-in), May 30 (default for new projects), October 30 (applied to existing projects too) — quoting supabase.com/changelog/45329-....',
+  },
+  {
+    q: 'A migration creates `app_private.settings`, grants `select` on it to `service_role`, but never adds `app_private` to `[api] schemas`. What happens when a service-role supabase-js client calls `.from(\'settings\')`?',
+    options: [
+      'It succeeds, because service_role bypasses schema restrictions the same way it bypasses RLS',
+      'It fails with a 404 PGRST205 "could not find the table", the same error as a genuinely nonexistent table',
+      'It fails with a 401, because the grant is insufficient',
+      'It succeeds only for read operations, not writes',
+    ],
+    answer: 1,
+    explain: 'Schema exposure and BYPASSRLS are unrelated mechanisms — service_role still only reaches schemas PostgREST was configured to search. Proved above: correct grants, unlisted schema, real 404 PGRST205.',
   },
 ];
 
