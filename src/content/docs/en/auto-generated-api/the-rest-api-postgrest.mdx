@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
@@ -71,7 +72,187 @@ GET /rest/v1/movies?select=title,director:directors(name)
 
 This returns each movie with a nested `director` object containing `name`. PostgREST works this out by reading the actual foreign-key constraint in your schema — there is no separate relationship-mapping file to maintain. If the constraint changes or is dropped, the embedding stops working, because the schema is the single source of truth.
 
-As a related fact worth knowing: the same schema is also exposed automatically as a **GraphQL API** through the `pg_graphql` extension, for callers who prefer GraphQL over REST. This course focuses on the REST/RPC surface, but the GraphQL endpoint exists side by side with no extra schema work.
+Proof, with a real `agapi_directors`/`agapi_movies` pair — one movie deliberately has no director:
+
+```sql
+-- supabase/migrations/4201_agapi_movies_embedding.sql
+create table public.agapi_directors (
+  id bigint generated always as identity primary key,
+  name text not null
+);
+
+create table public.agapi_movies (
+  id bigint generated always as identity primary key,
+  title text not null unique,
+  year int not null,
+  rating numeric not null default 5.0,
+  director_id bigint references public.agapi_directors (id)
+);
+
+insert into public.agapi_directors (name) values ('Denis Villeneuve'), ('Greta Gerwig');
+
+insert into public.agapi_movies (title, year, director_id) values
+  ('Dune', 2021, 1),
+  ('Barbie', 2023, 2),
+  ('Untitled Indie Film', 2024, null);
+```
+
+```bash
+# scripts/agapi-curl-embed.sh
+curl "$API_URL/rest/v1/agapi_movies?select=title,director:agapi_directors(name)&order=id" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY"
+```
+
+```text
+[{"title":"Dune","director":{"name":"Denis Villeneuve"}},
+ {"title":"Barbie","director":{"name":"Greta Gerwig"}},
+ {"title":"Untitled Indie Film","director":null}]
+```
+
+Plain embedding is a **left join**: "Untitled Indie Film" has no `director_id`, and it still comes back, with `director: null`. Appending `!inner` to the embedded resource forces an **inner join** instead — rows without a match are dropped from the result entirely, not just null-padded:
+
+```bash
+# scripts/agapi-curl-embed-inner.sh
+curl "$API_URL/rest/v1/agapi_movies?select=title,director:agapi_directors!inner(name)&order=id" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY"
+```
+
+```text
+[{"title":"Dune","director":{"name":"Denis Villeneuve"}},
+ {"title":"Barbie","director":{"name":"Greta Gerwig"}}]
+```
+
+Same query, same data — "Untitled Indie Film" is simply gone from the response, not present-with-null. `!inner` is also how you filter a movie by a column on the *embedded* table (e.g. `agapi_directors!inner(name)&agapi_directors.name=eq.Denis+Villeneuve`) — a plain embed cannot filter the outer rows that way, because a left join has to keep every outer row by definition.
+
+### `count=exact`, `count=planned`, `count=estimated`
+
+PostgREST can report how many rows *would* match, independent of how many are returned by `Range`/`limit`, via `Prefer: count=...` and the response's `Content-Range` header. Three modes exist, and they are not interchangeable, per PostgREST's own docs ([docs.postgrest.org — Pagination and Count](https://docs.postgrest.org/en/stable/references/api/pagination_count.html)): `exact` runs a real `count(*)`; `planned` reads Postgres's own query-planner row estimate (fast, but only as accurate as the table's statistics); `estimated` uses the exact count below a configured row threshold (`db-max-rows`) and falls back to the planned estimate above it. Proof, same three-row `agapi_movies` table, one request each:
+
+```bash
+# scripts/agapi-curl-count.sh
+curl -D - -o /dev/null "$API_URL/rest/v1/agapi_movies?select=id&limit=1" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY" -H "Prefer: count=exact"
+curl -D - -o /dev/null "$API_URL/rest/v1/agapi_movies?select=id&limit=1" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY" -H "Prefer: count=planned"
+curl -D - -o /dev/null "$API_URL/rest/v1/agapi_movies?select=id&limit=1" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY" -H "Prefer: count=estimated"
+```
+
+```text
+count=exact      -> Content-Range: 0-0/3      (a real count(*): exactly 3 rows)
+count=planned    -> Content-Range: 0-0/720    (Postgres's own planner guess — this table was never ANALYZEd, so it is a generic default estimate, not the real 3)
+count=estimated  -> Content-Range: 0-0/3      (3 rows is below db-max-rows, so estimated fell back to an exact count here)
+```
+
+`planned`'s `720` is not a bug or a rounding artifact — it is exactly what Postgres's planner guesses for a small table it has no fresh statistics on, surfaced verbatim. This is the entire trade-off in one number: `exact` is always right and can be slow on a huge table; `planned` is always fast and can be wildly wrong on a small/unanalyzed one; `estimated` tries to get the best of both by switching on table size.
+
+### `Prefer:` headers — real request/response for each one
+
+- **`return=representation`** — by default, a successful `insert`/`update`/`delete` returns an empty body with `201`/`204`; this header makes PostgREST return the affected row(s) instead, in the same response:
+
+```bash
+# scripts/agapi-curl-prefer-representation.sh
+curl -X POST "$API_URL/rest/v1/agapi_movies" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY" \
+  -H "Content-Type: application/json" -H "Prefer: return=representation" \
+  -d '{"title":"Poor Things","year":2023,"director_id":2}'
+```
+
+```text
+201  [{"id":4,"title":"Poor Things","year":2023,"rating":5.0,"director_id":2}]
+```
+
+- **`resolution=merge-duplicates`** — turns an insert conflicting with a unique constraint into an upsert (`insert ... on conflict ... do update`), instead of a `409`. Requires `?on_conflict=<column>` naming the constraint to resolve against:
+
+```bash
+# scripts/agapi-curl-prefer-merge.sh
+# Without the header, inserting the same title again is a real conflict:
+curl -X POST "$API_URL/rest/v1/agapi_movies" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"title":"Poor Things","year":2023,"director_id":2}'
+
+# With it, the same request updates the existing row instead:
+curl -X POST "$API_URL/rest/v1/agapi_movies?on_conflict=title" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY" \
+  -H "Content-Type: application/json" -H "Prefer: return=representation,resolution=merge-duplicates" \
+  -d '{"title":"Poor Things","year":2023,"director_id":2,"rating":9.1}'
+```
+
+```text
+without header  -> 409  {"code":"23505","details":"Key (title)=(Poor Things) already exists.","hint":null,"message":"duplicate key value violates unique constraint \"agapi_movies_title_key\""}
+with header     -> 200  [{"id":4,"title":"Poor Things","year":2023,"rating":9.1,"director_id":2}]
+```
+
+- **`missing=default`** — a bulk insert with rows that do not all share the same JSON keys is rejected outright by default (`PGRST102`, "All object keys must match"); this header, combined with an explicit `?columns=` listing every column the batch uses, fills any key missing from a given row with that column's own default instead of erroring:
+
+```bash
+# scripts/agapi-curl-prefer-missing.sh
+curl -X POST "$API_URL/rest/v1/agapi_movies?columns=title,year,rating" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY" \
+  -H "Content-Type: application/json" -H "Prefer: return=representation,missing=default" \
+  -d '[{"title":"Movie With Rating","year":2020,"rating":8.0},{"title":"Movie Without Rating","year":2021}]'
+```
+
+```text
+201  [{"id":7,"title":"Movie With Rating","year":2020,"rating":8.0,"director_id":null},
+      {"id":8,"title":"Movie Without Rating","year":2021,"rating":5.0,"director_id":null}]
+```
+
+The second row never mentioned `rating` at all — it landed as `5.0`, the column's `default`, not `null`. Without `missing=default` (or without the matching `?columns=` list), the exact same request is rejected before it reaches Postgres at all.
+
+<Callout title="tx=rollback did nothing here — and that is correct, documented behavior">
+`Prefer: tx=rollback` is supposed to run the request for real and then roll back the transaction — useful for testing a write without keeping it. Tried against this stack, the insert **committed anyway**:
+
+```bash
+curl -X POST "$API_URL/rest/v1/agapi_movies" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY" \
+  -H "Content-Type: application/json" -H "Prefer: return=representation,tx=rollback" \
+  -d '{"title":"Should Not Persist","year":2099,"director_id":1}'
+```
+
+```text
+201  [{"id":9,"title":"Should Not Persist","year":2099,"rating":5.0,"director_id":1}]
+```
+
+Querying for that row afterward finds it — `tx=rollback` never took effect. This is not a bug in the proof: per PostgREST's own docs, client-controlled transaction rollback is gated behind a server setting, `db-tx-end`, which defaults to `commit` — a plain, non-overridable commit — unless the server operator explicitly sets it to `commit-allow-override` (or `rollback`/`rollback-allow-override`) ([docs.postgrest.org — Transactions](https://postgrest.org/en/stable/references/transactions.html)). Supabase's local `config.toml` has no `db-tx-end` key at all, so PostgREST's own default (`commit`, no override allowed) applies — `Prefer: tx=rollback` is silently ignored, exactly as documented, not silently broken.
+</Callout>
+
+### GraphQL through `pg_graphql` — and RLS still applies
+
+The schema is also reachable as GraphQL, but on this local stack that is not automatic — `pg_graphql` is an available Postgres extension, not one enabled by default:
+
+```sql
+-- sql/agapi_enable_pg_graphql.sql
+create extension if not exists pg_graphql;
+```
+
+```bash
+# scripts/agapi-curl-graphql-before.sh
+curl -X POST "$API_URL/graphql/v1" -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY" \
+  -H "Content-Type: application/json" -d '{"query":"query { agapi_moviesCollection { edges { node { title } } } } "}'
+```
+
+```text
+{"errors":[{"message":"pg_graphql extension is not enabled."}]}
+```
+
+Once enabled, the exact same authorization rules apply as REST — reusing the `agapi_notes` table and RLS policy from the previous lesson (one row owned by each of two real users), the *same unfiltered* GraphQL query returns different rows for different callers:
+
+```bash
+# scripts/agapi-curl-graphql-rls.sh
+curl -X POST "$API_URL/graphql/v1" -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ALICE_TOKEN" \
+  -H "Content-Type: application/json" -d '{"query":"query { agapi_notesCollection { edges { node { id body } } } }"}'
+curl -X POST "$API_URL/graphql/v1" -H "apikey: $ANON_KEY" -H "Authorization: Bearer $BOB_TOKEN" \
+  -H "Content-Type: application/json" -d '{"query":"query { agapi_notesCollection { edges { node { id body } } } }"}'
+```
+
+```text
+alice -> {"data":{"agapi_notesCollection":{"edges":[{"node":{"id":"16ff28b0-...","body":"alice private note"}}]}}}
+bob   -> {"data":{"agapi_notesCollection":{"edges":[{"node":{"id":"6e11f6a2-...","body":"bob private note"}}]}}}
+```
+
+`pg_graphql` builds its schema from the same Postgres catalog PostgREST reads, and executes through the same Postgres connection, under the same role and the same RLS — there is no separate GraphQL-only authorization layer to configure or forget. A `security invoker` RPC's RLS-safety (proved last lesson) and this GraphQL query's RLS-safety are the same underlying guarantee, reached through two different protocols.
 
 <Mermaid title="From a Postgres table to a filterable REST endpoint" code={postgrestDiagram} />
 
@@ -84,8 +265,51 @@ export const postgrestDiagram = `flowchart LR
   endpoint --> embed["?select=title,director:directors(name) embeds via FK"]`;
 
 <Callout title="The one-line takeaway">
-**PostgREST** introspects your Postgres schema and generates a REST endpoint for every exposed table with no hand-written API code, where URL query parameters drive **column selection** (`select`), **filtering** (`column=operator.value`, e.g. `gte.`, `like.`, `in.`), and **ordering** (`order`), and where a real **foreign-key constraint** lets you **embed** a related row in the same request — the same schema also gets a GraphQL endpoint for free via `pg_graphql`.
+**PostgREST** introspects your Postgres schema and generates a REST endpoint for every exposed table with no hand-written API code, where URL query parameters drive **column selection** (`select`), **filtering** (`column=operator.value`, e.g. `gte.`, `like.`, `in.`), and **ordering** (`order`), and where a real **foreign-key constraint** lets you **embed** a related row (`!inner` turns that left join into an inner join, dropping unmatched rows). `Prefer:` headers change response shape and write semantics (`return=representation`, `resolution=merge-duplicates`, `missing=default`) or transaction handling (`tx=rollback` — gated behind a server setting that defaults to off, proved above), and `count=exact`/`planned`/`estimated` trade accuracy for speed on `Content-Range`. `pg_graphql` gets you the same schema over GraphQL — on this local stack, `create extension pg_graphql` first — with the exact same RLS enforced underneath, proved above with the same two-user notes table from the RPC lesson.
 </Callout>
+
+## Reading AI-generated code
+
+An AI assistant asked to "let admins bulk-import movies from a spreadsheet, skipping ones that already exist" produced this:
+
+<SpotTheBug lang="ts" code={`// src/import-movies.ts
+import { createClient } from '@supabase/supabase-js';
+
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!);
+
+async function importMovies(rows: { title: string; year: number; rating?: number }[]) {
+  const { data, error } = await supabase
+    .from('agapi_movies')
+    .upsert(rows, { onConflict: 'title', ignoreDuplicates: true });
+
+  if (error) {
+    console.error('import failed:', error.message);
+    return;
+  }
+
+  console.log(\`imported \${rows.length} movies\`);
+}
+`}>
+Three separate problems, each plausible on its own. First, the final `console.log` reports `rows.length` — the input size — not what actually happened: with `ignoreDuplicates: true`, rows that already exist are silently skipped, so "imported 40 movies" can mean anywhere from 0 to 40 were actually new; the code never looks at the returned `data` to find out. Second, rows with mixed keys (some with `rating`, some without, exactly like the spreadsheet-import framing implies) hit the same `PGRST102 "All object keys must match"` proved above — supabase-js's `.upsert()` does not paper over this, it is still one PostgREST bulk request under the hood, so a heterogeneous batch fails outright unless the caller also passes the option that maps to `missing=default` and specifies the full column set. Third, and easy to miss: this uses the **anon** key from a script that talks about "admins" — if `agapi_movies` grants `insert` to `anon`/`authenticated` at all (per the previous lesson, easy to have happened by accident), this "admin" import runs with whatever access any logged-in user already has, not an admin-specific credential; nothing here actually checks the caller is an admin.
+</SpotTheBug>
+
+## Mental Model
+
+PostgREST is a compiler, not a proxy: every request — `select`, filter, embed, `Prefer` header, `count` mode — is source code in a small query language spelled out as a URL and some headers, and PostgREST's only job is to compile that into one SQL statement and hand it to Postgres inside a single transaction. There is no framework-level "REST layer" doing anything Postgres itself does not also do — `!inner` compiles to an actual SQL `join` instead of a `left join`, `count=planned` compiles to reading `pg_class`/planner statistics instead of running `count(*)`, `resolution=merge-duplicates` compiles to `on conflict do update`. Once you see it this way, "what will this URL actually do" becomes a question with a mechanical answer: what SQL would I write by hand for this, and does Postgres itself support it.
+
+## Trade-offs
+
+- **Embedding replaces a manual join/second query with one URL** — **at the cost of a left-join default you must actively override** (`!inner`) the moment a "missing related row" should exclude the result instead of null-padding it.
+- **`count=exact` is unambiguously correct** — **at the cost of a real full-table scan-equivalent** on a large, unindexed count; `planned` is nearly free but only as good as Postgres's last `ANALYZE`; `estimated` is the pragmatic middle ground most UIs actually want, but its accuracy silently depends on a server-side threshold you do not control from the client.
+- **`Prefer:` headers add real capability (upsert, default-filling, response shape) without extra endpoints** — **at the cost of behavior that is invisible unless you read the header list**: `resolution=merge-duplicates` needs `?on_conflict=`, `missing=default` needs `?columns=`, and `tx=rollback` needs a server-side opt-in that may not be set, so the same header can be a no-op depending on server config, not client intent.
+- **`pg_graphql` gives a second query language over the same authorization model for free** — **at the cost of it needing to be enabled at all on a fresh local stack**, unlike hosted projects where it typically already is — proved above as a real, blocking `"pg_graphql extension is not enabled"` error until you run `create extension`.
+
+## Common Misconceptions
+
+- **"Embedding is a join, so a movie with no director just would not appear."** The default is a **left** join — it appears, with the embedded field `null`. Only `!inner` drops it, and that is an opt-in you have to write.
+- **"`count=planned` is broken if it does not match the real row count."** It is working as designed — it is a planner estimate, not a count, and is only as fresh as the table's last `ANALYZE`. Proved above: a real `720` on a real 3-row table, not a bug.
+- **"Sending `Prefer: tx=rollback` means my test write definitely did not persist."** Proved above that it can silently do nothing — `db-tx-end` on the server decides whether the header is even honored, and the local stack's default does not honor it. Verify by querying for the row afterward, every time you rely on it.
+- **"GraphQL and REST have separate security models, so I need to configure RLS twice."** They share the same Postgres connection, role, and RLS policies — proved above with the identical notes/RLS setup from the REST-based RPC lesson working unchanged over `/graphql/v1`. The only extra step locally is enabling the extension at all.
 
 export const quizPostgrestApi = [
   {
@@ -97,6 +321,7 @@ export const quizPostgrestApi = [
       'The Supabase CLI compiles routes at deploy time from a fixed template',
     ],
     answer: 1,
+    explain: 'No routes file, no deploy step — PostgREST reads the live Postgres catalog on every request and generates the endpoint from it.',
   },
   {
     q: 'What does the query parameter `?year=gte.2020` do?',
@@ -107,6 +332,7 @@ export const quizPostgrestApi = [
       'It selects only the year column and renames it to 2020',
     ],
     answer: 1,
+    explain: '`gte.` is PostgREST\'s operator prefix for "greater than or equal" — it compiles to a SQL WHERE clause, not a column definition or a sort.',
   },
   {
     q: 'How does PostgREST know it can embed a related resource like a director inside a movie response?',
@@ -117,6 +343,7 @@ export const quizPostgrestApi = [
       'Embedding requires a separate GraphQL-only feature and does not work over REST',
     ],
     answer: 1,
+    explain: 'The real FK constraint is the source of truth — drop or change it and the embedding stops working, proving there is no separate mapping file.',
   },
   {
     q: 'Besides REST, what other API style is automatically available from the same schema',
@@ -127,6 +354,40 @@ export const quizPostgrestApi = [
       'No other API style is available',
     ],
     answer: 1,
+    explain: 'pg_graphql builds a GraphQL schema from the same Postgres catalog — on a fresh local stack it needs `create extension pg_graphql` first, proved above.',
+  },
+  {
+    q: 'A movie has no director (director_id is null). What is the difference between plain embedding (`select=title,director:agapi_directors(name)`) and `!inner` embedding for that row?',
+    options: [
+      'No difference — both return the same rows with director: null',
+      'Plain embedding is a left join and includes the row with director: null; !inner is an inner join and drops the row from the result entirely',
+      '!inner throws an error whenever any row has a null foreign key',
+      'Plain embedding excludes the row; !inner includes it with director: null',
+    ],
+    answer: 1,
+    explain: 'Proved above with the exact same query and data — plain embed kept "Untitled Indie Film" with director: null, !inner removed it from the response entirely.',
+  },
+  {
+    q: 'A request sends `Prefer: tx=rollback` on an insert, and the row shows up in a later GET request anyway. What does that mean?',
+    options: [
+      'The Prefer header was misspelled',
+      'The server\'s db-tx-end setting defaults to commit and does not allow client override unless explicitly configured otherwise, so the header was silently ignored, exactly as PostgREST documents',
+      'tx=rollback only works on updates, never on inserts',
+      'The row will be removed automatically after a timeout',
+    ],
+    answer: 1,
+    explain: 'Proved above: local config.toml sets no db-tx-end, so PostgREST\'s own default (commit, no override) applies — tx=rollback is honored only when the server operator opts in.',
+  },
+  {
+    q: 'Why does count=planned sometimes report a number far from the table\'s real row count?',
+    options: [
+      'It is a bug in PostgREST',
+      'It reads the Postgres query planner\'s row estimate from table statistics, which can be stale or generic if the table was never (recently) ANALYZEd, instead of running a real count',
+      'It always rounds to the nearest hundred',
+      'It only counts rows matching an index, ignoring the rest',
+    ],
+    answer: 1,
+    explain: 'Proved above: a real 3-row table reported a planned count of 720 — a genuine, undistorted planner guess for a table with no fresh statistics, not an error.',
   },
 ];
 

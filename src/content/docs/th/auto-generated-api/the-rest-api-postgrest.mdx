@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
@@ -71,7 +72,187 @@ GET /rest/v1/movies?select=title,director:directors(name)
 
 request นี้คืนแต่ละ movie พร้อม object `director` แบบ nested ที่มี `name` อยู่ข้างใน PostgREST หาความสัมพันธ์นี้ได้จากการอ่าน foreign-key constraint จริงใน schema ของคุณ — ไม่มีไฟล์ mapping ความสัมพันธ์แยกต่างหากให้ดูแล ถ้า constraint เปลี่ยนหรือถูกลบ การ embed ก็จะหยุดทำงานทันที เพราะ schema คือ source of truth เดียว
 
-อีกข้อที่ควรรู้ไว้ schema เดียวกันนี้ยัง expose เป็น **GraphQL API** ให้อัตโนมัติผ่าน extension `pg_graphql` สำหรับคนที่ชอบใช้ GraphQL มากกว่า REST คอร์สนี้เน้นที่ REST/RPC เป็นหลัก แต่ GraphQL endpoint ก็มีอยู่คู่กันโดยไม่ต้องทำ schema เพิ่ม
+พิสูจน์ ด้วย `agapi_directors`/`agapi_movies` คู่จริง — movie หนึ่งเรื่องตั้งใจให้ไม่มี director:
+
+```sql
+-- supabase/migrations/4201_agapi_movies_embedding.sql
+create table public.agapi_directors (
+  id bigint generated always as identity primary key,
+  name text not null
+);
+
+create table public.agapi_movies (
+  id bigint generated always as identity primary key,
+  title text not null unique,
+  year int not null,
+  rating numeric not null default 5.0,
+  director_id bigint references public.agapi_directors (id)
+);
+
+insert into public.agapi_directors (name) values ('Denis Villeneuve'), ('Greta Gerwig');
+
+insert into public.agapi_movies (title, year, director_id) values
+  ('Dune', 2021, 1),
+  ('Barbie', 2023, 2),
+  ('Untitled Indie Film', 2024, null);
+```
+
+```bash
+# scripts/agapi-curl-embed.sh
+curl "$API_URL/rest/v1/agapi_movies?select=title,director:agapi_directors(name)&order=id" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY"
+```
+
+```text
+[{"title":"Dune","director":{"name":"Denis Villeneuve"}},
+ {"title":"Barbie","director":{"name":"Greta Gerwig"}},
+ {"title":"Untitled Indie Film","director":null}]
+```
+
+embed แบบธรรมดาเป็น **left join**: "Untitled Indie Film" ไม่มี `director_id` แล้วมันก็ยังกลับมาอยู่ดี พร้อม `director: null` ใส่ `!inner` ต่อท้าย resource ที่ embed บังคับให้เป็น **inner join** แทน — row ที่ไม่มีคู่ตรงจะถูกตัดออกจากผลลัพธ์ทั้งแถว ไม่ใช่แค่ใส่ null:
+
+```bash
+# scripts/agapi-curl-embed-inner.sh
+curl "$API_URL/rest/v1/agapi_movies?select=title,director:agapi_directors!inner(name)&order=id" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY"
+```
+
+```text
+[{"title":"Dune","director":{"name":"Denis Villeneuve"}},
+ {"title":"Barbie","director":{"name":"Greta Gerwig"}}]
+```
+
+query เดียวกัน data เดียวกัน — "Untitled Indie Film" หายไปจาก response เลย ไม่ใช่อยู่แบบ null `!inner` ยังเป็นวิธี filter movie ด้วย column บน table ที่ *ถูก embed* ด้วย (เช่น `agapi_directors!inner(name)&agapi_directors.name=eq.Denis+Villeneuve`) — embed ธรรมดา filter row ชั้นนอกแบบนั้นไม่ได้ เพราะ left join ต้องเก็บทุก row ชั้นนอกไว้ตามนิยามของมัน
+
+### `count=exact`, `count=planned`, `count=estimated`
+
+PostgREST รายงานได้ว่ามี row *ที่ตรงเงื่อนไข* กี่แถว แยกอิสระจากจำนวนที่ return จริงจาก `Range`/`limit` ผ่าน `Prefer: count=...` และ header `Content-Range` ของ response มีสามโหมด และใช้แทนกันไม่ได้ ตาม docs ของ PostgREST เอง ([docs.postgrest.org — Pagination and Count](https://docs.postgrest.org/en/stable/references/api/pagination_count.html)): `exact` รัน `count(*)` จริง; `planned` อ่าน row estimate ของ query planner ของ Postgres เอง (เร็ว แต่แม่นแค่ไหนขึ้นกับสถิติของ table); `estimated` ใช้ exact count ถ้าต่ำกว่า threshold ที่ตั้งไว้ (`db-max-rows`) แล้ว fallback ไปใช้ planned estimate ถ้าเกิน พิสูจน์ ด้วย `agapi_movies` table สามแถวเดิม ยิง request ละแบบ:
+
+```bash
+# scripts/agapi-curl-count.sh
+curl -D - -o /dev/null "$API_URL/rest/v1/agapi_movies?select=id&limit=1" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY" -H "Prefer: count=exact"
+curl -D - -o /dev/null "$API_URL/rest/v1/agapi_movies?select=id&limit=1" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY" -H "Prefer: count=planned"
+curl -D - -o /dev/null "$API_URL/rest/v1/agapi_movies?select=id&limit=1" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY" -H "Prefer: count=estimated"
+```
+
+```text
+count=exact      -> Content-Range: 0-0/3      (a real count(*): exactly 3 rows)
+count=planned    -> Content-Range: 0-0/720    (Postgres's own planner guess — this table was never ANALYZEd, so it is a generic default estimate, not the real 3)
+count=estimated  -> Content-Range: 0-0/3      (3 rows is below db-max-rows, so estimated fell back to an exact count here)
+```
+
+`720` ของ `planned` ไม่ใช่บั๊กหรือการปัดเศษ — มันคือค่าที่ query planner ของ Postgres เดาไว้จริง ๆ สำหรับ table เล็กที่ไม่มีสถิติสดใหม่ ยกมาตรง ๆ นี่คือ trade-off ทั้งหมดในตัวเลขเดียว: `exact` ถูกต้องเสมอแต่ช้าได้บน table ใหญ่; `planned` เร็วเสมอแต่ผิดได้มากบน table เล็กที่ไม่ถูก analyze; `estimated` พยายามเอาข้อดีทั้งสองมารวมกันด้วยการสลับตามขนาด table
+
+### `Prefer:` header — request/response จริงของแต่ละตัว
+
+- **`return=representation`** — โดย default การ `insert`/`update`/`delete` ที่สำเร็จจะคืน body ว่างพร้อม `201`/`204`; header นี้ทำให้ PostgREST คืน row ที่ได้รับผลแทน อยู่ใน response เดียวกัน:
+
+```bash
+# scripts/agapi-curl-prefer-representation.sh
+curl -X POST "$API_URL/rest/v1/agapi_movies" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY" \
+  -H "Content-Type: application/json" -H "Prefer: return=representation" \
+  -d '{"title":"Poor Things","year":2023,"director_id":2}'
+```
+
+```text
+201  [{"id":4,"title":"Poor Things","year":2023,"rating":5.0,"director_id":2}]
+```
+
+- **`resolution=merge-duplicates`** — เปลี่ยน insert ที่ขัดกับ unique constraint ให้กลายเป็น upsert (`insert ... on conflict ... do update`) แทนที่จะได้ `409` ต้องมี `?on_conflict=<column>` ระบุ constraint ที่จะใช้แก้ conflict:
+
+```bash
+# scripts/agapi-curl-prefer-merge.sh
+# Without the header, inserting the same title again is a real conflict:
+curl -X POST "$API_URL/rest/v1/agapi_movies" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"title":"Poor Things","year":2023,"director_id":2}'
+
+# With it, the same request updates the existing row instead:
+curl -X POST "$API_URL/rest/v1/agapi_movies?on_conflict=title" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY" \
+  -H "Content-Type: application/json" -H "Prefer: return=representation,resolution=merge-duplicates" \
+  -d '{"title":"Poor Things","year":2023,"director_id":2,"rating":9.1}'
+```
+
+```text
+without header  -> 409  {"code":"23505","details":"Key (title)=(Poor Things) already exists.","hint":null,"message":"duplicate key value violates unique constraint \"agapi_movies_title_key\""}
+with header     -> 200  [{"id":4,"title":"Poor Things","year":2023,"rating":9.1,"director_id":2}]
+```
+
+- **`missing=default`** — bulk insert ที่ row ไม่ได้มี key JSON ตรงกันทุกตัวถูกปฏิเสธทันทีโดย default (`PGRST102`, "All object keys must match") header นี้ บวกกับ `?columns=` ที่ระบุทุก column ที่ batch ใช้อย่างชัดเจน จะเติม key ที่ขาดไปในแต่ละ row ด้วย default ของ column นั้นแทนการ error:
+
+```bash
+# scripts/agapi-curl-prefer-missing.sh
+curl -X POST "$API_URL/rest/v1/agapi_movies?columns=title,year,rating" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY" \
+  -H "Content-Type: application/json" -H "Prefer: return=representation,missing=default" \
+  -d '[{"title":"Movie With Rating","year":2020,"rating":8.0},{"title":"Movie Without Rating","year":2021}]'
+```
+
+```text
+201  [{"id":7,"title":"Movie With Rating","year":2020,"rating":8.0,"director_id":null},
+      {"id":8,"title":"Movie Without Rating","year":2021,"rating":5.0,"director_id":null}]
+```
+
+row ที่สองไม่ได้พูดถึง `rating` เลย — มันลงเอยเป็น `5.0` ซึ่งเป็น `default` ของ column ไม่ใช่ `null` ถ้าไม่มี `missing=default` (หรือไม่มี `?columns=` ที่ตรงกัน) request แบบเดียวกันเป๊ะจะถูกปฏิเสธก่อนไปถึง Postgres เลยด้วยซ้ำ
+
+<Callout title="tx=rollback ไม่มีผลอะไรเลยที่นี่ — และนั่นคือพฤติกรรมที่ถูกต้องตาม docs">
+`Prefer: tx=rollback` ควรจะรัน request จริงแล้ว rollback transaction — มีประโยชน์สำหรับทดสอบการเขียนโดยไม่เก็บผลไว้ ลองกับ stack นี้ insert **commit ไปเลยเฉย ๆ**:
+
+```bash
+curl -X POST "$API_URL/rest/v1/agapi_movies" \
+  -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY" \
+  -H "Content-Type: application/json" -H "Prefer: return=representation,tx=rollback" \
+  -d '{"title":"Should Not Persist","year":2099,"director_id":1}'
+```
+
+```text
+201  [{"id":9,"title":"Should Not Persist","year":2099,"rating":5.0,"director_id":1}]
+```
+
+query หา row นั้นทีหลังก็ยังเจอ — `tx=rollback` ไม่มีผลเลย นี่ไม่ใช่บั๊กในการพิสูจน์: ตาม docs ของ PostgREST เอง การ rollback transaction ที่ client สั่งได้ถูกกั้นไว้ด้วย setting ฝั่ง server คือ `db-tx-end` ซึ่ง default เป็น `commit` — commit ธรรมดาที่ override ไม่ได้ — เว้นแต่ server operator จะตั้งเป็น `commit-allow-override` (หรือ `rollback`/`rollback-allow-override`) เองอย่างชัดเจน ([docs.postgrest.org — Transactions](https://postgrest.org/en/stable/references/transactions.html)) `config.toml` ของ local ไม่มี key `db-tx-end` เลย ดังนั้น default ของ PostgREST เอง (`commit` ไม่มี override) จึงใช้งานอยู่ — `Prefer: tx=rollback` ถูกเพิกเฉยเงียบ ๆ ตรงตามที่ docs บอกไว้ ไม่ใช่พังแบบเงียบ ๆ
+</Callout>
+
+### GraphQL ผ่าน `pg_graphql` — และ RLS ยังบังคับใช้อยู่
+
+schema เดียวกันนี้ยังเข้าถึงได้ผ่าน GraphQL แต่บน local stack นี้มันไม่ได้อัตโนมัติ — `pg_graphql` เป็น Postgres extension ที่มีให้ใช้ ไม่ใช่ตัวที่เปิดไว้โดย default:
+
+```sql
+-- sql/agapi_enable_pg_graphql.sql
+create extension if not exists pg_graphql;
+```
+
+```bash
+# scripts/agapi-curl-graphql-before.sh
+curl -X POST "$API_URL/graphql/v1" -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY" \
+  -H "Content-Type: application/json" -d '{"query":"query { agapi_moviesCollection { edges { node { title } } } } "}'
+```
+
+```text
+{"errors":[{"message":"pg_graphql extension is not enabled."}]}
+```
+
+เปิดแล้ว กฎ authorization เดียวกันเป๊ะกับ REST ใช้ได้ — reuse table `agapi_notes` และ RLS policy จากบทก่อนหน้า (แต่ละ row เป็นของ user จริงคนละคนใน user จริงสองคน) GraphQL query ที่ *ไม่ filter อะไรเลย* ตัวเดียวกันคืน row ต่างกันให้ผู้เรียกต่างกัน:
+
+```bash
+# scripts/agapi-curl-graphql-rls.sh
+curl -X POST "$API_URL/graphql/v1" -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ALICE_TOKEN" \
+  -H "Content-Type: application/json" -d '{"query":"query { agapi_notesCollection { edges { node { id body } } } }"}'
+curl -X POST "$API_URL/graphql/v1" -H "apikey: $ANON_KEY" -H "Authorization: Bearer $BOB_TOKEN" \
+  -H "Content-Type: application/json" -d '{"query":"query { agapi_notesCollection { edges { node { id body } } } }"}'
+```
+
+```text
+alice -> {"data":{"agapi_notesCollection":{"edges":[{"node":{"id":"16ff28b0-...","body":"alice private note"}}]}}}
+bob   -> {"data":{"agapi_notesCollection":{"edges":[{"node":{"id":"6e11f6a2-...","body":"bob private note"}}]}}}
+```
+
+`pg_graphql` สร้าง schema ของมันจาก Postgres catalog เดียวกับที่ PostgREST อ่าน และรันผ่าน Postgres connection เดียวกัน ด้วย role เดียวกันและ RLS เดียวกัน — ไม่มี authorization layer แยกต่างหากสำหรับ GraphQL ให้ต้อง config หรือลืม ความปลอดภัยของ RLS ใน RPC แบบ `security invoker` (พิสูจน์แล้วบทก่อนหน้า) กับความปลอดภัยของ RLS ใน GraphQL query นี้ คือ guarantee เดียวกันเป๊ะ แค่เข้าถึงผ่านสอง protocol ที่ต่างกัน
 
 <Mermaid title="จาก table ใน Postgres สู่ REST endpoint ที่ filter ได้" code={postgrestDiagram} />
 
@@ -84,8 +265,51 @@ export const postgrestDiagram = `flowchart LR
   endpoint --> embed["?select=title,director:directors(name) embeds via FK"]`;
 
 <Callout title="สรุปหนึ่งบรรทัด">
-**PostgREST** อ่าน schema ของ Postgres แล้ว generate REST endpoint ให้ทุก table ที่ expose ไว้โดยไม่ต้องเขียนโค้ด API เอง โดย URL query parameter ควบคุม **เลือก column** (`select`), **filter** (`column=operator.value` เช่น `gte.`, `like.`, `in.`) และ **เรียงลำดับ** (`order`) ส่วน **foreign-key constraint** จริงในระบบทำให้ **embed** row ที่เกี่ยวข้องมาใน request เดียวกันได้ และ schema เดียวกันนี้ยังได้ GraphQL endpoint ฟรีผ่าน `pg_graphql`
+**PostgREST** อ่าน schema ของ Postgres แล้ว generate REST endpoint ให้ทุก table ที่ expose ไว้โดยไม่ต้องเขียนโค้ด API เอง โดย URL query parameter ควบคุม **เลือก column** (`select`), **filter** (`column=operator.value` เช่น `gte.`, `like.`, `in.`) และ **เรียงลำดับ** (`order`) ส่วน **foreign-key constraint** จริงในระบบทำให้ **embed** row ที่เกี่ยวข้องมาได้ (`!inner` เปลี่ยน left join นั้นให้เป็น inner join ตัดแถวที่ไม่มีคู่ทิ้ง) `Prefer:` header เปลี่ยน response shape และ semantics ของการเขียน (`return=representation`, `resolution=merge-duplicates`, `missing=default`) หรือการจัดการ transaction (`tx=rollback` — ถูกกั้นด้วย setting ฝั่ง server ที่ default ปิดไว้ พิสูจน์แล้วด้านบน) และ `count=exact`/`planned`/`estimated` แลกความแม่นยำกับความเร็วบน `Content-Range` `pg_graphql` ให้ schema เดียวกันผ่าน GraphQL — บน local stack นี้ต้อง `create extension pg_graphql` ก่อน — ด้วย RLS เดียวกันเป๊ะที่บังคับใช้อยู่ข้างใต้ พิสูจน์แล้วด้านบนด้วย notes table สองผู้ใช้ตัวเดียวกับบท RPC
 </Callout>
+
+## Reading AI-generated code
+
+AI assistant ที่ถูกขอให้ "ให้ admin bulk-import หนังจาก spreadsheet โดยข้ามตัวที่มีอยู่แล้ว" สร้างโค้ดนี้ขึ้นมา:
+
+<SpotTheBug lang="ts" code={`// src/import-movies.ts
+import { createClient } from '@supabase/supabase-js';
+
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!);
+
+async function importMovies(rows: { title: string; year: number; rating?: number }[]) {
+  const { data, error } = await supabase
+    .from('agapi_movies')
+    .upsert(rows, { onConflict: 'title', ignoreDuplicates: true });
+
+  if (error) {
+    console.error('import failed:', error.message);
+    return;
+  }
+
+  console.log(\`imported \${rows.length} movies\`);
+}
+`}>
+สามปัญหาแยกกัน แต่ละอันดูสมเหตุสมผลในตัวเอง อันแรก `console.log` บรรทัดสุดท้ายรายงาน `rows.length` — ขนาด input — ไม่ใช่สิ่งที่เกิดขึ้นจริง: ด้วย `ignoreDuplicates: true` row ที่มีอยู่แล้วถูกข้ามไปเงียบ ๆ ดังนั้น "imported 40 movies" อาจหมายถึง 0 ถึง 40 ตัวที่เป็นของใหม่จริง ๆ ก็ได้ โค้ดไม่เคยดู `data` ที่ return กลับมาเลยเพื่อรู้ความจริง อันที่สอง row ที่มี key ไม่ตรงกัน (บางอันมี `rating` บางอันไม่มี ตรงกับสถานการณ์ import จาก spreadsheet เป๊ะ) จะเจอ `PGRST102 "All object keys must match"` แบบเดียวกับที่พิสูจน์ไว้ด้านบน — `.upsert()` ของ supabase-js ไม่ได้ปิดบังปัญหานี้ มันยังเป็น PostgREST bulk request ตัวเดียวอยู่ดีข้างใต้ ดังนั้น batch ที่มี key ไม่ตรงกันจะล้มเหลวทันที เว้นแต่ผู้เรียกจะส่ง option ที่ map ไปเป็น `missing=default` ด้วย พร้อมระบุ column ให้ครบ อันที่สาม และพลาดง่ายที่สุด: โค้ดนี้ใช้ key **anon** จาก script ที่พูดถึง "admin" — ถ้า `agapi_movies` grant `insert` ให้ `anon`/`authenticated` อยู่แล้ว (ตามบทก่อนหน้า เกิดขึ้นโดยไม่ตั้งใจได้ง่าย) การ import แบบ "admin" นี้ก็รันด้วยสิทธิ์เดียวกับที่ user คนไหนก็ตามที่ login มีอยู่แล้ว ไม่ใช่ credential เฉพาะ admin เลย ไม่มีจุดไหนในโค้ดเช็คเลยว่าผู้เรียกเป็น admin จริงไหม
+</SpotTheBug>
+
+## Mental Model
+
+PostgREST คือ compiler ไม่ใช่ proxy: ทุก request — `select`, filter, embed, `Prefer` header, count mode — คือ source code ในภาษา query เล็ก ๆ ที่เขียนเป็น URL กับ header บางตัว และหน้าที่เดียวของ PostgREST คือ compile มันเป็น SQL statement เดียวแล้วส่งให้ Postgres ข้างใน transaction เดียว ไม่มี "REST layer" ระดับ framework ที่ทำอะไรที่ Postgres เองทำไม่ได้เลย — `!inner` compile เป็น SQL `join` จริง ไม่ใช่ `left join`, `count=planned` compile เป็นการอ่าน `pg_class`/สถิติของ planner แทนที่จะรัน `count(*)`, `resolution=merge-duplicates` compile เป็น `on conflict do update` เมื่อมองแบบนี้ "URL นี้จะทำอะไรจริง ๆ" กลายเป็นคำถามที่มีคำตอบเชิงกลไก: ถ้าเขียน SQL เองจะเขียนยังไง แล้ว Postgres เองรองรับมันไหม
+
+## Trade-offs
+
+- **การ embed แทนที่ join/query ที่สองด้วยตนเองด้วย URL เดียว** — **แลกกับ default ที่เป็น left join ที่ต้อง override เอง** (`!inner`) ทันทีที่ "ไม่มี related row" ควรตัดผลลัพธ์ออกแทนที่จะใส่ null
+- **`count=exact` ถูกต้องแบบไม่มีข้อสงสัย** — **แลกกับต้นทุนเทียบเท่า full-table scan จริง** บน table ใหญ่ที่ไม่มี index; `planned` แทบไม่มีต้นทุนแต่แม่นแค่ไหนขึ้นกับ `ANALYZE` ล่าสุดของ Postgres; `estimated` เป็นจุดกึ่งกลางที่ UI ส่วนใหญ่อยากได้จริง ๆ แต่ความแม่นยำขึ้นกับ threshold ฝั่ง server ที่ client คุมไม่ได้อย่างเงียบ ๆ
+- **`Prefer:` header เพิ่ม capability จริง (upsert, เติม default, response shape) โดยไม่ต้องมี endpoint เพิ่ม** — **แลกกับพฤติกรรมที่มองไม่เห็นเว้นแต่จะอ่าน header list**: `resolution=merge-duplicates` ต้องมี `?on_conflict=`, `missing=default` ต้องมี `?columns=`, และ `tx=rollback` ต้องมี server opt-in ที่อาจไม่ได้ตั้งไว้ ทำให้ header เดียวกันเป็น no-op ได้ขึ้นกับ config ฝั่ง server ไม่ใช่ intent ของ client
+- **`pg_graphql` ให้ query language ที่สองบน authorization model เดียวกันฟรี ๆ** — **แลกกับการที่มันต้องถูกเปิดก่อนเลยบน local stack ใหม่ ๆ** ไม่เหมือนโปรเจกต์ hosted ที่มักเปิดไว้แล้ว — พิสูจน์แล้วด้านบนด้วย error `"pg_graphql extension is not enabled"` จริงที่บล็อกจนกว่าจะรัน `create extension`
+
+## Common Misconceptions
+
+- **"Embedding คือ join เลยไง movie ที่ไม่มี director ก็ไม่ควรปรากฏ"** default เป็น **left** join — มันปรากฏ พร้อม field ที่ embed เป็น `null` มีแค่ `!inner` เท่านั้นที่ตัดมันออก และนั่นคือ opt-in ที่ต้องเขียนเอง
+- **"`count=planned` พังถ้ามันไม่ตรงกับจำนวน row จริง"** มันทำงานตามที่ออกแบบไว้ — เป็น planner estimate ไม่ใช่ count และสดใหม่แค่ไหนขึ้นกับ `ANALYZE` ล่าสุดของ table พิสูจน์แล้วด้านบน: `720` จริงบน table 3 แถวจริง ไม่ใช่บั๊ก
+- **"ส่ง `Prefer: tx=rollback` แปลว่า test write ของฉันไม่ persist แน่นอน"** พิสูจน์แล้วด้านบนว่ามันไม่มีผลอะไรเลยแบบเงียบ ๆ ได้ — `db-tx-end` ฝั่ง server เป็นตัวตัดสินว่า header นี้จะถูกฟังหรือไม่ และ default ของ local stack ไม่ฟังมัน ตรวจสอบด้วยการ query หา row ทีหลังทุกครั้งที่พึ่งพามัน
+- **"GraphQL กับ REST มี security model แยกกัน ต้อง config RLS สองรอบ"** ทั้งสองแชร์ Postgres connection, role และ RLS policy เดียวกัน พิสูจน์แล้วด้านบนด้วย notes/RLS setup ตัวเดียวกันจากบท RPC-based REST ที่ทำงานเหมือนเดิมผ่าน `/graphql/v1` ขั้นตอนเดียวที่เพิ่มมาบน local คือต้องเปิด extension ก่อน
 
 export const quizPostgrestApi = [
   {
@@ -97,6 +321,7 @@ export const quizPostgrestApi = [
       'Supabase CLI compile route ตอน deploy จาก template ตายตัว',
     ],
     answer: 1,
+    explain: 'ไม่มีไฟล์ route ไม่มีขั้นตอน deploy — PostgREST อ่าน Postgres catalog สดใหม่ทุก request แล้ว generate endpoint จากมัน',
   },
   {
     q: 'query parameter `?year=gte.2020` ทำอะไร',
@@ -107,6 +332,7 @@ export const quizPostgrestApi = [
       'เลือกเฉพาะ column year แล้วเปลี่ยนชื่อเป็น 2020',
     ],
     answer: 1,
+    explain: '`gte.` คือ operator prefix ของ PostgREST สำหรับ "มากกว่าหรือเท่ากับ" — มัน compile เป็น SQL WHERE clause ไม่ใช่การประกาศ column หรือการเรียงลำดับ',
   },
   {
     q: 'PostgREST รู้ได้อย่างไรว่า embed resource ที่เกี่ยวข้องอย่าง director เข้าไปใน response ของ movie ได้',
@@ -117,6 +343,7 @@ export const quizPostgrestApi = [
       'การ embed ทำได้แค่ผ่าน GraphQL เท่านั้น ใช้กับ REST ไม่ได้',
     ],
     answer: 1,
+    explain: 'FK constraint จริงคือ source of truth — เปลี่ยนหรือลบมันแล้ว embedding จะหยุดทำงาน พิสูจน์ว่าไม่มีไฟล์ mapping แยกต่างหาก',
   },
   {
     q: 'นอกจาก REST แล้ว มี API style อื่นที่ได้มาโดยอัตโนมัติจาก schema เดียวกันไหม',
@@ -127,6 +354,40 @@ export const quizPostgrestApi = [
       'ไม่มี API style อื่นให้ใช้',
     ],
     answer: 1,
+    explain: 'pg_graphql สร้าง GraphQL schema จาก Postgres catalog เดียวกัน — บน local stack ใหม่ ๆ ต้อง `create extension pg_graphql` ก่อน พิสูจน์แล้วด้านบน',
+  },
+  {
+    q: 'movie เรื่องหนึ่งไม่มี director (director_id เป็น null) ความต่างระหว่าง embedding ธรรมดา (`select=title,director:agapi_directors(name)`) กับ embedding แบบ `!inner` สำหรับ row นั้นคืออะไร',
+    options: [
+      'ไม่ต่างกัน ทั้งคู่คืน row เดียวกันพร้อม director: null',
+      'embedding ธรรมดาเป็น left join และรวม row นั้นไว้พร้อม director: null; !inner เป็น inner join และตัด row นั้นออกจากผลลัพธ์ทั้งแถว',
+      '!inner throw error เมื่อไหร่ก็ตามที่มี row ที่ foreign key เป็น null',
+      'embedding ธรรมดาตัด row ออก; !inner รวมไว้พร้อม director: null',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วด้านบนด้วย query และ data เดียวกัน — embed ธรรมดาเก็บ "Untitled Indie Film" ไว้พร้อม director: null, !inner ตัดออกจาก response ไปเลย',
+  },
+  {
+    q: 'request หนึ่งส่ง `Prefer: tx=rollback` ตอน insert แล้ว row นั้นก็ยังโผล่มาใน GET request ทีหลัง แปลว่าอะไร',
+    options: [
+      'header Prefer สะกดผิด',
+      'setting db-tx-end ของ server default เป็น commit และไม่ยอมให้ client override เว้นแต่จะตั้งค่าไว้เป็นอย่างอื่นอย่างชัดเจน ดังนั้น header ถูกเพิกเฉยเงียบ ๆ ตรงตามที่ PostgREST เขียนไว้ใน docs',
+      'tx=rollback ใช้ได้แค่กับ update ไม่ใช่กับ insert',
+      'row จะถูกลบอัตโนมัติหลังจาก timeout',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วด้านบน: config.toml ของ local ไม่ได้ตั้ง db-tx-end เลย default ของ PostgREST เอง (commit ไม่มี override) จึงใช้งาน — tx=rollback จะมีผลก็ต่อเมื่อ server operator opt-in เท่านั้น',
+  },
+  {
+    q: 'ทำไม count=planned บางทีถึงรายงานตัวเลขที่ห่างไกลจากจำนวน row จริงของ table',
+    options: [
+      'เป็นบั๊กใน PostgREST',
+      'มันอ่าน row estimate ของ query planner ของ Postgres จากสถิติของ table ซึ่งอาจเก่าหรือเป็นค่า generic ถ้า table ไม่เคยถูก (หรือไม่เพิ่งถูก) ANALYZE แทนที่จะรัน count จริง',
+      'มันปัดเศษไปที่ร้อยที่ใกล้ที่สุดเสมอ',
+      'มันนับแค่ row ที่ตรงกับ index เท่านั้น ทิ้งที่เหลือ',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วด้านบน: table 3 แถวจริงรายงาน planned count เป็น 720 — เป็นค่าเดาของ planner จริง ๆ ไม่บิดเบือน สำหรับ table ที่ไม่มีสถิติสดใหม่ ไม่ใช่ error',
   },
 ];
 
