@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
@@ -35,13 +36,97 @@ export DATABASE_URL="postgres://postgres.<project-ref>:[YOUR-PASSWORD]@aws-0-us-
 export DIRECT_URL="postgres://postgres.<project-ref>:[YOUR-PASSWORD]@aws-0-us-east-1.pooler.supabase.com:5432/postgres"
 ```
 
+## พิสูจน์ว่า pooler เปิดอยู่จริง บน local
+
+local stack ของ Supabase CLI มาพร้อม `[db.pooler] enabled = false` โดย default — container ของ pooler มีอยู่ แต่ `supabase start` เฉย ๆ จะไม่มีมันให้ใช้ stack ของคอร์สนี้เปิดมันไว้:
+
+```text
+$ grep -A6 '\[db.pooler\]' supabase/config.toml
+[db.pooler]
+enabled = true
+# Port to use for the local connection pooler.
+port = 55329
+pool_mode = "transaction"
+default_pool_size = 20
+max_client_conn = 100
+```
+
+สังเกต port: ใน layout local แบบตำรามันจะเป็น `54329`; stack ของคอร์สนี้บวก port ทุกตัวขึ้น `1000` (บันทึกไว้ใน `README.md` ของ repo เอง) ดังนั้น pooler local จริงอยู่ที่ `55329` ยืนยันสด ๆ:
+
+```text
+$ docker ps --format '{{.Names}}\t{{.Ports}}' | grep pooler
+supabase_pooler_probe   0.0.0.0:55329->6543/tcp
+```
+
+table tenant ของ Supavisor เอง query ตรง ๆ ยืนยันว่ามีแค่โหมดเดียวที่ตั้งไว้ให้ tenant นี้ — ไม่ใช่ transaction/session สองพอร์ตแยกแบบที่ hosted project มี:
+
+```text
+$ docker exec -i supabase_db_probe psql -U postgres -d _supabase -c \
+    "select db_user, pool_size, mode_type from _supavisor.users;"
+  db_user  | pool_size |  mode_type
+-----------+-----------+-------------
+ pgbouncer |        20 | transaction
+```
+
+<Callout title="ความต่างจริงระหว่าง local กับ hosted บอกตามตรง">
+`db_user` ที่ Supavisor ใช้ต่อกับ Postgres จริง ๆ คือ `pgbouncer` เป๊ะ ๆ ไม่ว่า client จะส่ง username อะไรมา — มรดกจากการที่ Supavisor implement wire protocol แบบ compatible กับ PgBouncer และเป็นเรื่องที่เห็นแล้วแปลกใจจริงใน `pg_stat_activity` ที่สำคัญกว่านั้น: **local CLI stack รันแค่ pool mode เดียวในแต่ละครั้ง** (`transaction` ตั้งไว้ใน `config.toml` ข้างบน) ไม่ใช่สองพอร์ตแยก (`6543` transaction, `5432` session) แบบที่ hosted project มี เพื่อพิสูจน์พฤติกรรม session-mode บน local บทนี้ใช้ **direct Postgres connection** (`DB_URL` เดียวกับบทก่อน ๆ) เป็นตัวแทน local — มันมี property ที่สำคัญกับ proof นี้เป๊ะ (backend connection เดียวถือไว้ตลอดชีวิตของ session) แม้จะไม่ใช่ port session-mode ของ Supavisor เองตรง ๆ ก็ตาม
+</Callout>
+
 ## ควรใช้โหมดไหน
 
 ให้ default เป็น transaction mode สำหรับอะไรก็ตามที่เป็น serverless หรืออายุสั้น เช่น Edge Function, backend ของแอปส่วนใหญ่ที่รันบน serverless platform และ API route ที่เปิด connection ต่อ request เพราะเป็นโหมดที่ถูกสร้างมาสำหรับ traffic รูปแบบนั้นโดยตรง
 
 ให้ใช้ session mode เฉพาะตอนที่คุณต้องการ feature ระดับ session จริง ๆ เช่น prepared statement, `LISTEN`/`NOTIFY` หรือ process ฝั่ง server อายุยืน (backend แบบดั้งเดิมที่มี connection pool ของตัวเองอยู่แล้ว หรือ migration tool) ที่ต่ออยู่ตลอดและได้ประโยชน์จาก connection เฉพาะตัวมากกว่า connection แบบ pool ถ้าไม่แน่ใจว่า framework หรือ ORM ของคุณต้องการอันไหน ให้เช็ก doc ของตัวเองเรื่อง pooler compatibility ก่อนเลือกโหมด — ORM บางตัวต้องการ session-mode URL สำหรับ migration และ transaction-mode URL สำหรับ query ตอน runtime
 
-<Mermaid title="Transaction mode pools many short-lived clients; session mode dedicates one connection per client" code={connPoolDiagram} />
+## prepared statement พัง พิสูจน์ด้วย error จริง
+
+"transaction mode ไม่รองรับ prepared statement" พูดง่าย แต่เห็นมันพังจริงยาก — client เดียวบน pool ที่ load เบา ๆ มักได้ backend connection เดิมซ้ำโดยบังเอิญ แล้ว statement ก็ใช้ได้เฉย ๆ การบังคับให้เกิด contention จริงกับ pooler ของคอร์สนี้เอง (`supavisor`, `pool_size = 20`) reproduce error จริงได้:
+
+```text
+$ docker exec -i supabase_db_probe psql "postgresql://postgres.pooler-dev:postgres@supabase_pooler_probe:6543/postgres" \
+    -c "PREPARE fnd_stmt2 AS select 2;"
+PREPARE
+
+# ...มี 25 session พร้อมกันแย่ง pool 20 connection เดียวกันอยู่ระหว่างนี้...
+
+$ docker exec -i supabase_db_probe psql "postgresql://postgres.pooler-dev:postgres@supabase_pooler_probe:6543/postgres" \
+    -c "EXECUTE fnd_stmt2;"
+ERROR:  prepared statement "fnd_stmt2" does not exist
+```
+
+`PREPARE` กับ `EXECUTE` ออกไปผ่าน client connection เดียวกันเป๊ะ ๆ ไปที่ pooler — แต่ transaction mode คืน backend Postgres connection กลับ pool ทันทีหลังแต่ละ statement ที่ autocommit ดังนั้นภายใต้ contention จริงสำหรับ 20 backend นั้น `EXECUTE` ไปตกที่ backend คนละตัวกับที่ `PREPARE` รัน และ backend นั้นไม่เคยเห็น statement ถูก prepare เลย คู่ `PREPARE`/`EXECUTE` เดียวกันเป๊ะ กับ **direct connection** — ตัวแทน local ของ session-mode ที่บทนี้ใช้ข้างบน — ไม่พังเลย ไม่ว่า concurrency จะเท่าไหร่ เพราะ direct connection ถือ backend เดียวตลอดอายุของมัน:
+
+```text
+$ docker exec -i supabase_db_probe psql -U postgres -c "PREPARE fnd_stmt3 AS select 3;" -c "EXECUTE fnd_stmt3;"
+PREPARE
+ ?column?
+----------
+        3
+```
+
+นี่คือกลไกเดียวกับที่บท [Edge Functions and the Database](/supabase/th/edge-functions/edge-functions-and-the-database/) เอ่ยชื่อไว้ แต่ตามที่บทนั้นยอมรับเอง reproduce ไม่ได้ภายใต้ test local ที่ concurrency ต่ำ — การ reproduce ที่นี่ต้องมี contention จริงต่อ pool ไม่ใช่แค่หน่วงเวลาระหว่าง statement ซึ่งเป็นส่วนที่ขาดไป
+
+## Pool size: เพดานของใครกันแน่ที่กำลังถูกใช้
+
+ทุกค่าข้างบนมาจากแหล่งจริงที่ query ได้ ไม่ใช่การเดา — table `_supavisor.users`/`_supavisor.tenants` ของ Supavisor เองใน database `_supabase`:
+
+- **`pool_size = 20`** (`default_pool_size` ใน `config.toml`) — จำนวน backend connection ของ Postgres จริงที่ Supavisor เปิดค้างไว้ให้ tenant นี้ แชร์กันตาม client connection ที่เข้ามา
+- **`max_client_conn = 100`** — เพดานของ connection ฝั่ง *client* ที่ Supavisor เองจะรับ มากกว่า backend pool เยอะ ซึ่งเป็นประเด็นทั้งหมดของ pooling: client เยอะ แต่ Postgres connection จริงน้อย
+- `max_connections` ของ Postgres เอง (ตั้งค่าระดับ cluster ไม่เกี่ยวกับตัวเลขสองตัวข้างบนเลย) คือเพดานแข็งจริงที่ทุกอย่างข้างบนกำลังป้องกันอยู่ — pool ของ Supavisor มีไว้เพื่อให้ traffic serverless ที่พุ่งขึ้นมาใช้ budget 100 client ของตัวเองหมดก่อนที่จะไปถึง Postgres จริงได้เลย
+
+## `pgbouncer` และทำไมชื่อนี้ถึงยังโผล่มา
+
+ก่อนมี Supavisor pooler ของ Supabase ฝั่ง hosted *คือ* [PgBouncer](https://www.pgbouncer.org/) ตรง ๆ [Supavisor rollout ช่วงกันยายน–ตุลาคม 2023](https://github.com/orgs/supabase/discussions/19706) (เปิดให้ project ใหม่ตั้งแต่ 27 กันยายน 2023 และเปิดให้ทุก project ภายใน 15 ตุลาคม 2023) ส่วน PgBouncer ถูก[ประกาศ deprecated อย่างเป็นทางการวันที่ 15 มกราคม 2024](https://supabase.com/changelog/17817-pgbouncer-and-ipv4-deprecation) บน platform hosted Supavisor คือ pooler ที่เขียนขึ้นใหม่ทั้งหมด (ด้วย Elixir ตาม repo ของมันเอง) สร้างมาเฉพาะเพื่อรองรับ scale และ multi-tenancy ที่ platform hosted เดียวที่แชร์กันต้องการ รวมถึง feature ที่ PgBouncer เดี่ยว ๆ ไม่มีให้ — แต่มันจงใจพูด wire protocol แบบ compatible กับ PgBouncer ใกล้พอที่ tooling เดิมที่สร้างมาคู่กับ PgBouncer จะยังใช้งานได้ compatibility layer นั้นแหละคือเหตุผลที่ query จริงข้างบนแสดงว่า Supavisor ต่อเข้า Postgres ด้วยชื่อ role ตัวอักษรจริง ๆ ว่า `pgbouncer` — ซากมรดกจากที่มา ไม่ใช่สัญญาณว่า PgBouncer ยังแอบรันอยู่ข้างใต้
+
+<Callout title="Self-hosting ยังมี PgBouncer จริงให้เลือกใช้">
+นอก platform hosted ของ Supabase self-hosted Supabase (`docker-compose.pgbouncer.yml`) ยังรัน PgBouncer จริงแทน Supavisor ได้ในฐานะ override ที่มีเอกสารรองรับ — transaction mode เท่านั้น ตาม[เอกสาร self-hosting](https://github.com/supabase/supabase/blob/master/apps/docs/content/guides/self-hosting/accessing-postgres.mdx) stack ของคอร์สนี้ไม่ได้ใช้ override นั้น มันใช้ container Supavisor ของ CLI เอง ที่พิสูจน์ไว้ข้างบน
+</Callout>
+
+## IPv4, IPv6 และทำไมเรื่องนี้ถึงสำคัญกับการเลือก pooler
+
+ตาม[เอกสาร pooling and limits](https://github.com/supabase/supabase/blob/master/apps/docs/content/guides/database/connecting-to-postgres/pooling-and-limits.mdx) ของ Supabase เอง: **direct connection** เข้า Postgres แบบ hosted ต้องการ IPv6 (หรือ add-on IPv4 แบบเสียเงิน) — environment serverless และ CI จำนวนมากยังมีแค่ IPv4 egress เท่านั้น ซึ่งเป็นเหตุผลตรงที่ทำให้พวกมันข้าม pooling ไปต่อตรงไม่ได้เลยแม้จะเป็นแค่ connection อายุยืนตัวเดียว **Supavisor** (shared pooler ที่บทนี้พิสูจน์มาตลอด) ถูกระบุไว้ชัดเจนว่าเป็น **IPv4-only** ซึ่งตรงกับเหตุผลที่ทำให้ session mode ของมันเป็น "ทางเลือกตอน session พวกนั้นต้องการ IPv4" ตามเอกสารเดียวกัน — ไม่ใช่แค่ workaround สำหรับ limit จำนวน connection แต่บางครั้งเป็นตัวเลือกเดียวที่เข้าถึงได้ผ่าน IPv4 สำหรับ workload ที่ต้องการพฤติกรรมระดับ session เลย dedicated pooler แบบ PgBouncer (เสียเงิน รันคู่กับ database ของคุณ) รองรับ IPv6 หรือ IPv4-กับ-add-on เหมือนกับ direct connection
+
+<Mermaid title="Transaction mode pool client อายุสั้นจำนวนมาก; session mode จอง connection หนึ่งต่อ client หนึ่ง" code={connPoolDiagram} />
 
 export const connPoolDiagram = `flowchart LR
   subgraph short["Many short-lived clients"]
@@ -61,8 +146,41 @@ export const connPoolDiagram = `flowchart LR
   s2 --> sess
   sess --> dedicated[("One dedicated Postgres connection per client")]`;
 
+## อ่านโค้ดที่ AI สร้าง
+
+AI assistant ถูกขอให้ "connect our serverless API to Supabase" แล้วสร้างสิ่งนี้:
+
+<SpotTheBug lang="ts" code={`// src/db-client.ts
+// An AI assistant's suggested connection setup for a serverless API route
+import postgres from 'postgres';
+
+const sql = postgres(process.env.DIRECT_URL!, { prepare: true });
+
+export async function getWidget(id: string) {
+  return sql\`select * from fnd_widgets where id = \${id}\`;
+}
+`}>
+สองข้อผิดพลาดที่ซ้อนกัน ทั้งคู่มองไม่เห็นจนกว่า traffic จริงจะมา อย่างแรก `DIRECT_URL` คือชื่อ convention ของ codebase นี้เองสำหรับ connection string แบบ **session-mode / direct** (ตัวที่ ORM บางตัวต้องการเฉพาะสำหรับ migration) การใช้มันเป็น runtime connection ของ serverless API route แปลว่าทุก invocation แย่งกันใช้ backend connection เฉพาะตัว ตรงปัญหาทรัพยากรขาดแคลนที่บทนี้เปิดเรื่องไว้เป๊ะ ๆ และมันจะทำให้ connection limit จริงของ Postgres หมดภายใต้ burst ของ concurrent request จริงใด ๆ อย่างที่สอง แม้จะสลับไปใช้ pooler URL แบบ transaction-mode ก็ยังไม่พอ: default ของ driver ที่ `prepare: true` คือ setting เดียวกับที่พิสูจน์ไว้ข้างบนว่าพังแบบคาดเดาไม่ได้ภายใต้ transaction-mode pooling เมื่อ load concurrent จริง — ไม่ใช่ demo traffic ต่ำแบบระมัดระวังของบทนี้ — เริ่มกระจาย statement ของ client ไปคนละ backend connection ทางแก้ต้องทำทั้งคู่: ชี้ serverless/edge code ไปที่ **pooler URL แบบ transaction-mode** และใส่ `prepare: false` (หรือของเทียบเท่าใน driver ของคุณ) combination เดียวกับที่ module Edge Functions พิสูจน์ว่าใช้ได้จริงกับ pooler ตัวเดียวกันนี้
+</SpotTheBug>
+
+## Mental Model
+
+pooler ไม่ใช่ cache และไม่ใช่ proxy ที่ทำให้ Postgres เร็วขึ้น — มันคือ **ห้องรอที่แลกความขาดแคลนแบบหนึ่งกับอีกแบบหนึ่ง** direct connection ขาดแคลน (`max_connections` ของ Postgres เอง) ส่วน pooled client slot ค่อนข้างเหลือเฟือเมื่อเทียบกัน (`max_client_conn = 100` ที่นี่ พิสูจน์ข้างบน) transaction mode ซื้อความเหลือเฟือนั้นมาด้วยการคืน backend connection จริงทันทีที่ transaction จบ ซึ่งเป็นเหตุผลตรงที่ทำให้อะไรก็ตามที่พึ่งพา state ที่อยู่รอด *ข้าม* transaction บน backend เดียวกัน — prepared statement, session variable, `LISTEN`/`NOTIFY` — ไม่สามารถสมมติว่าใช้ได้เลย พิสูจน์ข้างบนแล้วด้วย error จริง ไม่ใช่สมมติฐาน
+
+## Trade-offs
+
+- **Transaction mode ให้ pool เล็ก ๆ ตายตัวของ Postgres connection จริง รองรับ client อายุสั้นพร้อมกันได้มากกว่ามาก** — **แลกมาด้วย state ระดับ session ไม่รอดข้าม statement** พิสูจน์ข้างบนแล้ว: prepared statement ที่สร้างใน transaction หนึ่งหายไปแล้วตอน transaction ถัดไป
+- **direct connection (ตัวแทน local ของ session mode ในบทนี้) ให้ feature ของ Postgres ครบทุกอย่าง รวมถึง prepared statement** — **แลกมาด้วยการกิน backend connection ที่ขาดแคลนจริงของ Postgres ไว้หนึ่งตัวตลอดเวลาที่มันเปิดอยู่** ทรัพยากรตัวเดียวกันเป๊ะ ๆ ที่บทนี้เปิดเรื่องไว้ว่ามีจำกัด
+- **wire protocol แบบ compatible กับ PgBouncer ของ Supavisor ทำให้ tooling เดิมยังใช้งานได้โดยแก้น้อยที่สุด** — **แลกมาด้วยรายละเอียดที่งงเมื่อดูจริง ๆ**: ชื่อ role `pgbouncer` ใน `pg_stat_activity`/`_supavisor.users` พิสูจน์ข้างบนแล้ว ซึ่งไม่เกี่ยวอะไรกับ PgBouncer ที่กำลังรันจริงเลย
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"Transaction mode ก็แค่ default ที่ช้ากว่าและปลอดภัยกว่า — session mode ดีกว่าเสมอถ้าจ่ายไหว"** ถูกหักล้างด้วยเลขคณิตของ pool size ข้างบน: "ดีกว่า" ของ session mode แลกมาด้วยการกิน backend connection ที่ขาดแคลนจริงหนึ่งตัวต่อ client ตลอดเวลาที่ client นั้นต่ออยู่ ซึ่งตรงกับสิ่งที่ไม่ scale กับรูปแบบ traffic แบบ serverless เป๊ะ ๆ
+- **"local stack นี้พิสูจน์ session mode ได้ด้วย เพราะแค่ใช้ direct connection ก็พอ"** บอกตามตรงไว้ข้างบน: local CLI stack ตั้งค่า Supavisor ด้วย `pool_mode` เดียวในแต่ละครั้ง (`transaction` ที่นี่) — ไม่มี port session-mode ของ Supavisor local ให้ test จริง direct connection เป็นตัวแทนที่สมเหตุสมผลของ *พฤติกรรม* ไม่ใช่ code path เดียวกันเป๊ะที่ port session-mode ของ hosted pooler รันจริง
+- **"IPv4/IPv6 สำคัญแค่กับ infrastructure เก่า ๆ เท่านั้น"** cite จากเอกสารของ Supabase เองข้างบน: direct connection เข้า Postgres แบบ hosted ต้องการ IPv6 (หรือ add-on เสียเงิน) วันนี้ ซึ่งเป็นเหตุผลตรงที่ session mode แบบ IPv4-only ของ Supavisor ถูกระบุว่าเป็นทางเลือกจริงและปัจจุบันสำหรับ environment ที่มีแค่ IPv4 — ไม่ใช่เรื่อง legacy
+
 <Callout title="สรุปหนึ่งบรรทัด">
-Postgres มีเพดาน concurrent connection ตายตัว และ **Supavisor** คือ pooler ของ Supabase ที่อยู่ด้านหน้าเพื่อไม่ให้ client ฝั่ง serverless กับ edge ไปชนเพดานนั้นตรง ๆ ใช้ **transaction mode** (port `6543`) สำหรับกรณีทั่วไปที่มี client อายุสั้นจำนวนมากอย่าง Edge Function โดยยอมรับว่าไม่รองรับ prepared statement ส่วน **session mode** (port `5432`) เก็บไว้ใช้กับ process อายุยืนหรืออะไรก็ตามที่ต้องการ feature ระดับ session ของ Postgres แบบเต็ม ๆ จริง ๆ โดยรู้ไว้ว่า client แต่ละตัวที่นั่นจะถือ connection เฉพาะตัวไว้ตลอดเวลาที่ยังต่ออยู่
+Postgres มีเพดาน concurrent connection ตายตัว และ **Supavisor** คือ pooler ของ Supabase ที่อยู่ด้านหน้าเพื่อไม่ให้ client ฝั่ง serverless กับ edge ไปชนเพดานนั้นตรง ๆ ใช้ **transaction mode** (port `6543` พิสูจน์ข้างบนว่าเป็น `55329` บน local stack นี้) สำหรับกรณีทั่วไปที่มี client อายุสั้นจำนวนมากอย่าง Edge Function โดยยอมรับว่าไม่รองรับ prepared statement — พิสูจน์ข้างบนด้วย error จริง `prepared statement "..." does not exist` ภายใต้ pool contention จริง ส่วน **session mode** (port `5432` หรือ direct connection เป็นตัวแทน local ของบทนี้) เก็บไว้ใช้กับ process อายุยืนหรืออะไรก็ตามที่ต้องการ feature ระดับ session ของ Postgres แบบเต็ม ๆ จริง ๆ โดยรู้ไว้ว่า client แต่ละตัวที่นั่นจะถือ connection เฉพาะตัวไว้ตลอดเวลาที่ยังต่ออยู่ Supavisor เองรันมาตั้งแต่ปลายปี 2023 แทนที่ PgBouncer แบบ hosted ที่ deprecated เต็มตัววันที่ 15 มกราคม 2024 — และเป็น IPv4-only ทำให้ session mode ของมันเป็นทางเลือกที่มีเอกสารรองรับสำหรับ environment ที่มีแค่ IPv4 ซึ่ง direct connection (IPv6-only ถ้าไม่มี add-on เสียเงิน) เข้าไม่ถึง
 </Callout>
 
 export const quizConnPooling = [
@@ -75,6 +193,7 @@ export const quizConnPooling = [
       'ทำให้ไม่ต้องใช้ anon key อีกต่อไป',
     ],
     answer: 1,
+    explain: 'ตัวเลข pool size ข้างบน (backend connection 20 ตัวรองรับ client connection ได้ถึง 100 ตัว) คือ trade-off นี้ในรูปธรรม',
   },
   {
     q: 'Supavisor transaction mode ใช้ port ไหน และไม่รองรับอะไร',
@@ -85,6 +204,7 @@ export const quizConnPooling = [
       'Port 6543 และไม่รองรับคำสั่ง SELECT',
     ],
     answer: 1,
+    explain: 'พิสูจน์ข้างบนด้วย error จริง: PREPARE ที่ยิงผ่าน pooler แล้ว EXECUTE ภายใต้ contention จริง พังด้วย "prepared statement ... does not exist" — SELECT และ query ปกติอื่น ๆ ใช้ได้ปกติ',
   },
   {
     q: 'ทำไม session mode ถึง scale ไปถึง client อายุสั้นจำนวนมหาศาลพร้อมกันไม่ได้แบบที่ transaction mode ทำได้',
@@ -95,6 +215,7 @@ export const quizConnPooling = [
       'session mode ต้องใช้ database engine คนละตัว',
     ],
     answer: 1,
+    explain: 'นี่คือเหตุผลตรงที่ proof PREPARE/EXECUTE บน direct connection ข้างบนไม่พังเลยไม่ว่า concurrency เท่าไหร่ — backend เดียวตลอด session ซึ่งก็เป็นสิ่งที่ทำให้มันไม่ scale ด้วย',
   },
   {
     q: 'Edge Function ควรใช้โหมดไหนโดยทั่วไป และทำไม',
@@ -105,6 +226,18 @@ export const quizConnPooling = [
       'session mode เพราะ Edge Function ต้องการ prepared statement',
     ],
     answer: 1,
+    explain: 'นี่คือ pattern เดียวกับที่ module Edge Functions พิสูจน์ว่าใช้ได้จริง: pooler URL แบบ transaction-mode บวก prepare: false',
+  },
+  {
+    q: 'config.toml ของ local stack นี้ตั้ง `[db.pooler] pool_mode = "transaction"` โดยไม่มี port session-mode แยก สิ่งนี้แปลว่าอะไรสำหรับการ test พฤติกรรม session-mode บน local',
+    options: [
+      'test session mode บน local ไม่ได้เลย แม้แต่ในเชิงแนวคิด',
+      'local CLI รัน Supavisor pool_mode เดียวในแต่ละครั้ง direct Postgres connection ถูกใช้เป็นตัวแทนเพราะมี property ที่สำคัญเหมือนกัน (backend เดียวถือไว้ตลอดชีวิตของ connection) แม้จะไม่ใช่ port session-mode ของ Supavisor ตรง ๆ',
+      'port 55329 รองรับทั้งสองโหมดเงียบ ๆ แล้วแต่ query',
+      'session mode มีอยู่แค่บน Windows เท่านั้น',
+    ],
+    answer: 1,
+    explain: 'บอกตรง ๆ ไว้ข้างบนว่าเป็นความต่างจริงระหว่าง local กับ hosted — คอร์สนี้ไม่แสร้งว่า local stack มีสิ่งที่มันไม่มี',
   },
 ];
 
