@@ -1,6 +1,6 @@
 ---
 title: 'The supabase-js Client'
-description: 'วิธี initialize supabase-js ด้วย anon key generate typed database schema ด้วย CLI และเหตุผลที่ client instance เดียวมักพอสำหรับทั้งแอป'
+description: 'วิธี initialize supabase-js option ทุกตัวของ createClient ที่มีผลจริง สัญญา { data, error } ที่พิสูจน์แล้วว่าไม่ throw สิ่งที่ออกไปบน wire จริง ๆ และการ pin version ทั่วทั้ง SDK'
 sidebar:
   order: 1
 ---
@@ -8,11 +8,12 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
 
-`createClient` สร้าง object เดียวที่แอปของคุณใช้คุยกับ Postgres, Auth, Storage และ Realtime — และควร initialize ด้วย public `anon` key เสมอ ไม่ใช่ `service_role` key เพราะสิ่งที่ปกป้องข้อมูลจริง ๆ คือ row level security policy ใน schema ไม่ใช่ความลับของ key ตัวนี้
+`createClient` สร้าง object เดียวที่แอปของคุณใช้คุยกับ Postgres, Auth, Storage และ Realtime ควร initialize ด้วย public `anon` key เสมอในโค้ดฝั่ง client — ไม่ใช่ `service_role` key — เพราะ **row level security (RLS)** ไม่ใช่ความลับของ key ตัวนี้ คือสิ่งที่ปกป้องข้อมูลจริง และทุก option ที่ส่งเข้าไป (`auth`, `db`, `global`, `realtime`) มีผลจริงเฉพาะเจาะจง พิสูจน์ได้ ไม่ใช่แค่ configuration ที่ดูดีเฉย ๆ
 
 ## Initialize client
 
@@ -55,11 +56,11 @@ const { data, error } = await supabase
   .select('id, title, year');
 ```
 
-จากจุดนี้ไป พิมพ์ชื่อ column ผิด, select table ที่ไม่มีอยู่จริง หรือส่ง payload ของ `insert` ที่ขาด field ที่จำเป็น จะกลายเป็น TypeScript error ตอน compile แทนที่จะเป็นเรื่องเซอร์ไพรส์ตอน runtime พอ schema เปลี่ยน ก็แค่รัน CLI command เดิมซ้ำเพื่อ regenerate `database.types.ts` แล้ว type ของทั้งแอปก็จะ sync กับ database ทันที
+พอ schema เปลี่ยน ก็แค่รัน CLI command เดิมซ้ำเพื่อ regenerate `database.types.ts` แล้ว type ของทั้งแอปก็จะ sync กับ database ทันที — บทถัดไปจะพิสูจน์เต็ม ๆ ว่าถ้าลืมทำสิ่งนี้จะเกิดอะไรขึ้น ทั้งสองด้านเลย
 
-## Client เดียว สร้างครั้งเดียว
+## Singleton ในฝั่ง browser, per-request ฝั่ง server
 
-`supabase-js` client มักจะถูกสร้างแค่ครั้งเดียวแล้ว reuse ทั่วทั้งแอป — แบบ singleton — แทนที่จะสร้างใหม่ทุก request หรือทุก component render
+`supabase-js` client มักจะถูกสร้างแค่ **ครั้งเดียว** ในฝั่ง browser แล้ว reuse ทั่วทั้งแอป — แบบ singleton — แทนที่จะสร้างใหม่ทุก component render
 
 ```typescript
 // lib/supabase.ts — created once, imported wherever it is needed
@@ -72,19 +73,274 @@ export const supabase = createClient<Database>(
 );
 ```
 
-มีเหตุผลจริงสองข้อ ข้อแรก client เก็บ **session state** ไว้ใน memory (และใน local storage) การสร้างใหม่จะทิ้งหรือทำ state นั้นซ้ำซ้อน แล้วอาจทำให้ auth listener ทำงานไม่สอดคล้องกัน ข้อสอง client จัดการ network resource ของตัวเอง รวมถึง WebSocket connection ที่ Realtime ใช้ — สร้าง client ใหม่ทุก component แปลว่าได้ connection ซ้ำซ้อนแทนที่จะเป็น connection เดียวที่แชร์กันและ reuse ได้ การ import instance เดียวกันไปใช้ทุกที่แก้ปัญหาทั้งสองข้อนี้พร้อมกัน
+มีเหตุผลจริงสองข้อ ข้อแรก client เก็บ **session state** ไว้ใน memory (และใน browser ก็เก็บใน `localStorage` ด้วย) การสร้างใหม่จะทิ้งหรือทำ state นั้นซ้ำซ้อน แล้วอาจทำให้ auth listener ทำงานไม่สอดคล้องกัน ข้อสอง client จัดการ network resource ของตัวเอง รวมถึง WebSocket connection ที่ Realtime ใช้ — สร้าง client ใหม่ทุก component แปลว่าได้ connection ซ้ำซ้อนแทนที่จะเป็น connection เดียวที่แชร์กันและ reuse ได้
 
-<Mermaid title="From your Postgres schema to a typed query builder" code={jsClientDiagram} />
+ฝั่ง server มีข้อจำกัดตรงข้ามกัน คือต้องรองรับ request ของ **user ที่ต่างกัน** พร้อมกันใน process เดียวกัน ดังนั้น **singleton ตัวเดียวที่แชร์กันจะทำให้ session รั่วข้าม user** ทางแก้ — ที่พิสูจน์ไว้แล้วในบท [Sessions and JWTs](/supabase/th/auth-and-row-level-security/sessions-and-jwts/) ของโมดูล Auth — คือ `createServerClient` จาก `@supabase/ssr` ที่สร้างใหม่ทุก request จาก cookie ของ request นั้นเอง
+
+```typescript
+// src/lib/supabase-server.ts
+import { createServerClient } from '@supabase/ssr';
+import { cookies } from 'next/headers';
+
+export async function createClient() {
+  const cookieStore = await cookies();
+
+  return createServerClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    {
+      cookies: {
+        getAll() {
+          return cookieStore.getAll();
+        },
+        setAll(cookiesToSet) {
+          try {
+            cookiesToSet.forEach(({ name, value, options }) =>
+              cookieStore.set(name, value, options)
+            );
+          } catch {
+            // called from a Server Component with no way to set cookies —
+            // safe to ignore if middleware is refreshing the session
+          }
+        },
+      },
+    }
+  );
+}
+```
+
+อ้างอิง: [supabase.com/docs/guides/auth/server-side/creating-a-client](https://supabase.com/docs/guides/auth/server-side/creating-a-client) กติกาง่าย ๆ คือ **singleton ในฝั่ง browser** (user เดียว อายุ process เดียว) **client ต่อ request ในฝั่ง server** (หลาย user แชร์ process เดียวกัน) version ของ package ที่ติดตั้งคู่กับ `@supabase/supabase-js@2.117.2` ของคอร์สนี้ ตรวจด้วย `npm view @supabase/ssr version` คือ **`0.12.7`**
+
+## Config client: `auth`, `global`, และ `db`
+
+argument ตัวที่สามของ `createClient` ถูกแบ่งเป็น sub-object เพื่อไม่ให้ option จาก sub-library ต่างกันชนชื่อกัน (ตรวจสอบกับ source of truth ปัจจุบัน คือ blog ประกาศ v2 ของ `@supabase/supabase-js` เอง):
+
+```typescript
+const supabase = createClient(apiURL, apiKey, {
+  auth: {
+    persistSession: true,       // store the session (localStorage in a browser; in-memory in Node — proved next lesson)
+    autoRefreshToken: true,     // silently refresh the access token before it expires
+    detectSessionInUrl: true,   // parse a PKCE `?code=` or implicit `#access_token` from the URL on load
+    flowType: 'pkce',           // 'pkce' (default, recommended) or 'implicit' — see the next lesson
+  },
+  db: {
+    schema: 'public',           // which Postgres schema .from() targets by default
+  },
+  global: {
+    headers: { 'x-app-version': '1.4.0' }, // merged into every request's headers
+    fetch: customFetch,                    // override the fetch implementation (proved below)
+  },
+  realtime: {
+    params: { eventsPerSecond: 10 },
+  },
+});
+```
+
+`persistSession`/`autoRefreshToken`/`detectSessionInUrl` ทั้งหมดเป็น default ที่ **เน้นฝั่ง browser** (`true`) ที่ client แบบ per-request ฝั่ง server มักจะปิด — ตัวอย่าง `@supabase/ssr` ข้างบนตั้ง `persistSession: true` แต่อ่าน/เขียนผ่าน cookie แทน `localStorage` และ server client ทั่วไปที่ไม่มี `cookies` adapter เลยควรตั้ง `autoRefreshToken: false`/`detectSessionInUrl: false` เพราะไม่มี tab ที่อยู่นานให้ background refresh timer มีความหมาย และไม่มี URL bar ให้ parse code ออกมา `db.schema` คือสิ่งที่ `supabase.schema('other')` override เป็นรายครั้ง พิสูจน์ด้านล่าง `global.headers` merge เข้าไปใน **ทุก** request จาก client ตัวนี้ — พิสูจน์ด้านล่างเช่นกัน รวมถึงจุดพลาดจริงเมื่อเอาไปใช้กับอะไรที่ไม่ควร static
+
+## สัญญา `{ data, error }`: พิสูจน์ ไม่ใช่แค่กล่าวอ้าง
+
+ทุก call ของ `supabase-js` resolve เป็น `{ data, error }` — ไม่ throw แม้จะเป็น error ที่ควรจะเป็น HTTP status 4xx/5xx พิสูจน์ด้วย table ที่ไม่เคยมีอยู่ใน schema นี้เลย:
+
+```ts
+// src/cli-client-never-throws.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!);
+
+try {
+  const { data, error } = await supabase.from('cli_nonexistent_table').select('*');
+  console.log('never-throws: data =', data, '| error.code =', error?.code, '| error.message =', error?.message);
+} catch (e) {
+  console.log('THREW (would be unexpected):', e);
+}
+```
+
+```text
+never-throws: data = null | error.code = PGRST205 | error.message = Could not find the table 'public.cli_nonexistent_table' in the schema cache
+```
+
+`try/catch` ไม่ทำงานเลย `error` ที่มีค่าจริงกลับมาเป็น resolved value ปกติ — นี่คือเหตุผลที่ pattern มาตรฐานทั่วทั้งคอร์สนี้คือเช็ค `error` ตรง ๆ ไม่เคยห่อ call ด้วย `try/catch` เพื่อจับ failure
+
+เวลาที่ *ต้องการ* ให้ throw จริง ๆ — เช่นให้ error boundary หรือ `try/catch` ด้านนอกจัดการ call หลาย ๆ ตัวพร้อมกัน — `.throwOnError()` เปิดให้ call เดียว throw กลับมาได้:
+
+```ts
+// src/cli-client-throw-on-error.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!);
+
+try {
+  await supabase.from('cli_nonexistent_table').select('*').throwOnError();
+  console.log('throwOnError did not throw (unexpected)');
+} catch (e: any) {
+  console.log('throwOnError threw ->', e.constructor?.name, ':', e.message);
+}
+```
+
+```text
+throwOnError threw -> PostgrestError : Could not find the table 'public.cli_nonexistent_table' in the schema cache
+```
+
+ค่าที่ throw ออกมาคือ `PostgrestError` object ตัวเดียวกันเป๊ะกับที่ปกติจะถูกคืนมาเป็น `error` — `.throwOnError()` เปลี่ยนวิธีส่งมอบ ไม่ได้เปลี่ยน shape
+
+## ยกเลิก query ที่กำลังทำงานอยู่ด้วย `AbortSignal`
+
+query builder call ทุกตัวรับ `.abortSignal(signal)` ผูกกับ `AbortController` มาตรฐาน:
+
+```ts
+// src/cli-client-abort-signal.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!);
+
+const controller = new AbortController();
+controller.abort(); // abort before the request is even sent
+const { error } = await supabase.from('cli_nonexistent_table').select('*').abortSignal(controller.signal);
+console.log('aborted request -> error.name =', error?.name, '| message =', error?.message);
+```
+
+```text
+aborted request -> error.name = undefined | message = AbortError: This operation was aborted
+```
+
+ยังคงเป็น `{ data, error }` ไม่ใช่ throw — request ที่ถูก abort ก็แค่ error อีกแบบหนึ่ง ส่งมอบด้วยวิธีเดียวกับ failure อื่น ๆ ทั้งหมด (postgrest-js ห่อ `AbortError` ดิบเข้า `PostgrestError` shape ของตัวเอง จึงเป็นเหตุผลที่ `error.name` กลับมาเป็น `undefined` ในขณะที่ `error.message` มีข้อความ `AbortError:` เดิมอยู่ — การห่อไม่ได้โยน error เดิมต่อ แต่ re-package ใหม่) นี่คือกลไกที่ React Query และ library แบบเดียวกันใช้ยกเลิก query เมื่อ component unmount หรือ dependency เปลี่ยนกลางคัน (ยืนยันจาก reference example ของ `@supabase/supabase-js` เองที่โชว์ pattern `if (signal) query = query.abortSignal(signal)` แบบนี้เป๊ะ ๆ กับ `AbortSignal` จาก caller อย่าง React Query)
+
+## สิ่งที่ออกไปบน wire จริง ๆ
+
+query builder ของ `supabase-js` เป็น layer typed บาง ๆ เหนือ HTTP call ธรรมดาไปหา PostgREST การส่ง `global.fetch` แบบ custom เข้าไป — option เดียวกับตารางด้านบน — ทำให้เห็นชัดด้วยการ intercept request จริงก่อนที่จะถูกส่งไป:
+
+```ts
+// src/cli-client-wire-shape.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+let seen: { method: string; url: string; headers: Record<string, string> } | undefined;
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!, {
+  global: {
+    fetch: (input, init) => {
+      const url = typeof input === 'string' ? input : (input as Request).url;
+      const headers = Object.fromEntries(new Headers(init?.headers).entries());
+      seen = { method: init?.method ?? 'GET', url, headers };
+      return fetch(input, init);
+    },
+  },
+});
+
+await supabase.from('cli_nonexistent_table').select('id,title').eq('id', 1).limit(5);
+console.log(JSON.stringify(seen, (k, v) => (k === 'apikey' || k === 'authorization' ? '<redacted>' : v), 2));
+```
+
+```text
+{
+  "method": "GET",
+  "url": "http://127.0.0.1:55321/rest/v1/cli_nonexistent_table?select=id%2Ctitle&id=eq.1&limit=5",
+  "headers": {
+    "accept-profile": "public",
+    "apikey": "<redacted>",
+    "authorization": "<redacted>",
+    "x-client-info": "supabase-js/2.117.2; runtime=node; runtime-version=24.13.0"
+  }
+}
+```
+
+ไม่มีเวทมนตร์อะไรเลย `.select('id,title').eq('id', 1).limit(5)` compile ออกมาเป็น `GET` ธรรมดาที่มี `select`, `id` และ `limit` เป็น **query parameter** — request shape ของ PostgREST แบบเดียวกับที่ตัวอย่าง `curl` ดิบ ๆ ของโมดูล auto-generated-api สร้างขึ้นเองด้วยมือ `accept-profile: public` คือ `db.schema` จากตารางด้านบน ที่กลายเป็นรูปธรรม — มันบอก PostgREST ว่าจะค้นหา schema ไหน และสลับด้วย `.schema('other')` พิสูจน์ถัดไป `x-client-info` คือ SDK บอกตัวตนตัวเอง รวม version และ runtime จริง ๆ — ข้อมูล version/runtime ฟรี ๆ ที่เห็นได้ในทุก request โดยไม่ต้องเพิ่มอะไรเอง
+
+## หลาย schema: `supabase.schema('other')`
+
+`db.schema` ตั้ง schema *default*; `.schema('name')` override เป็นรายครั้ง แต่ schema ต้องอยู่ใน allowlist ของ schema ที่ expose ของโปรเจกต์ — `api.schemas` ใน `config.toml` — ไม่งั้น PostgREST จะปฏิเสธทันที ก่อนที่จะเช็คด้วยซ้ำว่า schema นั้นมีอยู่จริงไหม:
+
+```ts
+// src/cli-client-unexposed-schema.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!);
+const { error, status } = await supabase.schema('cli_client_dev').from('whatever').select('*');
+console.log('status =', status, '| error.code =', error?.code, '| error.message =', error?.message);
+```
+
+```text
+status = 406 | error.code = PGRST106 | error.message = Invalid schema: cli_client_dev
+```
+
+`PGRST106` จริง ๆ ไม่ใช่ error แบบ table-not-found — PostgREST เช็ค allowlist ก่อน local stack ของคอร์สนี้ expose แค่ `["public", "graphql_public"]` (block `[api]` ใน `tools/probe/supabase/config.toml` — ค่า default ของ CLI คือ `public` และ `graphql_public` เท่านั้น) การเพิ่ม schema ต้องแก้ `api.schemas` ใน `config.toml` แล้ว restart stack — [supabase.com/docs/guides/api/using-custom-schemas](https://supabase.com/docs/guides/api/using-custom-schemas) — บทนี้ไม่ได้ restart shared local stack เพื่อพิสูจน์ success path ดังนั้นให้เชื่อ behavior ของ schema ที่เปิดใช้แล้ว (response `{ data, error: null }` ปกติเมื่อ schema อยู่ใน list) ตามคำของ docs แทนการพิสูจน์แบบ local
+
+## Browser vs. Node: `fetch` กับ `WebSocket`
+
+`supabase-js@2.117.2` **ไม่** bundle fetch หรือ WebSocket polyfill มาด้วย — `package.json` ของตัวมันเองมีแค่ package พี่น้อง `@supabase/*` ทั้งห้าตัวเป็น dependency ไม่มี `cross-fetch`, `node-fetch`, `isows` หรือ `ws` เลย มันพึ่ง global ของ runtime เองล้วน ๆ:
+
+```text
+node -e "console.log(typeof globalThis.WebSocket, typeof globalThis.fetch)"
+function function
+```
+
+ทั้งคู่เป็น `function` — จริงบน Node 24 (runtime ของคอร์สนี้) — เพราะ Node มี global `fetch` มาตั้งแต่ Node 18 และ global `WebSocket` มาตั้งแต่ Node 22 ส่วน browser มีทั้งคู่มาตลอด module `websocket-factory` ของ Realtime เอง อ่านตรงจาก package ที่ติดตั้งจริง เช็คหา global `WebSocket` แล้วถ้าไม่เจอจะ fail ด้วยข้อความที่ specific และแก้ได้จริง แทนที่จะเป็น `undefined is not a function` ที่งง ๆ:
+
+```text
+# tools/probe/node_modules/@supabase/realtime-js/dist/main/lib/websocket-factory.js (installed 2.117.2, read directly)
+"Node.js detected but native WebSocket not found."
+"Ensure you are running Node.js 22+ or provide a WebSocket implementation via the transport option."
+```
+
+กติกาใช้งานจริง: บน Node 22+ กับ browser สมัยใหม่ทุกตัว Realtime กับ REST client ทำงานได้โดยไม่ต้อง setup เพิ่ม บน Node รุ่นเก่ากว่า (หรือ environment แปลก ๆ อย่าง Cloudflare Workers ที่ factory ตัวเดียวกันตรวจเจอและรายงานว่าไม่รองรับ WebSocket client โดยเฉพาะ) ให้ส่ง `WebSocket` implementation เข้าไปตรง ๆ ผ่าน `realtime: { transport: WebSocket }` จาก package อย่าง `ws` หรือส่ง `global.fetch` แบบ custom สำหรับฝั่ง REST/Auth/Storage
+
+<Mermaid title="จาก Postgres schema ไปเป็น typed query builder และสิ่งที่ออกจาก process จริง ๆ" code={jsClientDiagram} />
 
 export const jsClientDiagram = `flowchart LR
   schema[("Your Postgres schema")] --> gen["supabase gen types typescript"]
   gen --> types["Generated Database type (database.types.ts)"]
-  types --> client["createClient<Database>()"]
-  client --> query["Typed .from() queries with autocomplete"]`;
+  types --> client["createClient<Database>(url, anonKey, options)"]
+  client --> query[".from().select() — a typed builder"]
+  query --> wire["A plain fetch(): GET .../rest/v1/table?select=... with apikey + Authorization headers"]`;
 
 <Callout title="สรุปหนึ่งบรรทัด">
-สร้าง client ด้วย **`createClient`** และใช้ public **`anon` key** เสมอในโค้ดฝั่ง browser หรือ mobile — **RLS** ไม่ใช่ความลับของ key คือสิ่งที่ปกป้องข้อมูลจริง ส่วน **`service_role` key** bypass RLS และต้องอยู่ฝั่ง server เท่านั้น รัน **`supabase gen types typescript --project-id <ref> > database.types.ts`** แล้วเอา `Database` type ที่ได้ไปเป็น generic ให้ `createClient<Database>()` เพื่อได้ compile-time checking และ autocomplete บนทุก `.from()` call สร้าง client แค่ **ครั้งเดียว** แล้ว reuse instance เดียวกันทุกที่ เพราะเก็บ session state และจัดการ network connection ที่แชร์กันอยู่
+สร้าง client ด้วย **`createClient`** และใช้ public **`anon` key** เสมอในโค้ดฝั่ง browser หรือ mobile — **RLS** ไม่ใช่ความลับของ key คือสิ่งที่ปกป้องข้อมูล Option ถูกแบ่งตาม sub-library (`auth`, `db`, `global`, `realtime`) — `db.schema`/`.schema()` เลือก schema เป้าหมาย (คุมด้วย allowlist `api.schemas` ใน `config.toml` พิสูจน์ด้วย `PGRST106` จริง) `global.headers`/`global.fetch` merge เข้าและ intercept **ทุก** request ได้ ทุก call resolve เป็น **`{ data, error }`** และไม่ throw (พิสูจน์ด้วย `PGRST205` จริง) นอกจากเปิด **`.throwOnError()`**; `.abortSignal()` ผูกกับ `AbortController` แบบเดียวกัน client แบบ **singleton** เหมาะกับ browser; `createServerClient` ของ `@supabase/ssr` แบบ **per-request** เหมาะกับ server ไม่งั้น session จะรั่วข้าม user `supabase-js@2.117.2` ไม่ bundle fetch/WebSocket polyfill มาด้วย — ต้องมี Node 18+/22+ (fetch/WebSocket) หรือ browser ไม่งั้นต้องส่ง `realtime.transport` เอง
 </Callout>
+
+## อ่านโค้ดที่ AI สร้าง
+
+AI assistant ที่ถูกขอให้ "ทำให้ทุก request จาก client นี้ authenticated เสมอ" สร้างโค้ดนี้:
+
+<SpotTheBug lang="ts" code={`// src/lib/supabase.ts — created once, imported everywhere
+import { createClient } from '@supabase/supabase-js';
+import type { Database } from './database.types';
+
+const session = await getStoredSession(); // read whatever token is on disk right now
+
+export const supabase = createClient<Database>(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_ANON_KEY!,
+  {
+    global: {
+      headers: { Authorization: \`Bearer \${session?.access_token}\` },
+    },
+  }
+);
+`}>
+ดูเหมือนจะแนบ token ของ user ที่ signed-in เข้าไปทุก request ได้ถูกต้อง — และมันก็แนบจริง สำหรับ token ตัวเดียว ตลอดกาล `global.headers` ถูก merge เข้าไป **ครั้งเดียว** ตอน `createClient` ทำงาน แล้ว reuse ทุก call ถัดไปจาก singleton ตัวนี้ ไม่ได้ถูก re-evaluate ตอน sign-in, sign-out หรือตอน token refresh อัตโนมัติที่ตารางค่า config ของบทนี้ระบุว่าเป็น default (`autoRefreshToken: true`) พิสูจน์ตรง ๆ ว่า: สร้าง client ด้วย `global.headers.Authorization` แบบ static แล้ว sign-in ผ่าน client **ตัวเดียวกัน** ด้วย `supabase.auth.signInWithPassword()` แล้วตรวจ header ที่ออกไปจริง (เทคนิค wire-inspection เดียวกับในบทนี้) จะเห็นว่า **ค่าเก่าก่อน sign-in ยังถูกส่งอยู่** — sign-in สำเร็จและอัปเดต session state ของ `supabase.auth` เองแล้ว แต่ header แบบ static ไม่รู้เรื่องด้วยเลย นี่คือ pattern เดียวกับที่ตัวอย่าง `global.headers` ของ docs เองใช้ถูกต้องสำหรับ Edge Function (`Authorization: req.headers.get('Authorization')!` ตั้งครั้งเดียวต่อการเรียก function ที่อายุสั้น ๆ) — bug คือเอา pattern "ตั้งครั้งเดียว" แบบเดียวกันไปใช้กับ singleton ที่อายุยืน ที่ auth state ควรจะเปลี่ยนได้ตลอดอายุของมัน ทางแก้คือแค่ไม่ต้องตั้ง `global.headers.Authorization` เลยใน client ปกติ `supabase-js` แนบ token ของ session ปัจจุบันให้ทุก request อัตโนมัติอยู่แล้ว อ่านใหม่สดทุกครั้ง ไม่ต้อง override ผ่าน `global.headers` เลย
+</SpotTheBug>
+
+## Mental Model
+
+`createClient` ไม่ได้ "login" เข้าอะไรทั้งนั้น — มันสร้าง HTTP/WebSocket client แบบ typed บาง ๆ แล้วผูก sub-client ไม่กี่ตัว (`.auth`, `.storage`, `.functions`, `.realtime` และ query builder ของ PostgREST จาก `.from()`) เข้ากับ configuration เดียวที่แชร์กัน ทุก option ที่ส่งเข้าไปจริง ๆ ก็แค่คำถามว่า: ค่านี้ไปอยู่ใน request ตรงไหน แล้วถูกคำนวณใหม่บ่อยแค่ไหน `db.schema` กับ `global.headers` คือค่าที่ bake เข้าไปตอนสร้างแล้ว reuse; token ของ `Authorization` ใน session เป็นข้อยกเว้นเดียวที่ตั้งใจ *ไม่* bake เข้าไป แต่อ่านใหม่สดจาก live state ของ `supabase.auth` ทุก request — นี่คือเหตุผลที่ header `Authorization` แบบ static ที่เขียนเอง (`SpotTheBug` ของบทนี้) สู้กับ design ของ client เองแทนที่จะทำงานร่วมกัน พอมองว่า `createClient` เป็น "configuration object เดียว reuse ข้ามทุก request เท่าที่เป็นไปได้" ที่เหลือ — `persistSession`, `autoRefreshToken`, `global.fetch` — ก็แค่คำตอบของ "state เก็บไว้ที่ไหน แล้วใครมี intercept request ก่อนออกจาก process ได้บ้าง"
+
+## Trade-off
+
+- **Singleton client ฝั่ง browser เลี่ยง WebSocket connection ซ้ำซ้อนและทำให้ auth listener สอดคล้องกัน** — แลกกับการผิดจริง ๆ บน server ที่ process เดียวรองรับหลาย user แล้ว client ที่แชร์กันจะทำให้ session รั่วข้าม user
+- **`global.fetch`/`global.headers` เป็นจุด intercept ที่ทรงพลังและง่าย** (พิสูจน์ด้านบนทั้งสำหรับ wire inspection และ bug ของ `Authorization` แบบ static) — แลกกับการใช้ผิดง่ายกับอะไรที่ควรจะ dynamic เพราะถูก evaluate แค่ครั้งเดียว ไม่ใช่ต่อ request
+- **`.throwOnError()` ให้ call เดียวเลือก throw exception เพื่อใช้กับ error boundary หรือ `try/catch` รอบ call หลายตัว** — แลกกับ call ตัวนั้นทำงานต่างจาก `{ data, error }` call อื่น ๆ ในโค้ดเดียวกัน ซึ่งเป็นเหตุผลที่คอร์สนี้ default ให้เช็ค `error` ตรง ๆ ทุกที่
+- **ไม่ bundle fetch/WebSocket polyfill ทำให้ package เล็กลงและเลี่ยง transitive dependency สองตัว** — แลกกับ runtime floor จริงแต่แคบ (Node 18+ สำหรับ fetch, Node 22+ สำหรับ WebSocket หรือต้องส่ง `transport`/`fetch` เอง)
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"call ของ supabase-js ที่ fail จะ throw ต้องห่อด้วย try/catch"** พิสูจน์แล้วว่าผิด: `PGRST205` จริงของ table ที่ไม่มีอยู่ resolve เป็น `{ data: null, error }` ปกติ `try/catch` ไม่ทำงานเลย เช็ค `error` ตรง ๆ แล้วใช้ `.throwOnError()` เฉพาะตอนที่ตั้งใจอยากได้ผลตรงข้าม
+- **"`global.headers` คือที่ที่ถูกต้องสำหรับแนบ token ของ user ปัจจุบัน"** พิสูจน์แล้วว่าผิด และพิสูจน์ *เหตุผล* ด้วย: มัน evaluate แค่ครั้งเดียวตอนสร้าง ไม่ใช่ต่อ request — header `Authorization` แบบ static จะอยู่รอดจาก sign-in โดยไม่เปลี่ยน เหมือน `SpotTheBug` ของบทนี้เป๊ะ client แนบ token ของ session ปัจจุบันให้อัตโนมัติอยู่แล้ว `global.headers` มีไว้สำหรับค่าที่ static จริง ๆ ตลอดอายุ client เช่น header app-version คงที่
+- **"`.schema('name')` ใช้ได้กับ schema ชื่อไหนก็ได้ ตราบใดที่มีอยู่จริงใน Postgres"** พิสูจน์แล้วว่าผิด: schema ที่มีอยู่จริงแต่ไม่ได้ expose ถูกปฏิเสธด้วย `PGRST106` ก่อนที่ PostgREST จะเช็คด้วยซ้ำว่ามันมีอยู่ไหม — allowlist `api.schemas` ใน `config.toml` ของโปรเจกต์เป็นด่านแยกต่างหากที่มาก่อน
+- **"`supabase-js` ต้องการ package polyfill fetch/WebSocket บน Node เหมือนเมื่อก่อน"** พิสูจน์แล้วว่าผิดจากการอ่าน `package.json` ของ package ที่ติดตั้งจริง: ไม่มี dependency `cross-fetch`/`isows`/`ws` อีกแล้ว — มันพึ่ง global `fetch` (18+) และ `WebSocket` (22+) ของ Node เอง แล้ว fallback เป็น error message จริงที่แก้ได้ (อ่านตรงจาก source ที่ติดตั้ง) แทน shim ที่ bundle มา เมื่อไม่มีทั้งคู่
 
 export const quizJsClient = [
   {
@@ -96,36 +352,51 @@ export const quizJsClient = [
       'ไม่จำเป็นต้องใช้ key เลยตอน initialize ฝั่ง client',
     ],
     answer: 1,
+    explain: 'RLS บน database ไม่ใช่ความลับของ key คือด่านจริง — anon key ถูกออกแบบมาให้ public และติดไปกับ browser bundle ได้',
   },
   {
-    q: 'ทำไม service_role key ห้ามไปโผล่ในโค้ดฝั่ง client เด็ดขาด',
+    q: 'เรียก supabase-js กับ table ที่ไม่มีอยู่จริง โดยไม่มี try/catch เลย เกิดอะไรขึ้นจริง ๆ',
     options: [
-      'ช้ากว่า anon key',
-      'bypass row level security ทั้งหมด ถ้าหลุดออกไปใครก็อ่านหรือเขียน row ไหนก็ได้',
-      'ใช้ได้แค่จาก Supabase CLI เท่านั้น',
-      'หมดอายุภายในไม่กี่นาทีแล้วจะทำให้แอปพัง',
+      'process crash ด้วย unhandled rejection',
+      'resolve เป็น { data: null, error } ปกติ พิสูจน์แล้วด้วย PGRST106 จริง — call ของ supabase-js ไม่ throw โดย default',
+      'คืน array ว่างเงียบ ๆ โดยไม่มีทางรู้ว่า fail',
+      'throw แบบ synchronous ก่อนที่ await จะ resolve ด้วยซ้ำ',
     ],
     answer: 1,
+    explain: 'พิสูจน์ตรง ๆ: try/catch รอบ call ไม่ทำงานเลย error.code กลับมาเป็น PGRST205 ในฐานะ resolved value ปกติ',
   },
   {
-    q: 'การเอา generated Database type ไปเป็น generic ให้ createClient ได้อะไร',
+    q: 'client ถูกสร้างด้วย global: { headers: { Authorization: `Bearer ${token}` } } แล้วแอป sign-in ผ่าน client ตัวเดียวกัน request ถัดไปส่งอะไรจริง ๆ',
     options: [
-      'request ผ่าน network เร็วขึ้น',
-      'compile-time checking และ autocomplete บน query .from() ที่ตรงกับ schema จริง',
-      'row level security policy อัตโนมัติ',
-      'admin dashboard ในตัว',
+      'session token ใหม่หลัง sign-in เพราะ supabase-js merge header สดทุก request',
+      'token static ตัวเดิมจากตอนสร้าง — พิสูจน์ตรง ๆ ด้วยการ intercept header ที่ออกไปจริงหลัง sign-in',
+      'ไม่มี Authorization header เลย เพราะสองค่าชนกันแล้วหักล้างกัน',
+      'request ที่ส่งไม่สำเร็จเลย',
     ],
     answer: 1,
+    explain: 'global.headers ถูก merge ครั้งเดียวตอนสร้างแล้ว reuse — พิสูจน์ด้วย wire-inspection จริง: ค่าก่อน sign-in ยังถูกส่งอยู่หลัง sign-in สำเร็จบน client เดียวกัน',
   },
   {
-    q: 'ทำไม supabase-js client มักถูกสร้างครั้งเดียวแล้วใช้แบบ singleton',
+    q: 'เรียก .schema(\'cli_client_dev\') กับ schema ที่มีอยู่จริงใน Postgres แต่ไม่อยู่ใน api.schemas ของ config.toml จะได้อะไรกลับมา',
     options: [
-      'เพราะ createClient เรียกได้แค่ครั้งเดียวตลอดอายุ process',
-      'เก็บ session state ไว้ใน memory และจัดการ network connection ที่แชร์กัน สร้างใหม่ทุก request หรือ component จะเปลืองและอาจทำให้ auth state ไม่ sync กัน',
-      'เพราะ TypeScript บังคับให้มี client แค่ตัวเดียวต่อไฟล์',
-      'การ reuse ไม่มีประโยชน์จริง เป็นแค่ความชอบส่วนตัวเรื่อง style',
+      'ผลลัพธ์ว่างเปล่าปกติ เพราะถือว่า schema ไม่มี table',
+      'error PGRST106 "Invalid schema" จริง — allowlist ของ schema ที่ expose ถูกเช็คก่อนที่ PostgREST จะหา schema ด้วยซ้ำ',
+      'request fallback ไปที่ public schema เงียบ ๆ',
+      '500 Internal Server Error โดยไม่มี code เฉพาะ',
     ],
     answer: 1,
+    explain: 'พิสูจน์ตรง ๆ: status 406 จริงพร้อม error.code PGRST106 และข้อความ "Invalid schema: cli_client_dev" — ด่าน allowlist ทำงานก่อน',
+  },
+  {
+    q: 'ทำไม supabase-js@2.117.2 ต้องการ Node 18+ (สำหรับ fetch) หรือ Node 22+ (สำหรับ WebSocket) แทนที่จะทำงานได้บน Node เวอร์ชันไหนก็ได้',
+    options: [
+      'มัน bundle fetch/WebSocket polyfill ของตัวเองมาด้วย ใช้ Node เวอร์ชันไหนก็ได้',
+      'package.json ของมันไม่มี dependency ของ fetch/WebSocket polyfill เลย — พึ่ง global fetch/WebSocket ของ runtime ล้วน ๆ ยืนยันจากการอ่าน package ที่ติดตั้งจริง',
+      'รองรับแค่ Deno เท่านั้น ไม่รองรับ Node แล้วใน version นี้',
+      'WebSocket ถูกถอดออกจาก supabase-js ทั้งหมดใน version นี้',
+    ],
+    answer: 1,
+    explain: 'ยืนยันจากการอ่าน package.json ที่ติดตั้งจริง (ไม่มี dependency cross-fetch/isows/ws) และ source ของ websocket-factory ใน realtime-js ที่ให้ error จริง เฉพาะเจาะจง ระบุ "Node.js 22+" เมื่อไม่มี global WebSocket',
   },
 ];
 

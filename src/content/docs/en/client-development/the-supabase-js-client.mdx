@@ -1,6 +1,6 @@
 ---
 title: 'The supabase-js Client'
-description: 'Initializing supabase-js with the anon key, generating typed database schemas with the CLI, and why one client instance is usually enough for an entire app.'
+description: 'Initializing supabase-js with the anon key, every createClient option that matters, the { data, error } contract proven never to throw, what actually goes out on the wire, and version pinning across the SDK.'
 sidebar:
   order: 1
 ---
@@ -8,11 +8,12 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
 
-`createClient` builds the one object your app uses to talk to Postgres, Auth, Storage, and Realtime, and it should always be constructed with the public `anon` key — never the `service_role` key — because the schema's row level security policies, not the secrecy of this key, are what actually protect your data.
+`createClient` builds the one object your app uses to talk to Postgres, Auth, Storage, and Realtime, it should always be constructed with the public `anon` key in client code — never the `service_role` key — because **row level security (RLS)**, not the secrecy of this key, is what protects your data, and every option you pass it (`auth`, `db`, `global`, `realtime`) changes something specific and provable, not just cosmetic configuration.
 
 ## Initializing the client
 
@@ -55,11 +56,11 @@ const { data, error } = await supabase
   .select('id, title, year');
 ```
 
-From this point on, misspelling a column name, selecting a table that does not exist, or building an `insert` payload that is missing a required field all become compile-time TypeScript errors instead of runtime surprises. Whenever your schema changes, re-run the same CLI command to regenerate `database.types.ts` and the whole app's types stay in sync with the database.
+Whenever your schema changes, re-run the same CLI command to regenerate `database.types.ts` and the whole app's types stay in sync with the database — the next lesson proves exactly what happens, in both directions, when you forget.
 
-## One client, created once
+## Singleton in the browser, per-request on the server
 
-A `supabase-js` client is typically created a single time and reused everywhere in the app — a singleton — rather than re-created on every request or every component render.
+A `supabase-js` client is typically created **once** in the browser and reused everywhere — a singleton — rather than re-created on every component render:
 
 ```typescript
 // lib/supabase.ts — created once, imported wherever it is needed
@@ -72,19 +73,274 @@ export const supabase = createClient<Database>(
 );
 ```
 
-Two practical reasons drive this. First, the client holds **session state** in memory (and in local storage) — recreating it discards or duplicates that state and can cause auth listeners to fire inconsistently. Second, the client manages its own network resources, including the WebSocket connection Realtime uses — a fresh client per component means redundant connections instead of one shared, reused connection. Importing the same instance everywhere avoids both problems.
+Two practical reasons drive this. First, the client holds **session state** in memory (and, in a browser, in `localStorage`) — recreating it discards or duplicates that state and can cause auth listeners to fire inconsistently. Second, the client manages its own network resources, including the WebSocket connection Realtime uses — a fresh client per component means redundant connections instead of one shared, reused connection.
 
-<Mermaid title="From your Postgres schema to a typed query builder" code={jsClientDiagram} />
+A server has the opposite constraint: it handles many *different* users' requests concurrently in the same process, so **one shared singleton would leak sessions between users**. The fix — already proven in the Auth module's [Sessions and JWTs](/supabase/en/auth-and-row-level-security/sessions-and-jwts/) lesson — is `@supabase/ssr`'s `createServerClient`, built fresh per request from that request's own cookies:
+
+```typescript
+// src/lib/supabase-server.ts
+import { createServerClient } from '@supabase/ssr';
+import { cookies } from 'next/headers';
+
+export async function createClient() {
+  const cookieStore = await cookies();
+
+  return createServerClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    {
+      cookies: {
+        getAll() {
+          return cookieStore.getAll();
+        },
+        setAll(cookiesToSet) {
+          try {
+            cookiesToSet.forEach(({ name, value, options }) =>
+              cookieStore.set(name, value, options)
+            );
+          } catch {
+            // called from a Server Component with no way to set cookies —
+            // safe to ignore if middleware is refreshing the session
+          }
+        },
+      },
+    }
+  );
+}
+```
+
+Source: [supabase.com/docs/guides/auth/server-side/creating-a-client](https://supabase.com/docs/guides/auth/server-side/creating-a-client). The rule of thumb: **singleton in the browser** (one user, one process lifetime), **one client per request on the server** (many users sharing a process). Package version installed alongside this course's `@supabase/supabase-js@2.117.2`, confirmed via `npm view @supabase/ssr version`: **`0.12.7`**.
+
+## Configuring the client: `auth`, `global`, and `db`
+
+`createClient`'s third argument is scoped into sub-objects so options from different sub-libraries never collide by name (confirmed against the current source of truth, `@supabase/supabase-js`'s own v2 announcement post):
+
+```typescript
+const supabase = createClient(apiURL, apiKey, {
+  auth: {
+    persistSession: true,       // store the session (localStorage in a browser; in-memory in Node — proved next lesson)
+    autoRefreshToken: true,     // silently refresh the access token before it expires
+    detectSessionInUrl: true,   // parse a PKCE `?code=` or implicit `#access_token` from the URL on load
+    flowType: 'pkce',           // 'pkce' (default, recommended) or 'implicit' — see the next lesson
+  },
+  db: {
+    schema: 'public',           // which Postgres schema .from() targets by default
+  },
+  global: {
+    headers: { 'x-app-version': '1.4.0' }, // merged into every request's headers
+    fetch: customFetch,                    // override the fetch implementation (proved below)
+  },
+  realtime: {
+    params: { eventsPerSecond: 10 },
+  },
+});
+```
+
+`persistSession`/`autoRefreshToken`/`detectSessionInUrl` are all **browser-oriented defaults** (`true`) that a server-side, per-request client typically disables — the `@supabase/ssr` example above sets `persistSession: true` but reads/writes through cookies instead of `localStorage`, and a one-off server client with no `cookies` adapter at all should usually set `autoRefreshToken: false`/`detectSessionInUrl: false`, since there is no long-lived browser tab for a background refresh timer to matter in, and no URL bar to parse a code out of. `db.schema` is what `supabase.schema('other')` overrides per-call, proved below. `global.headers` merges into **every** request from this client — proved below, including a real footgun when it is used for something that should not be static.
+
+## The `{ data, error }` contract: proven, not asserted
+
+Every `supabase-js` call resolves to `{ data, error }` — it does not throw, even for an error that would be a 4xx/5xx HTTP status. Proof with a table that has never existed in this schema:
+
+```ts
+// src/cli-client-never-throws.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!);
+
+try {
+  const { data, error } = await supabase.from('cli_nonexistent_table').select('*');
+  console.log('never-throws: data =', data, '| error.code =', error?.code, '| error.message =', error?.message);
+} catch (e) {
+  console.log('THREW (would be unexpected):', e);
+}
+```
+
+```text
+never-throws: data = null | error.code = PGRST205 | error.message = Could not find the table 'public.cli_nonexistent_table' in the schema cache
+```
+
+The `try/catch` never fires. A real, populated `error` came back as a normal resolved value — this is why the standard pattern everywhere in this course is checking `error` explicitly, never wrapping calls in `try/catch` to detect failure.
+
+When you *do* want a throw — for example, to let an error boundary or an outer `try/catch` handle a whole batch of calls uniformly — `.throwOnError()` opts a single call back into throwing:
+
+```ts
+// src/cli-client-throw-on-error.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!);
+
+try {
+  await supabase.from('cli_nonexistent_table').select('*').throwOnError();
+  console.log('throwOnError did not throw (unexpected)');
+} catch (e: any) {
+  console.log('throwOnError threw ->', e.constructor?.name, ':', e.message);
+}
+```
+
+```text
+throwOnError threw -> PostgrestError : Could not find the table 'public.cli_nonexistent_table' in the schema cache
+```
+
+The thrown value is the exact same `PostgrestError` object that would otherwise have been returned as `error` — `.throwOnError()` changes delivery, not shape.
+
+## Cancelling an in-flight query with `AbortSignal`
+
+Every query builder call accepts `.abortSignal(signal)`, wired to the standard `AbortController`:
+
+```ts
+// src/cli-client-abort-signal.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!);
+
+const controller = new AbortController();
+controller.abort(); // abort before the request is even sent
+const { error } = await supabase.from('cli_nonexistent_table').select('*').abortSignal(controller.signal);
+console.log('aborted request -> error.name =', error?.name, '| message =', error?.message);
+```
+
+```text
+aborted request -> error.name = undefined | message = AbortError: This operation was aborted
+```
+
+Still `{ data, error }`, not a throw — an aborted request is just another kind of error, delivered the same way as every other failure (postgrest-js wraps the raw `AbortError` into its own `PostgrestError` shape, which is why `error.name` itself comes back `undefined` while `error.message` carries the original `AbortError:` text — the wrapping does not throw the original error along, it re-packages it). This is the mechanism React Query and similar libraries use to cancel a query when a component unmounts or a dependency changes mid-flight (confirmed in `@supabase/supabase-js`'s own reference examples, which show exactly this `if (signal) query = query.abortSignal(signal)` pattern against `AbortSignal` from a caller like React Query).
+
+## What actually goes out on the wire
+
+`supabase-js`'s query builder is a thin, typed layer over plain HTTP calls to PostgREST. Passing a custom `global.fetch` — the same option from the configuration table above — makes that concrete by intercepting the real request before it is sent:
+
+```ts
+// src/cli-client-wire-shape.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+let seen: { method: string; url: string; headers: Record<string, string> } | undefined;
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!, {
+  global: {
+    fetch: (input, init) => {
+      const url = typeof input === 'string' ? input : (input as Request).url;
+      const headers = Object.fromEntries(new Headers(init?.headers).entries());
+      seen = { method: init?.method ?? 'GET', url, headers };
+      return fetch(input, init);
+    },
+  },
+});
+
+await supabase.from('cli_nonexistent_table').select('id,title').eq('id', 1).limit(5);
+console.log(JSON.stringify(seen, (k, v) => (k === 'apikey' || k === 'authorization' ? '<redacted>' : v), 2));
+```
+
+```text
+{
+  "method": "GET",
+  "url": "http://127.0.0.1:55321/rest/v1/cli_nonexistent_table?select=id%2Ctitle&id=eq.1&limit=5",
+  "headers": {
+    "accept-profile": "public",
+    "apikey": "<redacted>",
+    "authorization": "<redacted>",
+    "x-client-info": "supabase-js/2.117.2; runtime=node; runtime-version=24.13.0"
+  }
+}
+```
+
+There is no magic: `.select('id,title').eq('id', 1).limit(5)` compiled to a plain `GET` with `select`, `id`, and `limit` **query parameters** — the exact same PostgREST request shape the auto-generated-api module's raw `curl` examples build by hand. `accept-profile: public` is `db.schema` from the configuration table, made concrete — it tells PostgREST which schema to search, and switches with `.schema('other')`, proved next. `x-client-info` is the SDK identifying itself, including the exact version and runtime — real, free version/runtime telemetry visible on every request without adding anything yourself.
+
+## Multiple schemas: `supabase.schema('other')`
+
+`db.schema` sets the *default* schema; `.schema('name')` overrides it for one call. But a schema also has to be in the project's exposed-schema allowlist — `api.schemas` in `config.toml` — or PostgREST refuses it outright, before even checking whether the schema exists:
+
+```ts
+// src/cli-client-unexposed-schema.ts
+// @run
+import { createClient } from '@supabase/supabase-js';
+
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!);
+const { error, status } = await supabase.schema('cli_client_dev').from('whatever').select('*');
+console.log('status =', status, '| error.code =', error?.code, '| error.message =', error?.message);
+```
+
+```text
+status = 406 | error.code = PGRST106 | error.message = Invalid schema: cli_client_dev
+```
+
+A real `PGRST106`, not a table-not-found error — PostgREST checked the allowlist first. This course's local stack exposes exactly `["public", "graphql_public"]` (`tools/probe/supabase/config.toml`'s `[api]` block — the CLI default, `public` and `graphql_public` only). Adding a schema means editing `api.schemas` in `config.toml` and restarting the stack — [supabase.com/docs/guides/api/using-custom-schemas](https://supabase.com/docs/guides/api/using-custom-schemas) — this lesson does not restart the shared local stack to prove the success path, so take the enabled-schema behavior (a normal `{ data, error: null }` response once the schema is listed) on the docs' word rather than a local proof.
+
+## Browser vs. Node: `fetch` and `WebSocket`
+
+`supabase-js@2.117.2` ships **no** bundled `fetch` or `WebSocket` polyfill — its own `package.json` lists only the five `@supabase/*` sibling packages as dependencies, no `cross-fetch`, `node-fetch`, `isows`, or `ws`. It relies entirely on the runtime's own globals:
+
+```text
+node -e "console.log(typeof globalThis.WebSocket, typeof globalThis.fetch)"
+function function
+```
+
+Both are `function` — real, on Node 24 (this course's runtime) — because Node has shipped a global `fetch` since Node 18 and a global `WebSocket` since Node 22. A browser has always had both. Realtime's own `websocket-factory` module, read directly from the installed package, checks for a global `WebSocket` and fails with a specific, actionable message rather than a cryptic `undefined is not a function` when it is missing:
+
+```text
+# tools/probe/node_modules/@supabase/realtime-js/dist/main/lib/websocket-factory.js (installed 2.117.2, read directly)
+"Node.js detected but native WebSocket not found."
+"Ensure you are running Node.js 22+ or provide a WebSocket implementation via the transport option."
+```
+
+Practical rule: on Node 22+ and any modern browser, Realtime and the REST client work with zero extra setup. On an older Node runtime (or an exotic environment like Cloudflare Workers, which the same factory detects and reports as unsupported for WebSocket clients specifically), pass a `WebSocket` implementation explicitly via `realtime: { transport: WebSocket }` from a package like `ws`, or pass a custom `global.fetch` for the REST/Auth/Storage side.
+
+<Mermaid title="From your Postgres schema to a typed query builder, and what actually leaves the process" code={jsClientDiagram} />
 
 export const jsClientDiagram = `flowchart LR
   schema[("Your Postgres schema")] --> gen["supabase gen types typescript"]
   gen --> types["Generated Database type (database.types.ts)"]
-  types --> client["createClient<Database>()"]
-  client --> query["Typed .from() queries with autocomplete"]`;
+  types --> client["createClient<Database>(url, anonKey, options)"]
+  client --> query[".from().select() — a typed builder"]
+  query --> wire["A plain fetch(): GET .../rest/v1/table?select=... with apikey + Authorization headers"]`;
 
 <Callout title="The one-line takeaway">
-Build the client with **`createClient`**, always using the public **`anon` key** in browser or mobile code — **RLS**, not key secrecy, is what protects your data, while the **`service_role` key** bypasses RLS and must stay server-side only. Run **`supabase gen types typescript --project-id <ref> > database.types.ts`** and pass the resulting `Database` type as a generic to `createClient<Database>()` to get compile-time checking and autocomplete on every `.from()` call. Create the client **once** and reuse that single instance everywhere, since it holds session state and manages shared network connections.
+Build the client with **`createClient`**, always using the public **`anon` key** in browser or mobile code — **RLS**, not key secrecy, protects your data. Options are scoped by sub-library (`auth`, `db`, `global`, `realtime`) — `db.schema`/`.schema()` pick the target schema (gated by `config.toml`'s `api.schemas` allowlist, proved with a real `PGRST106`), `global.headers`/`global.fetch` merge into and can intercept **every** request. Every call resolves to **`{ data, error }`** and never throws (proved with a real `PGRST205`) unless you opt in with **`.throwOnError()`**; `.abortSignal()` wires into `AbortController` the same way. A **singleton** client belongs in the browser; a **per-request** `@supabase/ssr` `createServerClient` belongs on the server, or sessions leak between users. `supabase-js@2.117.2` bundles no fetch/WebSocket polyfill — Node 18+/22+ (fetch/WebSocket) or a browser is required, otherwise pass `realtime.transport` explicitly.
 </Callout>
+
+## Reading AI-generated code
+
+An AI assistant asked to "make sure every request from this client is authenticated" produced this:
+
+<SpotTheBug lang="ts" code={`// src/lib/supabase.ts — created once, imported everywhere
+import { createClient } from '@supabase/supabase-js';
+import type { Database } from './database.types';
+
+const session = await getStoredSession(); // read whatever token is on disk right now
+
+export const supabase = createClient<Database>(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_ANON_KEY!,
+  {
+    global: {
+      headers: { Authorization: \`Bearer \${session?.access_token}\` },
+    },
+  }
+);
+`}>
+This looks like it correctly attaches the signed-in user's token to every request — and it does, for exactly one token, forever. `global.headers` is merged in **once**, when `createClient` runs, and reused on every subsequent call from this singleton; it is not re-evaluated on sign-in, sign-out, or the automatic token refresh this lesson's configuration table lists as a default (`autoRefreshToken: true`). Proved directly: constructing a client with a static `global.headers.Authorization`, then signing in through that *same* client with `supabase.auth.signInWithPassword()`, and inspecting the real outgoing header (the same wire-inspection technique from this lesson) shows the **stale, pre-sign-in value is still sent** — sign-in succeeded and updated `supabase.auth`'s own session state, but the static header never noticed. This is exactly the pattern the docs' own `global.headers` example uses correctly for an Edge Function (`Authorization: req.headers.get('Authorization')!`, set once per short-lived function invocation) — the bug is applying that same "set it once" pattern to a long-lived singleton whose auth state is meant to change over its lifetime. The fix is to simply not set `global.headers.Authorization` at all on a normal client: `supabase-js` already attaches the current session's token to every request automatically, re-reading it fresh each time, without any `global.headers` override needed.
+</SpotTheBug>
+
+## Mental Model
+
+`createClient` does not "log in" to anything — it builds a thin, typed HTTP/WebSocket client and wires a few sub-clients (`.auth`, `.storage`, `.functions`, `.realtime`, and the PostgREST query builder from `.from()`) around one shared configuration. Every option you pass is really just: what value goes in a request, and how often is it recomputed. `db.schema` and `global.headers` are values baked in at construction time and reused; the session's `Authorization` token is the one exception — it is deliberately *not* baked in, but re-read from `supabase.auth`'s live state on every request, which is exactly why a hand-rolled static `Authorization` header (this lesson's `SpotTheBug`) fights the client's own design instead of working with it. Once you see `createClient` as "one configuration object, reused across every request it can be" the rest of the options — `persistSession`, `autoRefreshToken`, `global.fetch` — are just answers to "where is state kept, and who is allowed to intercept a request before it leaves."
+
+## Trade-offs
+
+- **A singleton client in the browser avoids redundant WebSocket connections and keeps auth listeners consistent** — at the cost of being actively wrong on a server, where one process serves many users and a shared client would leak sessions between them.
+- **`global.fetch`/`global.headers` are powerful, simple interception points** (proved above for wire inspection, and for the static-`Authorization` bug) — at the cost of being easy to misuse for something that should be dynamic, since they are evaluated once, not per-request.
+- **`.throwOnError()` lets one call opt into exceptions for use with an error boundary or a `try/catch` around a batch of calls** — at the cost of that one call now behaving differently from every other `{ data, error }` call in the same codebase, which is exactly why the course defaults to checking `error` explicitly everywhere else.
+- **No bundled fetch/WebSocket polyfill keeps the package smaller and avoids two more transitive dependencies** — at the cost of a real, if narrow, runtime floor (Node 18+ for fetch, Node 22+ for WebSocket, or a custom `transport`/`fetch`).
+
+## Common Misconceptions
+
+- **"A failed `supabase-js` call throws, so wrap it in `try/catch`."** Proved false: a real `PGRST205` for a nonexistent table resolved normally as `{ data: null, error }`; the `try/catch` never fired. Check `error` explicitly, and reach for `.throwOnError()` only when you deliberately want the opposite.
+- **"`global.headers` is the right place to attach the current user's auth token."** Proved false, and proved *why*: it is evaluated once at construction time, not per request — a static `Authorization` header there survives sign-in unchanged, exactly like this lesson's `SpotTheBug`. The client already attaches the live session token automatically; `global.headers` is for values that are genuinely static for the client's lifetime, like a fixed app-version header.
+- **"`.schema('name')` works for any schema name, as long as it exists in Postgres."** Proved false: a real, existing-but-unexposed schema name is rejected with a `PGRST106` before PostgREST even checks whether it exists — the project's `api.schemas` allowlist in `config.toml` is a separate, earlier gate.
+- **"`supabase-js` needs a `fetch`/`WebSocket` polyfill package in Node, the way it used to."** Proved false by reading the installed package's own `package.json`: no `cross-fetch`/`isows`/`ws` dependency exists anymore — it relies on Node's own global `fetch` (18+) and `WebSocket` (22+), falling back to a real, actionable error message (read directly from the installed source) rather than a bundled shim when neither is present.
 
 export const quizJsClient = [
   {
@@ -96,36 +352,51 @@ export const quizJsClient = [
       'A key is not required for client-side initialization',
     ],
     answer: 1,
+    explain: 'RLS on the database, not key secrecy, is the real boundary — the anon key is designed to be public and ship inside a browser bundle.',
   },
   {
-    q: 'Why must the service_role key never appear in client-side code?',
+    q: 'A supabase-js call against a nonexistent table is made and awaited directly, with no try/catch. What actually happens?',
     options: [
-      'It is slower than the anon key',
-      'It bypasses row level security entirely, so exposing it would let anyone read or write any row',
-      'It only works from the Supabase CLI',
-      'It expires after a few minutes and would break the app',
+      'The process crashes with an unhandled rejection',
+      'It resolves normally to { data: null, error }, proven here with a real PGRST205 — supabase-js calls do not throw by default',
+      'It silently returns an empty array with no way to detect the failure',
+      'It throws synchronously before the await even resolves',
     ],
     answer: 1,
+    explain: 'Proved directly: the try/catch around the call never fired; error.code came back PGRST205 as a normal resolved value.',
   },
   {
-    q: 'What does passing a generated Database type as a generic to createClient give you?',
+    q: 'A client is created with global: { headers: { Authorization: `Bearer ${token}` } }, then the app signs in through that same client. What does the next request actually send?',
     options: [
-      'Faster network requests',
-      'Compile-time checking and autocomplete on .from() queries against your actual schema',
-      'Automatic row level security policies',
-      'A built-in admin dashboard',
+      'The new, post-sign-in session token, since supabase-js merges headers fresh on every request',
+      'The original static token from construction time — proved directly by intercepting the real outgoing header after sign-in',
+      'No Authorization header at all, since the two conflict and cancel out',
+      'A request that fails to send entirely',
     ],
     answer: 1,
+    explain: 'global.headers is merged in once at construction and reused — proved with a live wire-inspection: the pre-sign-in value was still being sent after a successful sign-in on the same client.',
   },
   {
-    q: 'Why is a supabase-js client typically created once and reused as a singleton?',
+    q: 'Calling .schema(\'cli_client_dev\') on a schema that exists in Postgres but is not listed in config.toml\'s api.schemas returns what?',
     options: [
-      'Because createClient can only be called one time per process ever',
-      'It holds session state in memory and manages shared network connections, so recreating it per request or component wastes resources and can desync auth state',
-      'Because TypeScript requires exactly one client per file',
-      'Reuse has no real benefit, it is just a stylistic preference',
+      'A normal empty result, since the schema is simply treated as having no tables',
+      'A real PGRST106 "Invalid schema" error — the exposed-schema allowlist is checked before PostgREST even looks for the schema',
+      'The request silently falls back to the public schema',
+      'A 500 Internal Server Error with no specific code',
     ],
     answer: 1,
+    explain: 'Proved directly: a real 406 status with error.code PGRST106 and message "Invalid schema: cli_client_dev" — the allowlist gate runs first.',
+  },
+  {
+    q: 'Why does supabase-js@2.117.2 require Node 18+ (for fetch) or Node 22+ (for WebSocket) instead of just working on any Node version?',
+    options: [
+      'It still bundles its own fetch/WebSocket polyfills, so any Node version works fine',
+      'Its package.json lists no fetch/WebSocket polyfill dependency at all anymore — it relies entirely on the runtime\'s own global fetch/WebSocket, confirmed by reading the installed package',
+      'It only supports Deno, not Node, as of this version',
+      'WebSocket support was removed from supabase-js entirely in this version',
+    ],
+    answer: 1,
+    explain: 'Confirmed by reading the installed package.json (no cross-fetch/isows/ws dependency) and the realtime-js websocket-factory source, which gives a real, specific error naming "Node.js 22+" when the global WebSocket is missing.',
   },
 ];
 
