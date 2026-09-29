@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
@@ -35,13 +36,89 @@ where relnamespace = 'public'::regnamespace
   and relkind = 'r';
 ```
 
+รันจริงกับ local stack ที่แชร์กันของคอร์สนี้ — snapshot จริงที่ไม่ได้กรองอะไร ไม่ใช่ตัวอย่างที่จัดฉาก:
+
+```text
+$ docker exec -i supabase_db_probe psql -U postgres -c "
+    select relname as table_name, relrowsecurity as rls_enabled
+    from pg_class
+    where relnamespace = 'public'::regnamespace and relkind = 'r'
+    order by relrowsecurity asc, relname;"
+    table_name    | rls_enabled
+------------------+-------------
+ fnd_courses      | f
+ fnd_widgets      | f
+ rt_items         | f
+ rt_posts         | f
+ cli_widget_notes | t
+ cli_widgets      | t
+ rt_notes         | t
+```
+
+<Callout title="table scratch ของบทนี้เองยังพลาด checklist ข้อนี้ — ปล่อยไว้แบบนี้โดยตั้งใจ">
+`fnd_courses` กับ `fnd_widgets` คือ table proof ของ module Foundations ในคอร์สนี้เอง (ใช้พิสูจน์ migration workflow, `db diff` และ `gen types`) และมันไม่มี RLS เปิดจริง ๆ — โผล่มาเป็น finding จริง ไม่ใช่สมมติฐาน นั่นแหละคือประเด็นทั้งหมดของการรัน query นี้จริง ๆ แทนที่จะแค่บรรยาย: production readiness check ต้องรันกับสิ่งที่มีอยู่จริงใน database รวมถึงสิ่งที่คุณสร้างเองและอาจลืมไปแล้วด้วย (`rt_items`/`rt_posts` เป็นของ proof ของ module Realtime and Storage เอง list ไว้ที่นี่ด้วยเหตุผลเดียวกัน)
+</Callout>
+
+## Audit function `security definer`
+
+function `security definer` ใน schema ที่เปิดอยู่รันด้วยสิทธิ์ของ **owner** ไม่ว่าใครจะเป็นคนเรียก — [module Auto-Generated API](/supabase/th/auto-generated-api/database-functions-as-rpc/) พิสูจน์ความเสี่ยง schema-injection ที่สิ่งนี้สร้างขึ้นแบบลงลึกแล้ว หน้าที่ของ checklist นี้คือหา function ทุกตัวที่ต้องการการตรวจสอบนั้นตั้งแต่แรก:
+
+```text
+$ docker exec -i supabase_db_probe psql -U postgres -c "
+    select p.proname as function_name, p.prosecdef as is_security_definer, coalesce(p.proconfig, '{}') as proconfig
+    from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'public' and p.prosecdef
+    order by p.proname;"
+   function_name    | is_security_definer |      proconfig
+--------------------+----------------------+----------------------
+ rt_posts_broadcast | t                    | {"search_path=\"\""}
+```
+
+มี function `security definer` อยู่หนึ่งตัวบน shared stack นี้ และ `proconfig` พิสูจน์ว่ามันถูกเขียนถูกต้อง — `search_path=""` ถูกตั้งไว้ ตรงกับ hardening ที่ checklist นี้ (และบท RPC ที่มัน link ไป) ต้องการเป๊ะ ๆ audit query แบบนี้ควรอยู่ใน CI หรือเช็คตามตารางเวลา เพราะมันง่ายมากที่จะเพิ่ม function `security definer` ใหม่ทีหลังโดยลืมกฎ `search_path` — query ไม่สนว่ามนุษย์จำได้หรือไม่
+
+## Exposed schema เช็คแล้ว ไม่ใช่แค่สมมติ
+
+```text
+$ grep -A6 '\[api\]' supabase/config.toml
+[api]
+enabled = true
+port = 55321
+schemas = ["public", "graphql_public"]
+extra_search_path = ["public", "extensions"]
+```
+
+มีแค่ `public` กับ `graphql_public` เท่านั้นที่เข้าถึงได้ผ่าน Data API บน stack นี้ — เป็น default และเป็น default ที่ถูกต้องสำหรับ project ส่วนใหญ่ schema ที่ถูกเพิ่มเข้ามาตรงนี้โดยไม่มีเหตุผลเฉพาะจะขยาย attack surface ของ Data API ตามนิยาม เพราะ[Securing the Data API](/supabase/th/auto-generated-api/securing-the-data-api/) พิสูจน์ไว้แล้วว่าอะไรก็ตามที่เข้าถึงได้ผ่าน Data API ห่างจากการถูก query ได้โดย `anon` แค่ `grant` เดียว
+
+## `supabase db lint` รันจริง
+
+```text
+$ supabase db lint --db-url "postgresql://postgres:postgres@127.0.0.1:55322/postgres?sslmode=disable" --schema public --level warning
+Linting schema: public
+No schema errors found
+{"results":[],"message":"db lint"}
+```
+
+สะอาดวันนี้ — คำสั่งเดียวกับที่[บท migration ของ Foundations](/supabase/th/foundations/tables-schema-and-migrations/) พิสูจน์แบบลงลึก ควรรันเป็น CI gate ของตัวเอง (`--fail-on error`) โดยเฉพาะเพราะ schema typing error คือสิ่งที่ human reviewer มักจะกวาดสายตาผ่านไปใน migration diff ขนาดใหญ่
+
+## Async write กับ webhook — พิสูจน์ไว้ที่อื่นแล้ว link มาตรงนี้
+
+พฤติกรรม asynchronous ของ `pg_net` และ Database Webhook ที่เรียก Edge Function จาก database trigger ทั้งคู่ถูกพิสูจน์เต็มรูปแบบ พร้อม timing จริง (`net._http_response` มาถึงไม่กี่ millisecond หลัง `insert` ที่ trigger มันคืนค่า) และการ schedule ด้วย `pg_cron` ใน[Background Tasks and Webhooks with Functions](/supabase/th/edge-functions/background-tasks-and-webhooks-with-functions/) — สำหรับ production checklist ข้อนี้คือ ("project นี้พึ่งพา outbound HTTP จาก database ไหม และตัวรับจัดการ retry แบบ idempotent หรือเปล่า") ไม่ใช่ proof ที่ทำซ้ำที่นี่
+
+## Backup, point-in-time recovery และ compute — เอกสาร cite ไว้
+
+ไม่มีสามข้อนี้ที่พิสูจน์บน local ได้ — ต้องมี hosted project ที่เสียเงิน — แต่ทั้งสามข้อเป็นส่วนจริงของ "พร้อม production" พอ ๆ กับอะไรที่พิสูจน์ข้างบน:
+
+- **Point-in-time recovery (PITR)** ให้ project restore กลับไปยังจุดเวลาไหนก็ได้ภายใน retention window ไม่ใช่แค่ daily backup ล่าสุด — มีเป็น add-on ตั้งแต่[เปิดตัวครั้งแรกปี 2022](https://supabase.com/blog/postgres-point-in-time-recovery) มีเอกสารปัจจุบันที่ [supabase.com/docs/guides/platform/backups](https://github.com/supabase/supabase/blob/master/apps/docs/content/guides/platform/backups.mdx) ซึ่งครอบคลุมการ list และ restore backup ผ่าน Management API ด้วย
+- **Compute add-on** ไม่ใช่แค่ dial ปรับ CPU/RAM — มันเปลี่ยน connection limit จริงที่มีเอกสารรองรับด้วย ตาม pricing data ของ Supabase เอง: **Micro** (default, RAM 1GB, 2-core) รองรับ **60 direct** / **200 pooler** connection; **Small** (2GB) รองรับ 90 direct / 400 pooler; **Medium** (4GB) 120 direct / 600 pooler; **Large** (8GB, dedicated) 160 direct / 800 pooler เลขคณิตของ pool size จาก[Connection Pooling and Supavisor](/supabase/th/production-and-ecosystem/connection-pooling-and-supavisor/) ไม่ใช่ค่าคงที่ตายตัว — มัน scale ตาม compute add-on ที่ project กำลังรันอยู่จริง
+- [Production Checklist](https://github.com/supabase/supabase/blob/master/apps/docs/content/guides/deployment/going-into-prod.mdx) ของ Supabase เองคือ reference ที่เป็นทางการและดูแลต่อเนื่องสำหรับเรื่องทั้งหมดนี้ — rate limit, custom domain, upgrade Postgres version และทุกข้อที่ checklist ของบทนี้บีบอัดลงมาในหน้าเดียว อ่านมันตรง ๆ ก่อน launch จริง checklist ของบทนี้คือสรุปเพื่อการสอน ไม่ใช่สิ่งทดแทนมัน
+
 ## Project เดียว ทุกอย่างพร้อมกัน
 
 ลองนึกภาพแอปจริงตัวหนึ่ง เป็น task manager ที่มี table `todos`, เปิด RLS พร้อม policy ที่ scope ด้วย `auth.uid() = user_id` และมี index บน column `user_id` เดียวกันนั้น เพื่อให้ policy check ยังเร็วอยู่แม้ table จะโตขึ้น มีแค่ table `todos` กับ RPC function `create_todo` เท่านั้นที่เปิดผ่าน Data API — ส่วนอื่นใน schema เข้าถึงผ่าน REST ไม่ได้เลย backend ของแอปที่เป็น serverless ต่อผ่าน Supavisor ในโหมด transaction ดังนั้น request จำนวนมากพร้อมกันจะไม่มีทางไปใกล้เพดาน connection ของ Postgres เลย Edge Function จัดการกับ operation เดียวที่ต้องการสิทธิ์สูงจริง ๆ — เช่น admin cleanup job — โดยใช้ `service_role` key ซึ่งอยู่แค่ใน environment ของ function นั้น ไม่มีอยู่ใน client bundle เลย ทุก schema change ตั้งแต่ `create table` แรกสุดไปจนถึง index ที่ตามมาทีหลัง ล้วนเป็น migration file ที่ผ่าน preview branch มาแล้วและถูก apply เข้า production โดย CI ไม่ใช่โดยใครสักคนที่วาง SQL เข้า dashboard และ point-in-time recovery ถูกเปิดไว้ ดังนั้น migration ที่พังหรือการลบข้อมูลจำนวนมากโดยไม่ตั้งใจก็แค่ restore กลับมาได้ ไม่ใช่การสูญเสียถาวร
 
 ไม่มีชิ้นไหนในนี้ที่แปลกใหม่ในตัวเอง สิ่งที่ทำให้ project พร้อม production คือทุกชิ้นนี้ยึดโยงกันในเวลาเดียวกัน รอบ database เดียวกัน แทนที่จะจริงแค่ทีละชิ้น โดยข้ออื่นใน checklist เงียบ ๆ ไม่ถูกทำตาม
 
-<Mermaid title="Every piece of a production-ready Supabase project ties back to one Postgres database" code={securityChecklistDiagram} />
+<Mermaid title="ทุกชิ้นส่วนของ Supabase project ที่พร้อม production ยึดโยงกลับไปที่ Postgres database เดียว" code={securityChecklistDiagram} />
 
 export const securityChecklistDiagram = `flowchart TD
   db[("Postgres database")]
@@ -53,8 +130,39 @@ export const securityChecklistDiagram = `flowchart TD
   ci["Migrations via preview branch and CI"] --> db
   pitr["Backups with point-in-time recovery"] --> db`;
 
+## อ่านโค้ดที่ AI สร้าง
+
+AI assistant ถูกขอให้ "write the production readiness check for our RLS policies" แล้วสร้างสิ่งนี้:
+
+<SpotTheBug lang="sql" code={`-- An AI assistant's "RLS is enabled everywhere" check
+select count(*) as tables_without_rls
+from pg_class
+where relnamespace = 'public'::regnamespace
+  and relkind = 'r'
+  and not relrowsecurity;
+-- if this returns 0, we're good to ship
+`}>
+รัน query นี้กับ shared stack ของคอร์สนี้เองแล้วได้ค่าไม่เป็นศูนย์ — พิสูจน์ข้างบนแล้ว table จริงสี่ตัว (สองตัวเป็น table scratch ของบทนี้เอง) ตัว query เองไม่ผิด แต่ comment ที่แปะไว้ผิด: "if this returns 0, we're good to ship" ปฏิบัติกับ RLS coverage เหมือนเป็น security checklist *ทั้งหมด* ทั้งที่มันเป็นแค่หนึ่งข้อในเจ็ดข้อที่บทนี้เปิดเรื่องไว้ table หนึ่งเปิด RLS แล้วยังเปิดโล่งได้อยู่ดี — ช่องโหว่คลาสสิกจาก module Auth and RLS คือเปิด RLS แล้วมีแค่ policy `select` แล้วลืม `insert`/`update`/`delete` ซึ่ง check แบบนับจำนวนนี้มองไม่เห็นเลย เพราะ `relrowsecurity` เป็น `true` ไม่ว่ากรณีไหน ทางแก้ไม่ใช่ query อื่น — แต่คือการไม่ปฏิบัติกับศูนย์ของ query เดียวเป็นไฟเขียว checklist จริงต้องการ query นี้, audit `security definer`, check exposed-schemas และ review ต่อ table ว่า *operation* ไหนมี policy จริง ๆ ทั้งหมดที่พิสูจน์ไว้ข้างบน รันด้วยกัน ไม่ใช่ตัวแรกตัวเดียวพร้อม comment "if 0, ship it"
+</SpotTheBug>
+
+## Mental Model
+
+ปฏิบัติกับ "production ready" เป็น **conjunction ไม่ใช่ checklist ที่ tick ทีละข้อเรียงกัน** — ทุกข้อที่พิสูจน์หรือ cite ไว้ในบทนี้ต้องจริง *พร้อมกัน* รอบ database เดียวกัน ถึงจะปลอดภัยจริง project ที่ผ่าน RLS audit เป๊ะแต่เปิด schema เกินจำเป็น หรือ harden ทุก function `security definer` แต่รัน Supavisor ผิดโหมดสำหรับ traffic shape ของตัวเอง ไม่ใช่ "เกือบพร้อม production" — มันมีช่องโหว่ตรงจุดที่ attacker หรือ outage จะเจอพอดี นี่คือเหตุผลที่บทนี้รัน query จริงกับ stack จริงแทนที่จะ list bullet point: checklist item ที่ verify ไม่ได้คือ item ที่ไม่ได้ถูกเช็คจริง ๆ
+
+## Trade-offs
+
+- **การรัน audit query พวกนี้ใน CI จับ drift ได้ทันทีที่เกิดขึ้น** (table ใหม่ที่ไม่มี RLS, function `security definer` ใหม่ที่ยังไม่ audit) — **แลกมาด้วยต้องมีที่ให้ query พวกนี้รันอัตโนมัติจริง ๆ** ไม่ใช่แค่อยู่ในบทนี้เป็น exercise มือครั้งเดียว
+- **Compute add-on ซื้อ connection limit ที่สูงขึ้นและ resource แบบ dedicated** (พิสูจน์ข้างบน: 60 direct connection ของ Micro เทียบกับ 160 ของ Large) — **แลกมาด้วยต้นทุนจริงต่อเนื่อง** และการเลือก size แยกไม่ออกจากการตัดสินใจเรื่อง pooling ในบทก่อนหน้า — compute เพิ่มไม่ได้ทดแทนการเลือก transaction mode ตอนที่จำเป็น
+- **PITR ทำให้ความผิดพลาดแทบทุกอย่างย้อนกลับได้** — **แลกมาด้วยป้องกันแค่สิ่งที่เกิดภายใน retention window** และมันป้องกันข้อมูล ไม่ใช่ access control: service_role key ที่หลุดหรือ RLS policy ที่หายไปไม่ใช่สิ่งที่ PITR ย้อนกลับให้
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"ถ้า query เช็ค RLS coverage คืนค่าศูนย์ project ก็ปลอดภัยแล้ว"** ถูกหักล้างตรง ๆ ข้างบน: shared stack ของคอร์สนี้เองพลาด check นั้นเป๊ะ ๆ วันนี้ และแม้แต่ table ที่ผ่าน check นั้นก็ยังมีช่องโหว่ insert/update/delete ที่ query มองไม่เห็นได้อยู่ดี
+- **"function security definer อันตรายโดยธรรมชาติ ควรหลีกเลี่ยง"** audit ข้างบนพบแค่ตัวเดียว hardened ถูกต้องด้วย `search_path=""` — function เองเป็น pattern ที่ถูกต้องตามเอกสาร อันตรายคือตัวที่ *ไม่ได้ hardened* โดยเฉพาะ ซึ่งเป็นเหตุผลที่ audit เช็ค `proconfig` ไม่ใช่แค่ `prosecdef`
+- **"Backup อย่างเดียวทำให้ project พร้อม production"** cite ไว้ข้างบน: PITR restore ข้อมูล ไม่ใช่ความผิดพลาดด้าน access control (schema ที่เปิดเกิน, policy ที่หายไป) ที่ทำให้ต้อง restore ตั้งแต่แรก — check อื่น ๆ ของบทนี้มีอยู่เพราะ backup strategy ที่ดีไม่ได้ทดแทนส่วนที่เหลือของ checklist
+
 <Callout title="สรุปหนึ่งบรรทัด">
-Supabase project ที่พร้อม production คือผลรวมของทุก module ก่อนหน้านี้ที่จริงพร้อมกันทั้งหมด **Row Level Security** พร้อม policy ครบทุก operation ที่ต้องใช้, การเปิด **Data API** ที่ตั้งใจ, **service_role** key ที่อยู่แค่ใน server-side code ที่เชื่อถือได้, **index** บน column ของ RLS policy, **Supavisor** ในโหมด transaction สำหรับการเข้าถึงแบบ serverless, **migration** ที่ไหลผ่าน CI แทนที่จะเป็น ad hoc SQL และ **backup พร้อม point-in-time recovery** ที่ทำให้ change ที่พังย้อนกลับได้เสมอ — ไม่มีข้อไหนใน list นี้ที่เป็น optional สำหรับระบบที่ต้องรันจริงใน production
+Supabase project ที่พร้อม production คือผลรวมของทุก module ก่อนหน้านี้ที่จริงพร้อมกันทั้งหมด **Row Level Security** พร้อม policy ครบทุก operation ที่ต้องใช้ (พิสูจน์ข้างบน: shared stack ของคอร์สนี้เองพลาด audit นั้นตอนนี้บนสอง table scratch), การเปิด **Data API** ที่ตั้งใจ (`public`/`graphql_public` เท่านั้น ยืนยันจาก `config.toml`), **service_role** key ที่อยู่แค่ใน server-side code ที่เชื่อถือได้, ทุก function **security definer** hardened ด้วย `search_path=""` (พิสูจน์: พบหนึ่งตัว config ถูกต้อง), **index** บน column ของ RLS policy, **Supavisor** ในโหมด transaction ขนาดตามจริงตาม connection limit ของ compute add-on, **migration** ที่ไหลผ่าน CI พร้อม `db lint` และ `--dry-run` ก่อนหน้า และ **backup พร้อม point-in-time recovery** ที่ทำให้ change ที่พังย้อนกลับได้เสมอ — ไม่มีข้อไหนใน list นี้ที่เป็น optional และไม่มีข้อไหนทดแทนข้ออื่นได้ สำหรับระบบที่ต้องรันจริงใน production
 </Callout>
 
 export const quizSecurityChecklist = [
@@ -67,6 +175,7 @@ export const quizSecurityChecklist = [
       'RLS จะถูกปิดอัตโนมัติจนกว่าจะมี insert policy',
     ],
     answer: 1,
+    explain: 'ช่องโหว่นี้เป๊ะ ๆ คือเหตุผลที่ SpotTheBug ข้างบนยืนกรานว่า checklist จริงต้องการมากกว่าหนึ่ง query: relrowsecurity เป็น true ไม่ได้บอกอะไรเลยว่า operation ไหนมี policy จริง',
   },
   {
     q: 'ทำไม service_role key ไม่ควรโผล่อยู่ใน client-side code เลย',
@@ -77,6 +186,7 @@ export const quizSecurityChecklist = [
       'หมดอายุภายในไม่กี่วินาที ทำให้ไม่มีประโยชน์ใน client code อยู่ดี',
     ],
     answer: 1,
+    explain: 'พฤติกรรม bypass-RLS เดียวกับที่พิสูจน์ตลอด module Foundations และ Edge Functions — service_role กับ function security definer ที่ไม่ hardened ต่างข้ามการป้องกันเดียวกัน ด้วยเหตุผลเดียวกัน',
   },
   {
     q: 'ทำไมการรัน migration ผ่าน CI แทนที่จะรันเองด้วยมือถึงสำคัญต่อความพร้อม production',
@@ -87,6 +197,7 @@ export const quizSecurityChecklist = [
       'การรัน SQL ด้วยมือเข้า production จริง ๆ แล้วเร็วกว่าและปลอดภัยเท่ากัน',
     ],
     answer: 1,
+    explain: 'พิสูจน์พร้อม output จริงในบท Branching and Migrations Workflow: --dry-run กับ db lint ทั้งคู่ควรอยู่ใน CI pipeline เดียวกันนั้น ก่อนหน้า push จริง',
   },
   {
     q: 'point-in-time recovery หรือ PITR ให้คุณทำอะไรได้โดยเฉพาะที่ daily backup อย่างเดียวทำไม่ได้',
@@ -97,6 +208,18 @@ export const quizSecurityChecklist = [
       'rollback แค่ config ของ Data API เท่านั้น โดยไม่กระทบ schema ของ database',
     ],
     answer: 0,
+    explain: 'cite ไว้ข้างบนจากเอกสาร backup ของ Supabase เอง — และตาม section Trade-offs PITR ย้อนกลับแค่ข้อมูล ไม่ใช่ความผิดพลาดด้าน access control ที่ checklist item อย่าง RLS audit มีไว้เพื่อจับตั้งแต่แรก',
+  },
+  {
+    q: '"production readiness" check ที่ AI สร้างนับ table public ที่ RLS ปิดอยู่ แล้ว comment ว่า "if this returns 0, we\'re good to ship" อะไรผิดกับการปฏิบัติว่า query เดียวนี้พอแล้ว',
+    options: [
+      'query เองมี syntax error',
+      'มันเช็คแค่ว่า RLS เปิดอยู่หรือไม่ ไม่ได้เช็คว่าทุก operation (select/insert/update/delete) มี policy จริงไหม และมันไม่สนใจ checklist item อื่นเลยทั้งหมด (exposed schema, security definer hardening, service_role exposure)',
+      'ไม่มีอะไรผิดเลย RLS coverage คือ security model ทั้งหมดอยู่แล้ว',
+      'query ควรใช้ relhasrules แทน relrowsecurity',
+    ],
+    answer: 1,
+    explain: 'SpotTheBug ข้างบนไล่ตรงนี้เป๊ะ — table หนึ่งผ่าน check นี้ได้แล้วยังไม่ปฏิเสธอะไรเลยตอน insert/update/delete ได้อยู่ดี และนี่เป็นแค่หนึ่งในเจ็ดข้อของ checklist',
   },
 ];
 

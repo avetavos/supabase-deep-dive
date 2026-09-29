@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## The idea in one sentence
@@ -35,6 +36,82 @@ where relnamespace = 'public'::regnamespace
   and relkind = 'r';
 ```
 
+Run for real against this course's shared local stack — a genuine, unfiltered snapshot, not a staged example:
+
+```text
+$ docker exec -i supabase_db_probe psql -U postgres -c "
+    select relname as table_name, relrowsecurity as rls_enabled
+    from pg_class
+    where relnamespace = 'public'::regnamespace and relkind = 'r'
+    order by relrowsecurity asc, relname;"
+    table_name    | rls_enabled
+------------------+-------------
+ fnd_courses      | f
+ fnd_widgets      | f
+ rt_items         | f
+ rt_posts         | f
+ cli_widget_notes | t
+ cli_widgets      | t
+ rt_notes         | t
+```
+
+<Callout title="This lesson's own scratch tables fail their own checklist item — left that way on purpose">
+`fnd_courses` and `fnd_widgets` are this course's own Foundations-module proof tables (used to prove the migration workflow, `db diff`, and `gen types`) and they genuinely have no RLS enabled — they show up as real findings, not a hypothetical. That is the entire point of running this query for real instead of describing it: a production readiness check has to be run against what is actually in the database, including things you created yourself and might otherwise forget about. (`rt_items`/`rt_posts` belong to the Realtime and Storage module's own proofs, listed here for the same reason.)
+</Callout>
+
+## Auditing `security definer` functions
+
+A `security definer` function in an exposed schema runs with its **owner's** privileges regardless of who calls it — the [Auto-Generated API module](/supabase/en/auto-generated-api/database-functions-as-rpc/) proves the schema-injection risk this creates in depth; this checklist's job is finding every function that needs that scrutiny in the first place:
+
+```text
+$ docker exec -i supabase_db_probe psql -U postgres -c "
+    select p.proname as function_name, p.prosecdef as is_security_definer, coalesce(p.proconfig, '{}') as proconfig
+    from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'public' and p.prosecdef
+    order by p.proname;"
+   function_name    | is_security_definer |      proconfig
+--------------------+----------------------+----------------------
+ rt_posts_broadcast | t                    | {"search_path=\"\""}
+```
+
+One `security definer` function exists on this shared stack, and `proconfig` proves it was written correctly — `search_path=""` is set, exactly the hardening this checklist (and the RPC lesson it links to) requires. An audit query like this belongs in CI or a scheduled check precisely because it is easy to add a new `security definer` function later without remembering the `search_path` rule; the query does not care whether the human remembered.
+
+## Exposed schemas, checked, not assumed
+
+```text
+$ grep -A6 '\[api\]' supabase/config.toml
+[api]
+enabled = true
+port = 55321
+schemas = ["public", "graphql_public"]
+extra_search_path = ["public", "extensions"]
+```
+
+Only `public` and `graphql_public` are reachable through the Data API on this stack — the default, and the right default for most projects. A schema added here without a specific reason widens the Data API's attack surface by definition, since [Securing the Data API](/supabase/en/auto-generated-api/securing-the-data-api/) already proves that anything reachable through the Data API is one `grant` away from being queryable by `anon`.
+
+## `supabase db lint`, run for real
+
+```text
+$ supabase db lint --db-url "postgresql://postgres:postgres@127.0.0.1:55322/postgres?sslmode=disable" --schema public --level warning
+Linting schema: public
+No schema errors found
+{"results":[],"message":"db lint"}
+```
+
+Clean today — the same command the [Foundations migrations lesson](/supabase/en/foundations/tables-schema-and-migrations/) proves in depth, worth running as its own CI gate (`--fail-on error`) specifically because a schema typing error is exactly the kind of thing a human reviewer skims past in a large migration diff.
+
+## Async writes and webhooks — proven elsewhere, linked here
+
+`pg_net`'s asynchronous behavior and Database Webhooks calling an Edge Function from a database trigger are both proven in full, with real timing (`net._http_response` arriving milliseconds after the triggering `insert` returns) and `pg_cron` scheduling, in [Background Tasks and Webhooks with Functions](/supabase/en/edge-functions/background-tasks-and-webhooks-with-functions/) — a production checklist item ("does this project rely on outbound HTTP from the database, and does that receiver handle retries idempotently") rather than a proof repeated here.
+
+## Backups, point-in-time recovery, and compute — docs, cited
+
+None of these three are locally provable — they depend on a hosted, billed project — but all three are as real a part of "production ready" as anything proven above:
+
+- **Point-in-time recovery (PITR)** lets a project restore to any specific moment within its retention window, not just the latest daily backup — available as an add-on since [the original 2022 launch](https://supabase.com/blog/postgres-point-in-time-recovery), documented today at [supabase.com/docs/guides/platform/backups](https://github.com/supabase/supabase/blob/master/apps/docs/content/guides/platform/backups.mdx), which also covers listing and restoring backups through the Management API.
+- **Compute add-ons** are not just a CPU/RAM dial — they change real, documented connection limits too. Per Supabase's own pricing data: **Micro** (the default, 1GB RAM, 2-core) allows **60 direct** / **200 pooler** connections; **Small** (2GB) allows 90 direct / 400 pooler; **Medium** (4GB) 120 direct / 600 pooler; **Large** (8GB, dedicated) 160 direct / 800 pooler. The pool-size math from [Connection Pooling and Supavisor](/supabase/en/production-and-ecosystem/connection-pooling-and-supavisor/) is not a fixed constant — it scales with the compute add-on a project is actually running.
+- Supabase's own [Production Checklist](https://github.com/supabase/supabase/blob/master/apps/docs/content/guides/deployment/going-into-prod.mdx) is the canonical, maintained reference for all of this — rate limits, custom domains, upgrading Postgres versions, and every item this lesson's own checklist compresses into one page. Read it directly before a real launch; this lesson's checklist is a teaching summary, not a replacement for it.
+
 ## One project, all of it at once
 
 Picture a real app: a task manager with a `todos` table, RLS enabled with policies scoped to `auth.uid() = user_id`, and an index on that same `user_id` column so the policy check stays fast as the table grows. Only the `todos` table and the `create_todo` RPC function are exposed through the Data API — nothing else in the schema is reachable over REST. The app's serverless backend connects through Supavisor in transaction mode, so a burst of concurrent requests never comes close to exhausting Postgres's connection limit. An Edge Function handles the one operation that genuinely needs elevated access — say, an admin cleanup job — using the `service_role` key, which exists only in that function's environment and nowhere in the client bundle. Every schema change, from the original `create table` to the index that came later, is a migration file that went through a preview branch and was applied to production by CI, not by someone pasting SQL into a dashboard. And point-in-time recovery is enabled, so a bad migration or an accidental bulk delete is a restore away from being undone, not a permanent loss.
@@ -53,8 +130,39 @@ export const securityChecklistDiagram = `flowchart TD
   ci["Migrations via preview branch and CI"] --> db
   pitr["Backups with point-in-time recovery"] --> db`;
 
+## Reading AI-generated code
+
+An AI assistant, asked to "write the production readiness check for our RLS policies," produced this:
+
+<SpotTheBug lang="sql" code={`-- An AI assistant's "RLS is enabled everywhere" check
+select count(*) as tables_without_rls
+from pg_class
+where relnamespace = 'public'::regnamespace
+  and relkind = 'r'
+  and not relrowsecurity;
+-- if this returns 0, we're good to ship
+`}>
+Run this against this course's own shared stack and it returns a non-zero count — proved above, four real tables (two of which are this very lesson's own scratch tables). The check itself is not wrong, but the comment attached to it is: "if this returns 0, we're good to ship" treats RLS coverage as the *entire* security checklist, when it is one line item among the seven this lesson opens with. A table can have RLS enabled and still be wide open — the classic gap from the Auth and RLS module is enabling RLS with only a `select` policy and forgetting `insert`/`update`/`delete`, which this count-based check cannot see at all, since `relrowsecurity` is `true` either way. The fix is not a different query — it is not treating any single query's zero as a green light. A real checklist needs this query, the `security definer` audit, the exposed-schemas check, and a per-table review of which *operations* actually have policies, all proven above, run together, not the first one alone with an "if 0, ship it" comment.
+</SpotTheBug>
+
+## Mental Model
+
+Treat "production ready" as a **conjunction, not a checklist you tick off in sequence** — every item proved or cited in this lesson has to hold true *simultaneously*, around the same database, for the whole thing to actually be safe. A project that aces the RLS audit but exposes an extra schema, or hardens every `security definer` function but runs Supavisor in the wrong mode for its traffic shape, is not "mostly production ready" — it has exactly the one gap an attacker or an outage will find. This is why this lesson runs real queries against a real stack rather than listing bullet points: a checklist item you cannot verify is not actually checked.
+
+## Trade-offs
+
+- **Running these audit queries in CI catches drift the moment it happens** (a new table without RLS, a new unaudited `security definer` function) — **at the cost of needing the queries to actually run somewhere automated**, not just live in this lesson as a one-time manual exercise.
+- **Compute add-ons buy higher connection limits and dedicated resources** (proved above: Micro's 60 direct connections versus Large's 160) — **at real, ongoing cost**, and picking a size is inseparable from the pooling decisions in the earlier lesson — more compute does not substitute for choosing transaction mode where it is needed.
+- **PITR makes almost any mistake reversible** — **at the cost of only protecting what happened within the retention window**, and it protects data, not access control: a leaked `service_role` key or a missing RLS policy is not something PITR undoes.
+
+## Common Misconceptions
+
+- **"If the RLS-coverage query returns zero, the project is secure."** Disproved directly above: this course's own shared stack fails that exact check today, and even a table that passes it can still have an insert/update/delete gap the query cannot see.
+- **"A security definer function is inherently dangerous and should be avoided."** The audit above found exactly one, correctly hardened with `search_path=""` — the function itself is a legitimate, documented pattern; the danger is specifically an *unhardened* one, which is why the audit checks `proconfig`, not just `prosecdef`.
+- **"Backups alone make a project production ready."** Cited above: PITR restores data, not the access-control mistakes (an over-exposed schema, a missing policy) that made a restore necessary in the first place — this lesson's other checks exist because a good backup strategy does not substitute for the rest of the checklist.
+
 <Callout title="The one-line takeaway">
-A production-ready Supabase project is the sum of every earlier module holding true at once: **Row Level Security** with policies for every operation you need, **Data API** exposure kept deliberate, the **service_role** key confined to trusted server-side code, **indexes** on RLS policy columns, **Supavisor** in transaction mode for serverless access, **migrations** flowing through CI instead of ad hoc SQL, and **backups with point-in-time recovery** so a bad change is always reversible — none of these is optional in a system that actually has to run in production.
+A production-ready Supabase project is the sum of every earlier module holding true at once: **Row Level Security** with policies for every operation you need (proved above: this course's own shared stack currently fails that exact audit on two scratch tables), **Data API** exposure kept deliberate (`public`/`graphql_public` only, confirmed from `config.toml`), the **service_role** key confined to trusted server-side code, every **security definer** function hardened with `search_path=""` (proved: one found, correctly configured), **indexes** on RLS policy columns, **Supavisor** in transaction mode sized to a real compute add-on's connection limits, **migrations** flowing through CI with `db lint` and `--dry-run` ahead of them, and **backups with point-in-time recovery** so a bad change is always reversible — none of these is optional, and none of them substitutes for any other, in a system that actually has to run in production.
 </Callout>
 
 export const quizSecurityChecklist = [
@@ -67,6 +175,7 @@ export const quizSecurityChecklist = [
       'RLS is automatically disabled until an insert policy is added',
     ],
     answer: 1,
+    explain: 'This exact gap is why the SpotTheBug above insists a real checklist needs more than one query: relrowsecurity being true says nothing about which operations actually have policies.',
   },
   {
     q: 'Why should the service_role key never appear in client-side code?',
@@ -77,6 +186,7 @@ export const quizSecurityChecklist = [
       'It expires after a few seconds, making it useless in client code anyway',
     ],
     answer: 1,
+    explain: 'The same bypass-RLS behavior proved throughout the Foundations and Edge Functions modules — service_role and an unhardened security definer function both bypass the same protection, for the same reason.',
   },
   {
     q: 'Why does running migrations through CI rather than manually matter for production readiness?',
@@ -87,6 +197,7 @@ export const quizSecurityChecklist = [
       'Manual SQL against production is actually faster and equally safe',
     ],
     answer: 1,
+    explain: 'Proved with real output in the Branching and Migrations Workflow lesson: --dry-run and db lint both belong in that same CI pipeline, ahead of the real push.',
   },
   {
     q: 'What does point-in-time recovery, or PITR, specifically let you do that a daily backup alone does not?',
@@ -97,6 +208,18 @@ export const quizSecurityChecklist = [
       'Roll back only the Data API configuration, leaving the database schema unaffected',
     ],
     answer: 0,
+    explain: 'Cited above from Supabase\'s own backups docs — and, per the Trade-offs section, PITR only reverses data, not the access-control mistakes that a checklist item like the RLS audit exists to catch in the first place.',
+  },
+  {
+    q: 'An AI-generated "production readiness" check counts public tables with RLS disabled and comments "if this returns 0, we\'re good to ship." What is wrong with treating that single query as sufficient?',
+    options: [
+      'The query itself has a syntax error',
+      'It only checks whether RLS is enabled at all, not whether every operation (select/insert/update/delete) actually has a policy, and it ignores every other checklist item (exposed schemas, security definer hardening, service_role exposure) entirely',
+      'Nothing is wrong with it, RLS coverage is the entire security model',
+      'The query should use relhasrules instead of relrowsecurity',
+    ],
+    answer: 1,
+    explain: 'The SpotTheBug above walks through exactly this — a table can pass this one check and still deny nothing on insert/update/delete, and this is only one of the checklist\'s seven items.',
   },
 ];
 
