@@ -713,7 +713,7 @@ function checkMode(descriptors, { allSql = false, strict = false } = {}) {
   for (const [ns, info] of byNs) {
     for (const f of info.fences.filter((x) => x.kind === 'ts-edge')) {
       const dest = path.join(PROBE_DIR, destRelPath(ns, f.path));
-      const dres = spawnSync(DENO_BIN, ['check', dest], { encoding: 'utf8', env: { ...process.env, NO_COLOR: '1' } });
+      const dres = spawnSync(DENO_BIN, ['check', '--no-config', dest], { encoding: 'utf8', env: { ...process.env, NO_COLOR: '1' } });
       if (dres.status !== 0) {
         diagnostics.push({
           severity: 'error',
