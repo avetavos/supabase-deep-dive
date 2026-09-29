@@ -1,8 +1,179 @@
 ---
-title: 'reading-supabase'
-description: 'placeholder — being written'
+title: วิธีอ่านโค้ด Supabase ที่ไม่ได้เขียนเอง
+description: 'ลำดับการอ่านโค้ด Supabase ที่ AI เขียน -- schema กับ RLS ก่อน แล้วตามด้วย role กับ key, auth flow, client calls, edge functions, realtime กับ storage, แล้วจบที่ ops กับ pooling -- เพราะรูปแบบความล้มเหลวที่พบบ่อยที่สุดใน stack นี้คือโค้ดที่ทำงานสมบูรณ์แบบกับ service_role แล้วคืนค่าว่างเปล่าแบบเงียบ ๆ กับ anon'
 sidebar:
   order: 0
 ---
 
-Placeholder.
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+ทุกโมดูลก่อนหน้านี้ในคอร์สสอนให้คุณ *เขียน* schema, policy, client call, edge function และการต่อ realtime/storage โมดูลนี้สอนอีกครึ่งหนึ่ง: การอ่าน migration, การเรียก `supabase-js`, edge function หรือ `config.toml` ที่คนอื่น -- หรือสิ่งอื่น -- เขียนไว้ แล้วตัดสินว่ามันถูกต้องจริงหรือไม่ AI assistant ยื่น table ที่มี policy, client ที่ compile ผ่าน, และ function ที่คืน `200` ตั้งแต่ครั้งแรกให้คุณ และความสำเร็จนั้นแหละคือกับดัก: **Postgres ยอมรับ migration, `tsc` กับ `deno check` ผ่านทั้งคู่, และ demo ทำงานได้จริง** -- ในขณะที่โค้ดกลับไม่ให้สิทธิ์ที่ควรให้แบบเงียบ ๆ หรือให้สิทธิ์ทุกคนในสิ่งที่ควรกันไว้ ชั้นต่าง ๆ ของ Supabase เองแทบไม่ตรวจสอบ "เจตนา" เลย: policy `for select using (true)` ถูกต้องตามไวยากรณ์เป๊ะแต่ผิดความหมายอย่างสิ้นเชิง `createClient()` ไม่เคยปฏิเสธ call ที่จะพัง 403 ตอน runtime และ `security definer` compile ผ่านเหมือนกันไม่ว่าจะ pin `search_path` ไว้หรือไม่
+
+รูปแบบที่พบบ่อยที่สุด พิสูจน์ตลอดทั้ง catalog ของโมดูลนี้: **โค้ดที่ทำงานตอนทดสอบด้วย `service_role` key แล้วคืนค่าว่างเปล่า -- ไม่มี error, `200` พร้อม array ว่าง -- ตอนทดสอบด้วย `anon` หรือ JWT ของ user จริง** `service_role` ข้าม Row Level Security ไปทั้งหมด ดังนั้น policy ที่หายไป, grant ที่ขาด หรือ table ที่ไม่อยู่ใน publication จะมองไม่เห็นเลยระหว่างพัฒนา อ่านโค้ด Supabase ตามลำดับด้านล่างนี้โดยเฉพาะ เพราะแต่ละขั้นคือจุดที่ "ตอนลองมันทำงาน" กับ "มันถูกต้อง" แยกออกจากกันแบบเงียบ ๆ -- และทุกบทเรียนหลังจากนี้ในคอร์สก็มี section **`## Reading AI-generated code`** ของตัวเองที่เจาะลึกแต่ละชั้นเต็มรูปแบบอยู่แล้ว
+
+<Mermaid title="ลำดับการอ่านโค้ด Supabase ที่ไม่ได้เขียนเอง" code={readingOrderDiagram} />
+
+export const readingOrderDiagram = `flowchart TD
+  A["1. Schema &amp; RLS<br/>table, policy, using vs with check -- ทุกคำสั่งมี policy ของตัวเองหรือยัง?"] --> B["2. Role &amp; key<br/>anon/authenticated/service_role -- โค้ดนี้ใช้ key ไหนจริง ๆ?"]
+  B --> C["3. Auth flow<br/>getSession vs getUser, refresh rotation, custom claims -- verify แล้วหรือแค่ decode?"]
+  C --> D["4. Client calls<br/>เช็ค {data, error} แล้วหรือยัง? singleton? header ถูก freeze?"]
+  D --> E["5. Edge functions<br/>jsr:/npm: specifier, client ใช้ key ไหน, secrets"]
+  E --> F["6. Realtime &amp; storage<br/>เป็นสมาชิก publication แล้วหรือยัง, replica identity, policy ที่ scope ตาม folder"]
+  F --> G["7. Ops &amp; pooling<br/>prepare:false, pg_net เป็น async, ใครถือ key นี้อยู่จริง"]
+`;
+
+## 1. Schema & RLS
+
+ก่อนอื่นให้อ่านนิยาม table และทุก policy ที่ติดอยู่กับมันก่อน -- เพราะ table ที่เปิด RLS แล้วไม่มี policy เลยไม่ใช่ error แต่เป็น table ที่คืนค่าว่างเปล่าให้ทุกคนยกเว้นเจ้าของมันตลอดไป โดยไม่มีคำเตือนจากชั้นไหนเลย
+
+- **สิ่งที่ต้องมองหา:** ทุก table ที่ต้องการมี `enable row level security` หรือยัง? ทุกคำสั่งที่ client เรียกจริง (`select`, `insert`, `update`, `delete`) มี policy ของตัวเอง หรือ table นั้นมีแค่ policy `select` เพราะเป็นสิ่งแรกที่มีคนทดสอบ? บน policy `update` มีการเขียน `with check` แยกออกมาชัดเจน หรือใช้ `using (true)` ทำหน้าที่ทั้งสองอย่าง -- รูปแบบเดียวกับที่เปิดช่องให้ user คนหนึ่งเปลี่ยนความเป็นเจ้าของ row ของอีกคนได้? ฟังก์ชัน RPC ที่เป็น `security definer` pin `set search_path = ''` หรือเปล่า หรือเชื่อ `search_path` ของ session ผู้เรียกสำหรับการอ้างอิง table แบบไม่ qualify schema?
+- **คำถามที่ต้องถาม:** ถ้า policy นี้ถูก deploy จริง แล้ว user ทั่วไปที่ใช้แอปนี้ ไม่ต้อง spoof อะไรเลย -- แค่เปลี่ยนค่า field ที่ request เดิมยอมให้ส่งอยู่แล้ว -- อะไรที่หยุดไม่ให้การเขียนนั้นไปตกที่ row ของคนอื่น?
+- **บทเรียนที่อธิบายเรื่องนี้:** กลุ่ม Schema & migrations กับ RLS & roles ของ **[AI Bug Catalog](/supabase/th/reading-supabase/ai-bug-catalog/)** (entry 1–8) สำหรับ `42501` จริง, row ที่ถูกขโมยจริง, และการรั่วไหลของ `security definer` ที่ถูก schema-injection จริง; **[Row Level Security Fundamentals](/supabase/th/auth-and-row-level-security/row-level-security-fundamentals/)** และ **[RLS Patterns and Pitfalls](/supabase/th/auth-and-row-level-security/rls-patterns-and-pitfalls/)** สำหรับกลไกทั้งสองแบบเต็มรูปแบบ
+
+## 2. Role & key
+
+เมื่อเข้าใจ schema กับ policy แล้ว ให้ตรวจว่าโค้ดตรงหน้าใช้ key ไหนใน 3 ตัวจริง ๆ -- เพราะ `anon`, `authenticated`, และ `service_role` ไม่ใช่สิ่งที่ใช้แทนกันได้ และ `service_role` ข้าม policy ทุกตัวจากขั้นที่ 1 โดยไม่บอกอะไรใน response เลย
+
+- **สิ่งที่ต้องมองหา:** มีการอ้างอิง `SERVICE_ROLE_KEY` (หรือ `SUPABASE_SERVICE_ROLE_KEY`) ในที่ที่ browser bundle อาจส่งออกไปได้หรือไม่ -- client component, repo สาธารณะ, ไฟล์ `.env` ที่วางอยู่ใน `supabase/functions/<name>/` โดยไม่มี suffix `.local` (`.gitignore` ของ CLI เองกันแค่ `.env.local`/`.env.*.local` ไม่ใช่ `.env` เปล่า ๆ)? demo ที่ "ทำงานได้" ใช้ `service_role` เพราะ policy RLS จริงพังอยู่แล้วแต่ไม่มีใครสังเกตหรือเปล่า?
+- **คำถามที่ต้องถาม:** ถ้า request นี้ถูกยิงซ้ำด้วย `anon` key แทน key ที่โค้ดใช้ทดสอบจริง มันยังคืนข้อมูลตามที่อ้างหรือไม่ -- หรือความสำเร็จของ demo ขึ้นอยู่กับ key ที่ไม่ควรมาถึง code path นี้เลยทั้งหมด?
+- **บทเรียนที่อธิบายเรื่องนี้:** กลุ่ม Ops & pooling ของ **[AI Bug Catalog](/supabase/th/reading-supabase/ai-bug-catalog/)** (entry 22) สำหรับ response จริงที่เทียบกันตรง ๆ ระหว่าง `anon` กับ `service_role`; **[Securing the Data API](/supabase/th/auto-generated-api/securing-the-data-api/)** และ **[Project Setup and the Supabase CLI](/supabase/th/foundations/project-setup-and-the-supabase-cli/)** สำหรับโมเดล role/grant เต็มรูปแบบ
+
+## 3. Auth flow
+
+อ่านทุกจุดที่ session หรือ claim ถูกเชื่อถือ -- เพราะ `getSession()` decode JWT ในเครื่องโดยไม่เช็ค signature เลย และโค้ดที่ปฏิบัติต่อค่าที่คืนมาเหมือนเป็น identity ที่ verify แล้วก็แค่เชื่ออะไรก็ตามที่อยู่ใน storage ตอนนั้น
+
+- **สิ่งที่ต้องมองหา:** authorization check ฝั่ง server เรียก `getSession()` (หรืออ่าน `req.cookies` แล้ว decode เองด้วยมือ) แทนที่จะเป็น `getUser()`/`getClaims()` หรือเปล่า? refresh-token retry logic สมมติว่าการ reuse ทุกครั้งคือการโจมตีหรือเปล่า ทั้งที่มี grace window สั้น ๆ ที่ปรับได้ (`refresh_token_reuse_interval`) ที่ยอม token รุ่นก่อนหน้าทันทีโดยตั้งใจอยู่แล้ว? policy หรือ handler อ่าน custom JWT claim (`request.jwt.claims ->> 'user_role'`) ที่ไม่มี Auth Hook ไหนใน `config.toml` ของโปรเจกต์นี้เคยถูกเขียนขึ้นมาเพื่อเพิ่มมันเข้าไปเลยหรือเปล่า?
+- **คำถามที่ต้องถาม:** ถ้า JWT ที่โค้ดนี้กำลังจะเชื่อถูกแก้ payload ด้วยมือ -- header เดิม, signature เดิม (ที่ตอนนี้ใช้ไม่ได้แล้ว) -- มีอะไรใน code path นี้ที่สังเกตเห็นจริง ๆ ก่อนที่ claim ข้างในจะถูกนำไปใช้หรือไม่?
+- **บทเรียนที่อธิบายเรื่องนี้:** กลุ่ม Auth & sessions ของ **[AI Bug Catalog](/supabase/th/reading-supabase/ai-bug-catalog/)** (entry 9–11) สำหรับการพิสูจน์ token ที่ถูกแก้จริง และ `refresh_token_already_used` จริง; **[Sessions and JWTs](/supabase/th/auth-and-row-level-security/sessions-and-jwts/)** สำหรับกลไกทั้งสองแบบเต็มรูปแบบ
+
+## 4. Client calls
+
+`supabase-js` ไม่เคย throw เมื่อ database หรือ API error -- มันคืน `{ data, error }` -- ดังนั้นโค้ดที่ destructure แค่ `data` ได้ลบสัญญาณเดียวที่บอกว่า query ล้มเหลวไปแบบเงียบ ๆ
+
+- **สิ่งที่ต้องมองหา:** เช็ค `error` หรือเปล่า หรือโค้ดกระโดดไปที่ `data.map(...)` ตรง ๆ แล้ว crash ด้วย `TypeError` ที่งงกว่า `PGRST205`/`42501`/อะไรก็ตามที่เกิดขึ้นจริงมาก? branch logic ใช้ `error.message` (string ที่เปลี่ยนได้ระหว่าง version) แทนที่จะเป็น `error.code` ที่เสถียรกว่าหรือเปล่า? `.single()` ถูกเรียกกับ query ที่คืนได้ 0 หรือหลาย row โดยไม่มีการจัดการ `PGRST116` หรือเปล่า? มีการสร้าง `createClient()` ใหม่ต่อ request หรือต่อ component แทนที่จะเป็น singleton ตัวเดียวที่ใช้ร่วมกันหรือเปล่า? `global.headers.Authorization` ถูกตั้งตอนสร้าง client จนไปทับ `auth.setSession()` ทุกครั้งที่เรียกทีหลังสำหรับ client instance นั้นแบบเงียบ ๆ หรือเปล่า?
+- **คำถามที่ต้องถาม:** ถ้า call นี้ล้มเหลว -- ชื่อ table ผิด, grant หาย, session หมดอายุ, อะไรก็ได้ -- โค้ดที่รันต่อจากนั้นทำงานต่างจากตอนสำเร็จหรือไม่ หรือแค่ crash ต่อไปอีกบรรทัดด้วย error ที่แย่กว่าที่ Postgres ให้มาจริง ๆ?
+- **บทเรียนที่อธิบายเรื่องนี้:** กลุ่ม Client calls ของ **[AI Bug Catalog](/supabase/th/reading-supabase/ai-bug-catalog/)** (entry 12–15) สำหรับการ crash-on-`null` จริง, `PGRST116` จริง, คำเตือน singleton จริง, และการพิสูจน์ header ที่ถูก freeze จริง; **[The supabase-js Client](/supabase/th/client-development/the-supabase-js-client/)** และ **[Error Handling and Typed Queries](/supabase/th/client-development/error-handling-and-typed-queries/)** สำหรับกลไกทั้งสองแบบเต็มรูปแบบ
+
+## 5. Edge functions
+
+Edge Function รันบน Deno ไม่ใช่ Node -- bare `import` specifier ที่ resolve ได้ปกติในทุกไฟล์อื่นของ repo เดียวกันจะพังทันทีที่ deploy ที่นี่ และรูปแบบความล้มเหลวคือ `503` โดยไม่มีอะไรในโค้ดเองบอกว่าอะไรผิด
+
+- **สิ่งที่ต้องมองหา:** `import` ใช้ bare specifier (`@supabase/supabase-js`) แทนที่จะเป็น `jsr:`/`npm:`/relative path หรือเปล่า? `createClient()` ข้างใน function ใช้ key ไหนจริง ๆ -- `SUPABASE_ANON_KEY` (โดน RLS แบบเดียวกับ anon caller ทั่วไปทุกประการ พิสูจน์แล้วในขั้นที่ 1) หรือ `SUPABASE_SERVICE_ROLE_KEY` (ตัวเดียวที่ทำตัวเหมือน "โค้ดฝั่ง server ที่ข้าม RLS" จริง)? secret อยู่ในไฟล์ `supabase/functions/<name>/.env` ธรรมดา แทนที่จะเป็น `supabase secrets set` (hosted) หรือไฟล์ที่มี suffix `.local` ชัดเจน (รูปแบบเดียวที่ `.gitignore` ของ CLI นี้ป้องกันจริง) หรือเปล่า?
+- **คำถามที่ต้องถาม:** ไฟล์นี้เมื่อเช็คด้วย `deno check` -- ไม่ใช่ `tsc`, ไม่ใช่ type-checker ของ Node -- resolve ทุก import ที่ประกาศไว้จริงหรือไม่ และ client ที่มันสร้างถือ key ที่งานของ function นี้ต้องการจริง ๆ หรือเปล่า?
+- **บทเรียนที่อธิบายเรื่องนี้:** กลุ่ม Edge functions ของ **[AI Bug Catalog](/supabase/th/reading-supabase/ai-bug-catalog/)** (entry 16–18) สำหรับ `BOOT_ERROR` จริง, `[]` ที่ถูก RLS กันแบบ anon จากข้างใน function จริง, และช่องโหว่ `.gitignore` จริง; **[Writing and Invoking a Function](/supabase/th/edge-functions/writing-and-invoking-a-function/)** และ **[Edge Functions and the Database](/supabase/th/edge-functions/edge-functions-and-the-database/)** สำหรับกลไกทั้งสองแบบเต็มรูปแบบ
+
+## 6. Realtime & storage
+
+ทั้งสองอย่างนี้คือ Postgres ธรรมดาข้างใต้ -- row ของ table หนึ่ง (`realtime.messages`) และ table ที่มี policy คุ้มกัน (`storage.objects`) -- ดังนั้นนิสัยการอ่าน schema/RLS จากขั้นที่ 1 ใช้ได้เหมือนกันเป๊ะ บวกกับเงื่อนไขเบื้องต้นอีก 2 อย่างที่ไม่มีใครประกาศไว้และพลาดง่าย
+
+- **สิ่งที่ต้องมองหา:** table ที่ `postgres_changes` subscription เล็งไปหาเป็นสมาชิกของ publication `supabase_realtime` จริงหรือไม่ -- ตรวจสอบได้ แต่ไม่ได้เป็นไปเองแค่เพราะ table มีอยู่? `replica identity` เป็น `full` หรือ payload `old` ของ `UPDATE`/`DELETE` หดเหลือแค่ primary key (หรือหายไปเลย) แบบเงียบ ๆ? channel แบบ **private** มี policy ที่ตรงกับ topic ของมันเป๊ะ ๆ บน `realtime.messages` หรือเปล่า หรือ subscription แค่ fail ด้วย `Unauthorized`? policy ของ storage เช็ค `(storage.foldername(name))[1]` เทียบกับ id ของผู้เรียกเอง หรือเช็คแค่ `bucket_id` -- ปล่อยให้ authenticated user ทุกคนเขียนเข้าไปใน folder ของคนอื่นได้อย่างอิสระ? การ upload ที่มี `upsert: true` มี policy **select** เพิ่มจาก insert/update หรือเปล่า -- เส้นทาง upsert ของ storage เช็คว่า object มีอยู่แล้วก่อนเป็นอันดับแรก และ policy select ที่ขาดไปจะทำให้เช็คนั้นล้มเหลว แม้ insert กับ update จะ scope ถูกต้องแล้วก็ตาม?
+- **คำถามที่ต้องถาม:** ถ้า table/bucket/channel นี้ถูก query ตรง ๆ กับ Postgres เดี๋ยวนี้เลย -- `select * from pg_publication_tables`, `select relreplident`, `select policyname, qual from pg_policies` -- สิ่งที่ตั้งค่าไว้จริงตรงกับสิ่งที่โค้ดตรงหน้าสมมติว่าเป็นจริงอยู่แล้วหรือไม่?
+- **บทเรียนที่อธิบายเรื่องนี้:** กลุ่ม Realtime กับ Storage ของ **[AI Bug Catalog](/supabase/th/reading-supabase/ai-bug-catalog/)** (entry 19–24) สำหรับการพลาด publication แบบเงียบจริง, การถูกปฏิเสธ private-channel จริง, `old: null` จริง, และการเขียนข้าม folder ของคนอื่นจริง; **[Realtime Postgres Changes](/supabase/th/realtime-and-storage/realtime-postgres-changes/)**, **[Realtime Broadcast and Presence](/supabase/th/realtime-and-storage/realtime-broadcast-and-presence/)**, และ **[Storage Buckets and Policies](/supabase/th/realtime-and-storage/storage-buckets-and-policies/)** สำหรับทุกกลไกเต็มรูปแบบ
+
+## 7. Ops & pooling
+
+ชั้นสุดท้ายคือทุกอย่างเกี่ยวกับ *วิธีที่* request ไปถึง Postgres มากกว่าสิ่งที่มันขอ -- โหมดของ connection pooling, background job, และ key ตัวไหนไปฝังอยู่ตรงไหนจริง ๆ -- และเป็นชั้นที่โค้ดที่ AI เขียนแทบไม่พูดถึงเลย
+
+- **สิ่งที่ต้องมองหา:** โค้ดที่เชื่อมผ่าน pooler โหมด **transaction** ของ Supavisor สมมติว่า named prepared statement ทำงานแบบเดียวกับ direct connection หรือเปล่า (`prepare: false` คือทางแก้ที่มีเอกสารรองรับ ไม่ใช่แค่ความชอบส่วนตัวเรื่อง style)? การเรียก `pg_net` อ่าน `net._http_response` ใน statement เดียวกับที่ยิง request ออกไป สมมติว่ามันเป็น synchronous round trip ทั้งที่ตามการออกแบบมันคือ background worker แบบ asynchronous หรือเปล่า? `db push` ถูกรันกับ connection string ที่ผ่าน pooler โดยไม่มี `sslmode=disable` ทั้งที่ pooler ในเครื่องของ CLI นี้ไม่ terminate TLS หรือเปล่า?
+- **คำถามที่ต้องถาม:** ความถูกต้องของโค้ดนี้ขึ้นอยู่กับการที่ request เสร็จแบบ synchronous หรือขึ้นอยู่กับการรับประกันระดับ session (prepared statement, `SET LOCAL`) ที่อยู่รอดเกินกว่า 1 transaction ที่โหมด transaction ของ Supavisor รับประกันไว้จริง ๆ?
+- **บทเรียนที่อธิบายเรื่องนี้:** กลุ่ม Ops & pooling ของ **[AI Bug Catalog](/supabase/th/reading-supabase/ai-bug-catalog/)** (entry 25–27) สำหรับ race condition ของ `net._http_response` จริง และความล้มเหลวของ prepared statement ที่มีเอกสารรองรับ (และบน local stack นี้จริง ๆ ก็รายงานตรง ๆ ว่า reproduce ไม่ได้); **[Connection Pooling and Supavisor](/supabase/th/production-and-ecosystem/connection-pooling-and-supavisor/)** สำหรับเรื่อง session-vs-transaction mode เต็มรูปแบบ
+
+## โมดูลนี้มีอะไรต่อ
+
+- **[The AI Bug Catalog](/supabase/th/reading-supabase/ai-bug-catalog/)** -- 27 รูปแบบที่เจาะจง แต่ละอันมีโค้ดที่ AI มักเขียน, คำสั่งจริงพร้อมผลลัพธ์จริงที่จับสด ๆ กับ local stack ของโมดูลนี้เอง, และวิธีแก้
+- **[Review Checklist](/supabase/th/reading-supabase/review-checklist/)** -- 27 รูปแบบเดียวกันในรูปแบบ checklist หน้าเดียว 8 กลุ่ม แต่ละบรรทัดลิงก์ไปยังบทเรียนที่พิสูจน์มัน
+- **[Verification Tools](/supabase/th/reading-supabase/verification-tools/)** -- `supabase db lint`, query ตรวจ coverage ของ RLS, `pg_policies`, `explain analyze` ภายใต้ JWT จริง, `supabase test db` (pgTAP), `supabase gen types` + `tsc`, `deno check`, `curl` ด้วย anon เทียบ service key, MCP server, Studio, และ harness ของคอร์สนี้เอง แต่ละตัวพิสูจน์อะไรได้บ้างจริง ๆ
+- ทุกบทเรียนก่อนหน้าในคอร์สนี้มี section **`## Reading AI-generated code`** ของตัวเองพร้อม `<SpotTheBug>` อยู่แล้ว -- catalog ของโมดูลนี้ไม่ได้ซ้ำสิ่งเหล่านั้น แต่จัดกลุ่ม 27 รูปแบบที่กว้างกว่าตามลำดับการอ่านด้านบน เริ่มจาก **[What Is Supabase](/supabase/th/foundations/what-is-supabase/)** ถ้าต้องการเส้นทางบทเรียนแบบเต็มทีละบทแทน
+
+## Mental Model
+
+```text
+Reading order for Supabase code you did not write:
+
+1. Schema & RLS     -> does every command (select/insert/update/delete) have its own policy?
+2. Roles & keys     -> which of anon/authenticated/service_role is this code actually using?
+3. Auth flow        -> getSession (decoded, unverified) or getUser (verified)?
+4. Client calls     -> {data, error} checked? singleton? frozen Authorization header?
+5. Edge functions   -> jsr:/npm: specifiers, which key, which secrets file
+6. Realtime/storage -> publication membership, replica identity, folder-scoped policies
+7. Ops & pooling    -> prepare:false, pg_net is async, which key actually reached this code
+
+"It returned data when I tested it" answers almost none of these -- the single most common
+failure in this catalog is code that works with service_role and is silently empty with anon.
+```
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"ถ้า Postgres ยอมรับ migration แล้ว `tsc`/`deno check` ผ่านทั้งคู่ โค้ดนั้นถูกต้อง"** พิสูจน์แล้วตลอดทั้ง catalog ของโมดูลนี้: `for update using (true)` โดยไม่มี `with check` แยกชัดเจนคือ SQL ที่ถูกต้องตามไวยากรณ์เป๊ะ และเป็นช่องโหว่ row-hijack จริง พิสูจน์สดในบท RLS ของคอร์สนี้เอง -- ไม่มี compiler หรือ linter ตัวไหนจับได้ เพราะมันไม่ใช่ syntax error
+- **"policy ที่หายไปจะ throw error แน่นอน ฉันต้องสังเกตเห็น"** พิสูจน์แล้วว่าไม่จริง: RLS ที่เปิดแล้วไม่มี policy เลยคืน `200` พร้อม `[]` -- ไม่มี error จากชั้นไหนเลย ความเงียบนั่นแหละคือตัว bug
+- **"`service_role` ก็แค่ `anon` key ที่แรงกว่า"** มันคือคนละสิ่งกันเลย: มันข้าม Row Level Security ไปทั้งหมด ซึ่งหมายความว่า policy ทุกตัวที่ขั้นที่ 1 ของโมดูลนี้ขอให้อ่านจะมองไม่เห็นเลยระหว่างทดสอบด้วยมัน โค้ดที่ "ทำงานได้" ระหว่างพัฒนาแล้วพังทันทีที่ session ของ user จริงมาแทนที่ `service_role` คือรูปแบบที่พบบ่อยที่สุดที่ catalog นี้บันทึกไว้
+- **"โค้ด Supabase ที่ AI เขียนแค่ต้องการ prompt ที่ใหม่กว่า"** ปัญหาไม่ใช่แค่ความล้าสมัย: `for select using (true)` เป็น SQL ที่ถูกต้อง เป็นปัจจุบัน และถูกต้องตามไวยากรณ์เป๊ะ ที่แค่ไม่ได้มีความหมายตามที่ผู้อ่านซึ่งข้ามขั้นที่ 1 ไปสมมติ -- ไม่มี training-data cutoff ไหนแก้นิสัยการอ่านได้
+
+<Callout title="สรุปในบรรทัดเดียว">
+อ่านโค้ด Supabase ตามลำดับนี้ -- schema กับ RLS, role กับ key, auth flow, client calls, edge functions, realtime กับ storage, แล้วจบที่ ops กับ pooling -- เพราะ Postgres, PostgREST, `tsc`, และ `deno check` ทุกตัวตรวจแค่ syntax กับ type ไม่เคยตรวจเจตนา และความล้มเหลวที่พบบ่อยที่สุดที่ catalog นี้บันทึกไว้คือโค้ดที่คืนข้อมูลจริงด้วย `service_role` แล้วคืน `[]` แบบเงียบ ไม่มี error กับทุกคนที่ไม่ใช่ `service_role`
+</Callout>
+
+export const quizReadingSupabaseIndex = [
+  {
+    q: "ทำไมโมดูลนี้ถึงตรวจ schema กับ RLS ก่อนตรวจว่าโค้ดชิ้นหนึ่งใช้ key ไหน?",
+    options: [
+      "Because tables are always the shortest part of a file to read",
+      "Because a policy gap (a missing insert policy, using(true) standing in for with check, RLS enabled with zero policies) determines what ANY key below service_role can actually do -- reading roles and keys first tells you nothing about what those roles are restricted to",
+      "Because roles and keys never affect what a query returns",
+      "The order does not matter",
+    ],
+    answer: 1,
+    explain: "พิสูจน์แล้วใน AI Bug Catalog entry 1-8: RLS ที่เปิดแล้วไม่มี policy เลยคืน 200 พร้อม [] ให้ทั้ง anon กับ authenticated -- การรู้ว่า request ใช้ key ไหนไม่บอกอะไรเลยจนกว่าจะรู้ว่า policy บน table นั้นอนุญาตอะไรจริง ๆ",
+  },
+  {
+    q: "```text\n$ curl \"$API_URL/rest/v1/rd_notes?select=*\" -H \"apikey: $ANON_KEY\" -H \"Authorization: Bearer $ANON_KEY\"\n[]\nHTTP=200\n```\nจาก output จริงนี้ เมื่อรู้ว่า table นี้มี row จริงอยู่ (ตรวจแยกต่างหากในฐานะ postgres: 3 rows) มันพิสูจน์อะไรเกี่ยวกับความต่างระหว่าง policy ที่หายไปกับ table ที่หายไป?",
+    options: [
+      "That the table does not exist",
+      "Nothing distinguishes them from this output alone -- an empty result with HTTP 200 is the exact same shape RLS-enabled-with-zero-policies produces as an unrelated empty table or an over-narrow filter; the catalog proves this exact case is caused by RLS silently denying every row, not absence of data",
+      "That the anon key is invalid",
+      "That RLS is disabled",
+    ],
+    answer: 1,
+    explain: "พิสูจน์ตรง ๆ ใน AI Bug Catalog: postgres เอง (ข้าม RLS ในฐานะเจ้าของ table) แสดง real_row_count_as_superuser = 3 ในขณะที่ query เดียวกันเป๊ะผ่าน PostgREST ด้วย anon key คืน [] พร้อม HTTP 200 -- ไม่มี error จากชั้นไหนเลยที่แยกความแตกต่างระหว่าง 'ไม่มี policy อนุญาตสิ่งนี้' กับ 'ไม่มี row อยู่จริง'",
+  },
+  {
+    q: "ทำไมโมดูลนี้ถึงมอง 'demo ทำงานตอนฉันทดสอบ' เป็นหลักฐานที่เชื่อไม่ได้โดยเฉพาะกับโค้ด Supabase มากกว่า backend ส่วนใหญ่?",
+    options: [
+      "Supabase demos are always run by the original author",
+      "Because the service_role key -- the credential most local testing, seed scripts, and admin tooling naturally reach for -- bypasses Row Level Security entirely, so a demo that used it proves nothing about what happens once a real user's session (subject to every policy) replaces it",
+      "Because Supabase has no testing tools at all",
+      "Because RLS only applies to production projects",
+    ],
+    answer: 1,
+    explain: "พิสูจน์ตรง ๆ ในกลุ่ม Ops & pooling ของ AI Bug Catalog: request เดียวกันเป๊ะกับ row เดียวกันเป๊ะคืนข้อมูลจริงด้วย service_role และ [] ด้วย anon -- ความต่างมีแค่ key ที่ใช้เรียก ไม่ใช่อะไรเกี่ยวกับตัว request เลย",
+  },
+  {
+    q: "ขั้นไหนในลำดับการอ่านนี้ที่ถามเจาะจงว่าใช้ `deno check` -- ไม่ใช่ `tsc` -- ในการตรวจว่า import ของไฟล์ resolve ได้จริงหรือไม่?",
+    options: [
+      "Client calls",
+      "Edge functions",
+      "Realtime & storage",
+      "Auth flow",
+    ],
+    answer: 1,
+    explain: "พิสูจน์ตรง ๆ ใน AI Bug Catalog entry 16: 'import { createClient } from \"@supabase/supabase-js\"' แบบ bare specifier ข้างใน supabase/functions/<name>/index.ts type-check ผ่านถ้ารันแบบ tsc สไตล์ Node กับ tsconfig ที่หย่อน แต่ deploy จริงด้วย supabase functions serve คืน BOOT_ERROR 503 จริง -- มีแค่ deno check ที่รันกับ module graph ของ Deno เองเท่านั้นที่จับได้ก่อน deploy",
+  },
+  {
+    q: "ทำไมโมดูลนี้ถึงบอกว่าผลลัพธ์ที่ว่างเปล่าแบบเงียบ ๆ (อย่าง RLS ที่ไม่มี policy หรือ table ที่หายไปจาก publication) น่าเป็นห่วงสำหรับผู้ review มากกว่าอันที่ throw error แทนที่จะน้อยกว่า?",
+    options: [
+      "It doesn't -- thrown errors are always worse",
+      "A thrown error is loud and immediate -- a reader notices instantly and fixes it before shipping. A silent 200/[] looks identical to 'there is genuinely no data yet' until the exact row that should have been there is the one that goes missing in front of a real user",
+      "Silent results are rarer in practice than errors",
+      "Postgres always eventually raises an error for a missing policy on its own",
+    ],
+    answer: 1,
+    explain: "พิสูจน์ตลอดทั้ง catalog: RLS-enabled-zero-policies, table ที่หายไปจาก supabase_realtime, และ storage upsert ที่ขาด policy select ล้วนคืนรูปแบบที่ดูเหมือนสำเร็จ (200/[], channel ที่ไม่เคยยิง event เลย, RLS error ที่เฉพาะเจาะจงแต่อ่านผิดง่าย) แทนที่จะเป็นความล้มเหลวที่ชัดเจน -- แต่ละอันอ่านเหมือน 'ทำงานอยู่ แค่ยังไม่มีข้อมูล' จนกว่าจะพิสูจน์ได้ว่าไม่ใช่",
+  },
+];
+
+<Quiz client:visible id="reading-supabase/index" questions={quizReadingSupabaseIndex} />
+
+<ProgressTracker client:visible id="reading-supabase/index" />

@@ -1,8 +1,179 @@
 ---
-title: 'reading-supabase'
-description: 'placeholder — being written'
+title: How to read Supabase code you did not write
+description: 'A reading order for AI-generated Supabase code — schema and RLS first, then roles and keys, then the auth flow, client calls, edge functions, realtime and storage, then ops and pooling — because the single most common failure shape in this stack is code that works perfectly with service_role and returns nothing, silently, with anon.'
 sidebar:
   order: 0
 ---
 
-Placeholder.
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+Every earlier module in this course taught you to *write* schema, policies, client calls, edge functions, and realtime/storage wiring. This module teaches the other half: reading a migration, a `supabase-js` call, an edge function, or a `config.toml` someone — or something — else wrote, and deciding whether it is actually correct. An AI assistant hands you a table with a policy, a client that compiles, and a function that returns `200` on the first try, and that success is the trap: **Postgres accepts the migration, `tsc` and `deno check` both pass, and the demo works** — while the code silently grants nobody the access it meant to grant, or grants everybody the access it meant to withhold. Supabase's own layers validate almost nothing about intent: a `for select using (true)` policy is syntactically perfect and semantically wrong, `createClient()` never rejects a call that will 403 at runtime, and `security definer` compiles identically whether or not `search_path` is pinned.
+
+The single most common shape this takes, proven throughout this module's catalog: **code that works when tested with the `service_role` key and returns nothing — no error, `200` with an empty array — when tested with `anon` or a real user's JWT.** `service_role` bypasses Row Level Security entirely, so it makes a missing policy, a missing grant, or a table left out of a publication invisible during development. Read Supabase code in the order below specifically because each step is a place where "it worked when I tried it" and "it is correct" quietly diverge — and every lesson later in this course already carries its own **`## Reading AI-generated code`** section drilling one layer of it in full depth.
+
+<Mermaid title="Reading order for Supabase code you did not write" code={readingOrderDiagram} />
+
+export const readingOrderDiagram = `flowchart TD
+  A["1. Schema &amp; RLS<br/>tables, policies, using vs with check -- does every command have one?"] --> B["2. Roles &amp; keys<br/>anon/authenticated/service_role -- which key is this code actually using?"]
+  B --> C["3. Auth flow<br/>getSession vs getUser, refresh rotation, custom claims -- verified or just decoded?"]
+  C --> D["4. Client calls<br/>{data, error} checked? singleton? frozen headers?"]
+  D --> E["5. Edge functions<br/>jsr:/npm: specifiers, which key initializes the client, secrets"]
+  E --> F["6. Realtime &amp; storage<br/>publication membership, replica identity, folder-scoped policies"]
+  F --> G["7. Ops &amp; pooling<br/>prepare:false, pg_net async, who actually has this key"]
+`;
+
+## 1. Schema & RLS
+
+Before anything else, read the table definitions and every policy attached to them — because a table with RLS enabled and zero policies is not an error, it is a table that returns nothing to everyone except its owner, forever, with no warning at any layer.
+
+- **What to look for:** does every table that needs one have `enable row level security`? Does every command a client actually calls (`select`, `insert`, `update`, `delete`) have its own policy, or does the table only have a `select` policy because that's the first thing anyone tested? On an `update` policy, is `with check` written explicitly, or is `using (true)` doing double duty as both — the exact shape that lets one user reassign another user's row? Does a `security definer` RPC function pin `set search_path = ''`, or does it trust the caller's session `search_path` for its unqualified table references?
+- **The question to ask:** if this exact policy is deployed and a curious, technically-competent user of this app spoofs nothing at all — just changes a field the request already lets them send — what stops the write from landing on someone else's row?
+- **Which lesson explains it:** the **[AI Bug Catalog](/supabase/en/reading-supabase/ai-bug-catalog/)**'s Schema & migrations and RLS & roles groups (entries 1–8) for the real `42501`, the real hijacked row, and the real schema-injected `security definer` leak; **[Row Level Security Fundamentals](/supabase/en/auth-and-row-level-security/row-level-security-fundamentals/)** and **[RLS Patterns and Pitfalls](/supabase/en/auth-and-row-level-security/rls-patterns-and-pitfalls/)** for both mechanisms proven in full.
+
+## 2. Roles & keys
+
+Once the schema and its policies are understood, check which of the three keys the code in front of you is actually using — because `anon`, `authenticated`, and `service_role` are not interchangeable, and `service_role` bypasses every policy from step 1 without saying so anywhere in the response.
+
+- **What to look for:** is `SERVICE_ROLE_KEY` (or `SUPABASE_SERVICE_ROLE_KEY`) referenced anywhere a browser bundle could ship it — a client component, a public repo, a `.env` file sitting inside `supabase/functions/<name>/` with no `.local` suffix (the CLI's own `.gitignore` only excludes `.env.local`/`.env.*.local`, not a plain `.env`)? Does a demo that "worked" use `service_role` specifically because the actual RLS policy is broken and nobody noticed?
+- **The question to ask:** if this exact request is replayed with the `anon` key instead of whatever key the code actually used to test it, does it still return the data it claims to — or does the demo's success depend entirely on a key that should never reach this code path?
+- **Which lesson explains it:** the **[AI Bug Catalog](/supabase/en/reading-supabase/ai-bug-catalog/)**'s Ops & pooling group (entry 22) for the real side-by-side `anon` vs `service_role` response; **[Securing the Data API](/supabase/en/auto-generated-api/securing-the-data-api/)** and **[Project Setup and the Supabase CLI](/supabase/en/foundations/project-setup-and-the-supabase-cli/)** for the full role/grant model.
+
+## 3. Auth flow
+
+Read every place a session or a claim is trusted — because `getSession()` decodes a JWT locally with no signature check, and code that treats its return value as verified identity is trusting whatever happens to be sitting in storage.
+
+- **What to look for:** does a server-side authorization check call `getSession()` (or read `req.cookies` and manually decode) instead of `getUser()`/`getClaims()`? Does a refresh-token retry loop assume every reuse is malicious, when a short, configurable grace window (`refresh_token_reuse_interval`) tolerates the immediately-previous token on purpose? Does a policy or a handler read a custom JWT claim (`request.jwt.claims ->> 'user_role'`) that no Auth Hook in this project's `config.toml` was ever written to add?
+- **The question to ask:** if the JWT this code is about to trust had its payload edited by hand — same header, same (now-invalid) signature bytes — does anything in this exact code path actually notice before the claims inside it are acted on?
+- **Which lesson explains it:** the **[AI Bug Catalog](/supabase/en/reading-supabase/ai-bug-catalog/)**'s Auth & sessions group (entries 9–11) for the real tampered-token proof and the real `refresh_token_already_used`; **[Sessions and JWTs](/supabase/en/auth-and-row-level-security/sessions-and-jwts/)** for both mechanisms in full depth.
+
+## 4. Client calls
+
+`supabase-js` never throws on a database or API error — it returns `{ data, error }` — so code that only destructures `data` has silently deleted the one signal that tells you the query failed.
+
+- **What to look for:** is `error` ever checked, or does the code go straight to `data.map(...)` and crash on `null` with a confusing `TypeError` instead of surfacing the real `PGRST205`/`42501`/whatever actually happened? Does branch logic key off `error.message` (a string that can change between versions) instead of the stable `error.code`? Is `.single()` called on a query that can return zero or several rows without a `PGRST116` handler? Is a new `createClient()` constructed per request or per component instead of one shared singleton? Was `global.headers.Authorization` set at construction time, silently overriding every later `auth.setSession()` call for that client instance?
+- **The question to ask:** if this exact call fails — wrong table name, missing grant, expired session, anything — does the code that runs next behave any differently than it would on success, or does it just crash one line further down with a worse error than the one Postgres actually gave it?
+- **Which lesson explains it:** the **[AI Bug Catalog](/supabase/en/reading-supabase/ai-bug-catalog/)**'s Client calls group (entries 12–15) for the real crash-on-`null`, the real `PGRST116`, the real singleton warning, and the real frozen-header proof; **[The supabase-js Client](/supabase/en/client-development/the-supabase-js-client/)** and **[Error Handling and Typed Queries](/supabase/en/client-development/error-handling-and-typed-queries/)** for both mechanisms proven in full.
+
+## 5. Edge functions
+
+An Edge Function runs on Deno, not Node — a bare `import` specifier that resolves fine in every other file in the same repository fails the moment it is deployed here, and the failure mode is a `503` with no indication in the code itself of what went wrong.
+
+- **What to look for:** does an `import` use a bare specifier (`@supabase/supabase-js`) instead of `jsr:`/`npm:`/a relative path? Which key does `createClient()` inside the function actually use — `SUPABASE_ANON_KEY` (subject to the exact same RLS as any other anon caller, proven in step 1) or `SUPABASE_SERVICE_ROLE_KEY` (the only one that behaves like "server-side code that bypasses RLS")? Does a secret live in a plain `supabase/functions/<name>/.env` instead of `supabase secrets set` (hosted) or an explicitly `.local`-suffixed file (the only pattern this CLI's own `.gitignore` actually protects)?
+- **The question to ask:** does this exact file, checked with `deno check` against Deno's own module graph — not `tsc`, not a Node type-checker — actually resolve every import it declares, and does the client it constructs carry the key this function's job actually requires?
+- **Which lesson explains it:** the **[AI Bug Catalog](/supabase/en/reading-supabase/ai-bug-catalog/)**'s Edge functions group (entries 16–18) for the real `BOOT_ERROR`, the real anon-scoped `[]` from inside a function, and the real `.gitignore` gap; **[Writing and Invoking a Function](/supabase/en/edge-functions/writing-and-invoking-a-function/)** and **[Edge Functions and the Database](/supabase/en/edge-functions/edge-functions-and-the-database/)** for both mechanisms in full.
+
+## 6. Realtime & storage
+
+Both of these are ordinary Postgres underneath — a table's rows (`realtime.messages`) and a policy-guarded table (`storage.objects`) — so the exact same schema/RLS reading habits from step 1 apply, with two extra, easy-to-miss prerequisites neither one advertises.
+
+- **What to look for:** is the table a `postgres_changes` subscription targets actually a member of the `supabase_realtime` publication — checkable, but not implied by the table simply existing? Is `replica identity` `full`, or does an `UPDATE`/`DELETE` payload's `old` silently shrink to just the primary key (or vanish entirely)? Does a **private** channel have a matching policy on `realtime.messages` for its exact topic, or does the subscription just fail with `Unauthorized`? Does a storage policy check `(storage.foldername(name))[1]` against the caller's own id, or only `bucket_id` — leaving every authenticated user free to write into every other user's folder? Does an `upsert: true` upload have a **select** policy in addition to insert/update — storage's upsert path checks for the object's existence first, and a missing select policy fails that check even when insert and update are both correctly scoped?
+- **The question to ask:** if this exact table/bucket/channel is queried directly against Postgres right now — `select * from pg_publication_tables`, `select relreplident`, `select policyname, qual from pg_policies` — does what's actually configured match what the code in front of you assumes is already true?
+- **Which lesson explains it:** the **[AI Bug Catalog](/supabase/en/reading-supabase/ai-bug-catalog/)**'s Realtime and Storage groups (entries 19–24) for the real silent publication miss, the real private-channel rejection, the real `old: null`, and the real cross-user folder write; **[Realtime Postgres Changes](/supabase/en/realtime-and-storage/realtime-postgres-changes/)**, **[Realtime Broadcast and Presence](/supabase/en/realtime-and-storage/realtime-broadcast-and-presence/)**, and **[Storage Buckets and Policies](/supabase/en/realtime-and-storage/storage-buckets-and-policies/)** for every mechanism proven in full.
+
+## 7. Ops & pooling
+
+The last layer is everything about *how* a request reaches Postgres rather than what it asks for — connection pooling mode, background jobs, and which literal key ends up embedded where — and it is the layer most AI-generated code never mentions at all.
+
+- **What to look for:** does code connecting through Supavisor's **transaction mode** pooler assume named prepared statements work the way they do on a direct connection (`prepare: false` is the documented fix, not a style preference)? Does a `pg_net` call read `net._http_response` in the same statement that issued the request, assuming a synchronous round trip from what is, by design, an asynchronous background worker? Is `db push` run against a pooled connection string without `sslmode=disable`, when this CLI's own local pooler does not terminate TLS?
+- **The question to ask:** does this exact code's correctness depend on the request completing synchronously, or on a session-scoped guarantee (a prepared statement, a `SET LOCAL`) surviving past the one transaction Supavisor's transaction mode actually guarantees it for?
+- **Which lesson explains it:** the **[AI Bug Catalog](/supabase/en/reading-supabase/ai-bug-catalog/)**'s Ops & pooling group (entries 25–27) for the real `net._http_response` race and the documented (and, on this exact local stack, honestly non-reproduced) prepared-statement failure; **[Connection Pooling and Supavisor](/supabase/en/production-and-ecosystem/connection-pooling-and-supavisor/)** for the full session-vs-transaction-mode story.
+
+## What this module covers next
+
+- **[The AI Bug Catalog](/supabase/en/reading-supabase/ai-bug-catalog/)** — 27 specific patterns, each with the code AI typically writes, a real command and its real, freshly captured output against this module's own local stack, and the fix.
+- **[Review Checklist](/supabase/en/reading-supabase/review-checklist/)** — the same 27 patterns as a one-page, eight-group checklist, each line linking the lesson that proves it.
+- **[Verification Tools](/supabase/en/reading-supabase/verification-tools/)** — what `supabase db lint`, the RLS-coverage query, `pg_policies`, `explain analyze` under a real JWT, `supabase test db` (pgTAP), `supabase gen types` + `tsc`, `deno check`, `curl` with anon vs service keys, the MCP server, Studio, and this course's own harness each actually prove.
+- Every earlier lesson in this course already has its own **`## Reading AI-generated code`** section with a `<SpotTheBug>` — this module's catalog does not repeat those, it groups a broader set of 27 patterns around the reading order above. Start from **[What Is Supabase](/supabase/en/foundations/what-is-supabase/)** if you want the full lesson-by-lesson path instead.
+
+## Mental Model
+
+```text
+Reading order for Supabase code you did not write:
+
+1. Schema & RLS     -> does every command (select/insert/update/delete) have its own policy?
+2. Roles & keys     -> which of anon/authenticated/service_role is this code actually using?
+3. Auth flow        -> getSession (decoded, unverified) or getUser (verified)?
+4. Client calls     -> {data, error} checked? singleton? frozen Authorization header?
+5. Edge functions   -> jsr:/npm: specifiers, which key, which secrets file
+6. Realtime/storage -> publication membership, replica identity, folder-scoped policies
+7. Ops & pooling    -> prepare:false, pg_net is async, which key actually reached this code
+
+"It returned data when I tested it" answers almost none of these -- the single most common
+failure in this catalog is code that works with service_role and is silently empty with anon.
+```
+
+## Common Misconceptions
+
+- **"If Postgres accepts the migration and `tsc`/`deno check` both pass, the code is correct."** Proven throughout this module's catalog: `for update using (true)` with no explicit `with check` is syntactically perfect SQL and a real row-hijack vulnerability, proven live in this course's own RLS lessons — no compiler or linter catches it, because it is not a syntax error.
+- **"A missing policy throws an error, so I'd notice."** Disproven directly: RLS enabled with zero policies returns `200` with `[]` — no error at any layer, from Postgres up through PostgREST to the client. The silence is the bug.
+- **"`service_role` is just a stronger `anon` key."** It is a different thing entirely: it bypasses Row Level Security, which means every policy this module's step 1 asks you to read is invisible while testing with it. Code that "just works" during development and breaks the moment a real user's session replaces `service_role` is the single most common shape this catalog documents.
+- **"AI-generated Supabase code just needs a newer prompt."** The problem is not staleness alone: `for select using (true)` is real, current, syntactically correct SQL that simply does not mean what a reader who skips step 1 assumes it means — no training-data cutoff fixes a reading habit.
+
+<Callout title="The one-line takeaway">
+Read Supabase code in this order — schema and RLS, roles and keys, the auth flow, client calls, edge functions, realtime and storage, then ops and pooling — because Postgres, PostgREST, `tsc`, and `deno check` all validate syntax and types, never intent, and the single most common failure this catalog documents is code that returns real data with `service_role` and a silent, error-free `[]` with anyone else.
+</Callout>
+
+export const quizReadingSupabaseIndex = [
+  {
+    q: "Why does this module check schema and RLS before checking which key a piece of code uses?",
+    options: [
+      "Because tables are always the shortest part of a file to read",
+      "Because a policy gap (a missing insert policy, using(true) standing in for with check, RLS enabled with zero policies) determines what ANY key below service_role can actually do -- reading roles and keys first tells you nothing about what those roles are restricted to",
+      "Because roles and keys never affect what a query returns",
+      "The order does not matter",
+    ],
+    answer: 1,
+    explain: "Proven in the AI Bug Catalog's entries 1-8: RLS enabled with zero policies returns 200 with [] to both anon AND authenticated -- knowing which key a request uses tells you nothing until you know what the policies on that table actually allow.",
+  },
+  {
+    q: "```text\n$ curl \"$API_URL/rest/v1/rd_notes?select=*\" -H \"apikey: $ANON_KEY\" -H \"Authorization: Bearer $ANON_KEY\"\n[]\nHTTP=200\n```\nGiven real rows exist in this table (confirmed separately as postgres: 3 rows), what does this real output prove about the difference between a missing policy and a missing table?",
+    options: [
+      "That the table does not exist",
+      "Nothing distinguishes them from this output alone -- an empty result with HTTP 200 is the exact same shape RLS-enabled-with-zero-policies produces as an unrelated empty table or an over-narrow filter; the catalog proves this exact case is caused by RLS silently denying every row, not absence of data",
+      "That the anon key is invalid",
+      "That RLS is disabled",
+    ],
+    answer: 1,
+    explain: "Proved directly in the AI Bug Catalog: postgres itself (bypassing RLS as table owner) shows real_row_count_as_superuser = 3, while the identical query through PostgREST with the anon key returns [] with HTTP 200 -- no error at any layer distinguishes 'no policy grants this' from 'no rows exist'.",
+  },
+  {
+    q: "Why does this module treat 'the demo worked when I tested it' as unreliable evidence specifically for Supabase code, more than for most other backends?",
+    options: [
+      "Supabase demos are always run by the original author",
+      "Because the service_role key -- the credential most local testing, seed scripts, and admin tooling naturally reach for -- bypasses Row Level Security entirely, so a demo that used it proves nothing about what happens once a real user's session (subject to every policy) replaces it",
+      "Because Supabase has no testing tools at all",
+      "Because RLS only applies to production projects",
+    ],
+    answer: 1,
+    explain: "Proven directly in the AI Bug Catalog's Ops & pooling group: the exact same request against the exact same row returns real data with service_role and [] with anon -- the only difference is which key made the call, not anything about the request itself.",
+  },
+  {
+    q: "Which step in this reading order specifically asks whether deno check -- not tsc -- was used to verify a file's imports resolve?",
+    options: [
+      "Client calls",
+      "Edge functions",
+      "Realtime & storage",
+      "Auth flow",
+    ],
+    answer: 1,
+    explain: "Proven directly in the AI Bug Catalog's entry 16: a bare 'import { createClient } from \"@supabase/supabase-js\"' inside supabase/functions/<name>/index.ts type-checks under a Node-style tsc run against a permissive tsconfig, but a real supabase functions serve deployment returns a real BOOT_ERROR 503 -- only deno check, run against Deno's own module graph, catches it before deploy.",
+  },
+  {
+    q: "Why does this module say a silently-empty result (like RLS with zero policies, or a table missing from a publication) is MORE concerning to a reviewer than one that throws an error, rather than less?",
+    options: [
+      "It doesn't -- thrown errors are always worse",
+      "A thrown error is loud and immediate -- a reader notices instantly and fixes it before shipping. A silent 200/[] looks identical to 'there is genuinely no data yet' until the exact row that should have been there is the one that goes missing in front of a real user",
+      "Silent results are rarer in practice than errors",
+      "Postgres always eventually raises an error for a missing policy on its own",
+    ],
+    answer: 1,
+    explain: "Proven throughout the catalog: RLS-enabled-zero-policies, a table missing from supabase_realtime, and a storage upsert missing its select policy all return a clean success shape (200/[], a channel that simply never fires, a specific but easy-to-misread RLS error) rather than an unmistakable failure -- each one reads as 'working, just no data yet' until proven otherwise.",
+  },
+];
+
+<Quiz client:visible id="reading-supabase/index" questions={quizReadingSupabaseIndex} />
+
+<ProgressTracker client:visible id="reading-supabase/index" />
