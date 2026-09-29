@@ -8,6 +8,7 @@ sidebar:
 import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
@@ -54,6 +55,167 @@ create table public.profiles (
 );
 ```
 
+## สอง migration workflow จริง พิสูจน์กับ stack ที่รันอยู่จริง
+
+มีวิธีเขียน migration file สองแบบที่ต่างกันจริง ๆ และทั้งคู่ถูกรันจริงที่นี่ กับ Postgres local เดียวกับที่ stack ของคอร์สนี้ใช้ จาก scratch project แบบทิ้งได้ (ไม่เคยรันกับ `supabase/migrations/` ของคอร์สเอง — proof นี้อยู่ใน `/private/tmp/.../supabase-fnd/` ซึ่งเป็น `supabase init` project แบบใช้แล้วทิ้ง ชี้ไปที่ database ที่แชร์กันด้วย `--db-url` แล้วลบทิ้งทีหลัง)
+
+**Workflow 1 — เขียน migration เองด้วยมือ** `supabase migration new` สร้างแค่ไฟล์เปล่า ๆ ที่มี timestamp เท่านั้น คุณเขียน SQL เอง:
+
+```text
+$ supabase migration new fnd_create_widgets
+{"path":".../supabase/migrations/20260929070840_fnd_create_widgets.sql","message":"Migration created"}
+```
+
+```sql
+-- already applied above via db push; shown here for reference, not re-collected by the harness
+create table public.fnd_widgets (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  created_at timestamptz not null default now()
+);
+```
+
+```text
+$ supabase db push --db-url "postgresql://postgres:postgres@127.0.0.1:55322/postgres"
+Connecting to remote database...
+{"_tag":"Error","error":{"code":"LegacyDbConnectError","message":"failed to connect to postgres: failed to connect to `host=127.0.0.1 user=postgres database=postgres`: tls error (The server does not support SSL connections)"}}
+```
+
+<Callout title="ปัญหาจริงที่ไม่มีเขียนไว้ใน quickstart">
+`db push --db-url` ถือว่า target ที่ `--db-url` ชี้ไปเป็น database แบบ **remote** เสมอ และ default พยายาม require SSL ก่อน — กับ local stack ที่เป็น Postgres ธรรมดา สิ่งนี้พังด้วย error ตรงข้างบนเป๊ะ ทางแก้คือ parameter ของ connection string จริง ๆ ไม่ใช่ CLI flag: เติม `?sslmode=disable` ต่อท้าย
+</Callout>
+
+```text
+$ supabase db push --db-url "postgresql://postgres:postgres@127.0.0.1:55322/postgres?sslmode=disable" --yes
+Applying migration 20260929070840_fnd_create_widgets.sql...
+{"upToDate":false,"dryRun":false,"migrations":["20260929070840_fnd_create_widgets.sql"],"message":"Finished supabase db push."}
+```
+
+ตอนนี้ `fnd_widgets` มีอยู่จริงบน database ที่แชร์กัน — ยืนยันด้วย `\d` ของ `psql`
+
+**Workflow 2 — capture change ที่มีคนแก้ด้วยมือไปแล้ว** (แก้ผ่าน Studio GUI หรือใน proof นี้คือรัน `create table` ตรง ๆ กับ database เพื่อจำลองแบบนั้นเป๊ะ ๆ):
+
+```sql
+-- run directly against Postgres, simulating a Studio GUI edit — already applied, shown for reference
+create table public.fnd_courses (
+  id uuid primary key default gen_random_uuid(),
+  title text not null,
+  published boolean not null default false
+);
+```
+
+```text
+$ supabase db diff --db-url "postgresql://postgres:postgres@127.0.0.1:55322/postgres?sslmode=disable" -f fnd_capture_courses
+Creating shadow database...
+Diffing schemas...
+{"file":".../supabase/migrations/20260929070903_fnd_capture_courses.sql", "message":"Diff complete."}
+```
+
+```sql
+-- excerpt of the generated migration file (not the full diff output) — reference only
+CREATE TABLE "public"."fnd_courses" (
+  "id"        uuid    NOT NULL DEFAULT gen_random_uuid(),
+  "title"     text    NOT NULL,
+  "published" boolean NOT NULL DEFAULT false,
+  CONSTRAINT "fnd_courses_pkey" PRIMARY KEY (id)
+);
+```
+
+<Callout title="ปัญหาจริงเรื่อง db diff กับ database ที่แชร์กัน — บอกตามตรง">
+output เต็มของ `db diff` ครั้งนั้นยาวกว่า excerpt ข้างบนมาก — มันจับ table, policy และ extension ของ **บทอื่น** ใน local stack ที่แชร์กันของคอร์สนี้ด้วย เพราะ `db diff` สร้าง shadow database จาก **`supabase/migrations/` ของ project ตัวเองเท่านั้น** แล้ว diff กับ database เป้าหมายทั้งก้อน อะไรก็ตามบน target ที่ไม่อยู่ใน migrations directory ของคุณจะโผล่มาเป็น "drift" ไม่ว่าคุณจะเป็นคนสร้างมันหรือไม่ บน database ที่แชร์กัน แปลว่า `db diff -f` จาก scratch project ที่แยกออกมาไม่ปลอดภัยที่จะ commit ทันที — ต้อง trim output ด้วยมือให้เหลือแค่ change ที่ตั้งใจ capture จริง ๆ แบบที่ทำตรงนี้
+</Callout>
+
+สุดท้าย `supabase migration list` แสดง migration ทั้งสองตัวพร้อม state จริง — ตัวที่เขียนเองถูก apply แล้ว (`remote` มีค่า) ตัวที่ capture จาก diff ยังไม่ push (`remote` ยังว่าง เพราะ generate มาจาก state ที่มีอยู่แล้ว ไม่ได้ push ไปข้างหน้า):
+
+```text
+$ supabase migration list --db-url "postgresql://postgres:postgres@127.0.0.1:55322/postgres?sslmode=disable"
+{"migrations":[
+  {"local":"20260929070840","remote":"20260929070840","time":"2026-09-29 07:08:40"},
+  {"local":"20260929070903","remote":"","time":"2026-09-29 07:09:03"}
+]}
+```
+
+## `supabase db lint` — เช็ค schema ก่อน review ไม่ใช่หลัง
+
+`db lint` รัน analysis สไตล์ `plpgsql_check` ของ Postgres เองกับ schema แล้ว report typing error:
+
+```text
+$ supabase db lint --db-url "postgresql://postgres:postgres@127.0.0.1:55322/postgres?sslmode=disable" --schema public --level warning
+Linting schema: public
+No schema errors found
+{"results":[],"message":"db lint"}
+```
+
+local stack วันนี้สะอาด — `--fail-on warning` (หรือ `error`) เปลี่ยนสิ่งนี้ให้เป็น CI gate จริง แทนที่จะเป็นแค่ report ให้ดูเฉย ๆ ตรง pattern เดียวกับที่ production checklist ท้ายคอร์สนี้ใช้
+
+## `supabase test db` — pgTAP รันจริง
+
+`supabase test db` รันไฟล์ test [pgTAP](https://pgtap.org/) กับ database local test เล็ก ๆ จริง ที่เช็ค shape ของ table ที่สร้างข้างบน:
+
+```sql
+-- supabase/tests/database/fnd_widgets.test.sql
+begin;
+select plan(2);
+
+select has_table('public', 'fnd_widgets', 'fnd_widgets table should exist');
+select has_column('public', 'fnd_widgets', 'name', 'fnd_widgets should have a name column');
+
+select * from finish();
+rollback;
+```
+
+```text
+$ supabase test db --workdir tools/probe
+Connecting to local database...
+.../supabase/tests/database/fnd_widgets.test.sql .. ok
+All tests successful.
+Files=1, Tests=2,  0 wallclock secs
+Result: PASS
+```
+
+CLI จะดึง image `supabase/pg_prove` เล็ก ๆ ที่สร้างมาเพื่อสิ่งนี้ครั้งแรกที่รัน (ใช้ครั้งเดียว จบแล้ว exit — ไม่ได้เพิ่ม container ถาวรให้ stack) เปิด extension `pgtap` ให้อัตโนมัติ และห่อทั้งไฟล์ด้วย `begin`/`rollback` เพื่อไม่ให้ test data ลง database จริง วินัยแบบ rollback-by-default เดียวกับที่ verification harness ของคอร์สนี้เองใช้
+
+## `supabase gen types` — จาก schema เป็น TypeScript จริง
+
+```text
+$ supabase gen types typescript --db-url "postgresql://postgres:postgres@127.0.0.1:55322/postgres?sslmode=disable" --schema public
+```
+
+```typescript
+// database.types.ts (excerpt, generated — not hand-written)
+fnd_widgets: {
+  Row: {
+    created_at: string
+    id: string
+    name: string
+  }
+  Insert: {
+    created_at?: string
+    id?: string
+    name: string
+  }
+  Update: {
+    created_at?: string
+    id?: string
+    name?: string
+  }
+  Relationships: []
+}
+```
+
+ทุก column จาก migration ที่เขียนเองข้างบนถูก type ให้ถูกต้อง โดย variant `Insert`/`Update` จะ mark column ที่มี default ให้เป็น optional (`created_at`, `id`) ส่วน column ที่ต้องระบุจะเป็น required (`name`) ไฟล์นี้ควรถูก regenerate ทุกครั้งที่ schema เปลี่ยน แล้ว import เป็น `Database` เข้า `createClient<Database>(...)` — module [Client Development](/supabase/th/client-development/) พูดถึงว่าเกิดอะไรขึ้นถ้าข้าม step regenerate นี้หลัง schema เปลี่ยนจริง
+
+## Seeding กับ Branching — CLI เดียวกัน ส่วนใหญ่เป็นเอกสาร
+
+`supabase/seed.sql` รันอัตโนมัติหลัง `supabase db reset` (และรันได้ด้วยถ้าใส่ `db push --include-seed`) — ชุด row ตายตัวสำหรับ local development และ CI ไม่ใช่สิ่งที่ migration ควรแบก:
+
+```sql
+-- supabase/seed.sql
+insert into public.fnd_widgets (name) values ('seeded widget one'), ('seeded widget two');
+```
+
+**Branching** ถูกพูดถึงแล้วในฐานะ CLI-level feature (`supabase branches create`) ในบท [Branching and the Migrations Workflow](/supabase/th/production-and-ecosystem/branching-and-migrations-workflow/) ทีหลังในคอร์สนี้ — สรุปสั้น ๆ ตรงนี้: branch คือ hosted preview database แยกต่างหากจริง ที่ผูกกับ Git branch ไม่ใช่สิ่งที่ local CLI stack จำลองเองได้ (ต้องมี hosted project ที่ link ไว้) ดังนั้นบทนั้นจึงอิงเอกสารและ citation เป็นหลัก ไม่ได้พิสูจน์กับ local stack นี้
+
 ## ทำไมเรื่องนี้ถึงสำคัญ นี่คือ IaC สำหรับ schema ของคุณ
 
 นี่คือไอเดียเดียวกับ "infrastructure as code เทียบกับ ClickOps" จากฝั่ง infrastructure tooling แค่เอามาใช้กับ database ของคุณ การแก้ไขด้วยการคลิกใน Studio GUI ใช้งานได้จริง แต่มองไม่เห็นตอน code review, มองไม่เห็นใน `git log` และต้อง reproduce มือเพื่อให้ไปถึง environment ที่สอง migration file ทำให้ change เดียวกันนี้ **review ได้, ทำซ้ำได้ และ deploy ได้** — `supabase db push` apply เข้า staging, production หรือ local stack ของเพื่อนร่วมทีมได้เหมือนกันทุกที่
@@ -67,6 +229,35 @@ export const migrationsDiagram = `flowchart LR
   file --> push["supabase db push"]
   push --> hosted[("Hosted project Postgres")]
   local["Local migration written by hand"] --> file`;
+
+## อ่านโค้ดที่ AI สร้าง
+
+AI assistant ถูกขอให้ "add a migration for the new widgets table" แล้วสร้างสิ่งนี้:
+
+<SpotTheBug lang="bash" code={`# scripts/ai-migration-workflow.sh
+# An AI assistant's suggested "quick" migration workflow
+psql "$DATABASE_URL" -c "create table public.widgets (id uuid primary key default gen_random_uuid(), name text not null);"
+echo "Done — table created."
+`}>
+สิ่งนี้ "ใช้ได้" ในแง่ที่ table ถูกสร้างขึ้นจริง — และนั่นแหละคือปัญหาเป๊ะ ๆ change ตอนนี้มีอยู่แค่ในบรรทัด shell history และอะไรก็ตามที่ chat transcript ของ AI assistant เก็บไว้: ไม่มีอะไรใน `supabase/migrations/` บันทึกไว้เลย `supabase migration list` จะไม่มีวันแสดงว่ามันถูก apply แล้ว `supabase db push` ของเพื่อนร่วมทีมจะไม่มีวัน reproduce มันได้ และ `supabase db reset` (ซึ่ง replay migration file ทุกไฟล์ตั้งแต่ต้น) จะสร้าง database ที่ **ไม่มี** table นี้แบบเงียบ ๆ นี่คือ failure mode "ClickOps ที่มีขั้นตอนเพิ่ม" แบบเดียวกับต้นบท แค่พิมพ์ลง terminal แทนที่จะคลิกผ่าน Studio ทางแก้ไม่ใช่ "รัน SQL อื่น" — แต่คือ route change ผ่าน `supabase migration new`, เขียน SQL ลงไฟล์ที่ generate มา แล้ว apply ด้วย `db push` เพื่อให้ statement เดียวกันที่เพิ่งรันกลายเป็น artifact ที่ version-controlled และ replay ได้จริง แบบเดียวกับสอง workflow จริงที่พิสูจน์ไว้ข้างบน
+</SpotTheBug>
+
+## Mental Model
+
+migration file ไม่ใช่พิธีกรรมเฉพาะของ Supabase — มันคือ **SQL script ธรรมดาที่มี timestamp อยู่ในชื่อไฟล์** และคุณค่าทั้งหมดของ CLI คือการรันชุดไฟล์พวกนี้ตามลำดับกับ target แล้วจำว่าอันไหนรันไปแล้ว (คอลัมน์ `remote` ใน `migration list` ที่พิสูจน์ข้างบน) อะไรก็ตามที่แก้ schema โดยไม่ผ่านกลไกนี้ — คลิก Studio GUI, statement `psql` แบบ ad hoc — มีผลจริงทันที แต่ไม่ทิ้งร่องรอยที่ bookkeeping ของ CLI รู้จัก ซึ่งเป็นเหตุผลที่ `db diff` มีอยู่: เพื่อ reconcile "สิ่งที่เกิดขึ้นจริง" กลับเข้ากับ "สิ่งที่ migration file บอกว่าเกิดขึ้น"
+
+## Trade-offs
+
+- **เขียน migration เอง (`migration new` + SQL ที่พิมพ์เอง) ให้ control เต็มที่ว่าจะ ship อะไรออกไป** — **แลกมาด้วยต้องเขียน SQL ให้ถูกเอง** ไม่มีอะไรเช็คกับ live schema ปัจจุบันจนกว่า `db push` จะรันจริง
+- **Capture change ด้วย `db diff -f` เร็วและไม่พิมพ์ชื่อ column ผิดเลย** — **แลกมาด้วยการ capture ทุกอย่างที่ต่าง** พิสูจน์ข้างบนแล้ว: บน database ที่แชร์กัน นั่นรวม drift ที่คุณไม่ได้ตั้งใจแตะด้วย ต้อง trim มือก่อนถึงจะ commit ได้ปลอดภัย
+- **test pgTAP ของ `supabase test db` รันในห่อ `begin`/`rollback` เลยไม่มีทางปน data จริง** — **แลกมาด้วยไม่ได้ test อะไรที่ต้องมี row ที่ commit จริงข้ามหลาย statement** (เช่น trigger ที่ fire หลัง commit จริงเท่านั้น) — verification harness ของคอร์สนี้เองก็มี trade-off เดียวกันกับ sql fence ของตัวเอง
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"Migration คือ feature ของ Supabase"** จริง ๆ คือไฟล์ `.sql` ธรรมดาที่มี timestamp กำกับ กับ table bookkeeping (`supabase_migrations.schema_migrations`) — pattern เดียวกับที่ migration tool จริงจังทุกตัว (Rails, Django, Flyway, Prisma Migrate) ใช้ CLI ของ Supabase คือ wrapper บาง ๆ ที่รู้จัก Postgres ห่อรอบมัน ไม่ใช่กลไกใหม่
+- **"`db push --db-url` ทำงานเหมือน `db push --linked` แค่ชี้ไปที่อื่น"** ถูกหักล้างข้างบนแล้ว: `--db-url` ถือว่า target เป็น remote โดยเฉพาะ และ default require SSL ซึ่ง Postgres local ธรรมดาไม่รองรับ — ปัญหาจริงที่ไม่มีเขียนไว้ใน quickstart ที่มีแค่ `?sslmode=disable` แก้ได้
+- **"`db diff` แสดงแค่ change ที่เพิ่งทำ"** พิสูจน์ข้างบนแล้วบน database ที่แชร์กัน: มัน diff shadow schema ที่มาจาก migrations ทั้งหมดของคุณกับ target ทั้งก้อน ดังนั้นอะไรก็ตามที่เปลี่ยน target ก็โผล่มาด้วย ไม่ว่าจะเป็นของคุณหรือไม่
+- **"`supabase test db` ต้องมี test database แยก"** มันรันตรงกับ database ของ local stack เอง ในธุรกรรมที่ rollback เสมอ — ไม่ต้องมี database ที่สอง ไม่ต้องมี cleanup step เพิ่ม
 
 <Callout title="สรุปหนึ่งบรรทัด">
 table ใน Supabase ถูกสร้างด้วย **SQL ธรรมดาจริง ๆ** — `create table` ไม่มี abstraction พิเศษ — ไม่ว่าจะผ่าน Studio GUI หรือเขียนเอง และ pattern ที่พบบ่อยคือ table `profiles` ที่ `id` อ้างอิงไปยัง `auth.users` `supabase migration new` กับ `supabase db diff` แปลง schema change ให้เป็นไฟล์ `.sql` ใน version control และ `supabase db push` apply เข้า hosted project ที่ link ไว้ ทำให้แม้แต่ change ที่ทำผ่าน GUI ก็ยังจบลงที่ **review ได้, ทำซ้ำได้ และ deploy ได้** แทนที่จะเป็น ClickOps ที่มองไม่เห็น
@@ -82,6 +273,7 @@ export const quizTablesMigrations = [
       'ผ่าน schema builder add-on แบบเสียเงินเท่านั้น',
     ],
     answer: 1,
+    explain: 'ทั้งสอง migration workflow จริงข้างบนไม่ได้รันอะไรนอกจาก create table SQL ธรรมดา — CLI แค่เพิ่ม bookkeeping ของไฟล์รอบมัน ไม่ใช่ schema language ใหม่',
   },
   {
     q: '`supabase db push` ทำอะไร',
@@ -92,6 +284,7 @@ export const quizTablesMigrations = [
       'สร้างไฟล์ migration เปล่า ๆ ที่ไม่มี SQL อยู่ข้างใน',
     ],
     answer: 1,
+    explain: 'พิสูจน์ข้างบนแล้ว: db push --db-url apply migration fnd_create_widgets ที่เขียนเองจริง แล้ว migration list ก็แสดง remote timestamp ที่มีค่าแล้ว',
   },
   {
     q: 'ทำไมการเก็บ schema change เป็น migration file ถึงสำคัญ แม้ว่าคุณจะแก้ผ่าน Studio GUI ก็ตาม',
@@ -102,6 +295,7 @@ export const quizTablesMigrations = [
       'GUI ทำ schema change จริงไม่ได้เลย',
     ],
     answer: 1,
+    explain: 'SpotTheBug แบบ bash ที่ AI สร้างข้างบนแสดงชัดว่าถ้าข้ามสิ่งนี้ต้องเสียอะไร: change จริงที่ db reset จะทำหายแบบเงียบ ๆ เพราะไม่มีอะไรบันทึกไว้เป็น migration',
   },
   {
     q: 'pattern ที่พบบ่อยสำหรับเชื่อม table profiles เข้ากับ Supabase Auth คืออะไร',
@@ -112,6 +306,18 @@ export const quizTablesMigrations = [
       'ใช้ UUID แยกที่ไม่เกี่ยวข้องกัน โดยไม่มี foreign key',
     ],
     answer: 1,
+    explain: 'นี่คือ pattern มาตรฐานที่คอร์สนี้ใช้ตลอด — profiles.id อ้างอิง auth.users(id) เพื่อผูกข้อมูลของแอปเข้ากับ identity ที่ authenticate จริง',
+  },
+  {
+    q: '`supabase db push --db-url "postgresql://...127.0.0.1:55322/postgres"` จริง (ไม่มี param เพิ่ม) กับ local stack ของคอร์สนี้พังด้วย TLS error อะไรที่แก้ได้ และทำไม error ถึงเกิดขึ้นตั้งแต่แรก',
+    options: [
+      'restart local stack แก้ได้',
+      'เติม ?sslmode=disable ต่อท้าย connection string — db push --db-url ถือว่า target ที่ URL ไหนก็ตามเป็น remote เสมอและ default require SSL ซึ่ง Postgres local ธรรมดาไม่มีให้',
+      'ใช้ --linked แทน --db-url ซึ่งไม่ต้องแก้อะไรเลย',
+      'error ไม่เกี่ยวกับ SSL เลย ต้อง reinstall CLI',
+    ],
+    answer: 1,
+    explain: 'นี่คือ error จริงและทางแก้จริงที่แสดงข้างบนเป๊ะ — ปัญหาจริงที่ควรรู้ไว้ก่อนเจอครั้งแรกกับ local stack ของตัวเอง',
   },
 ];
 
